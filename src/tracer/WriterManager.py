@@ -208,6 +208,12 @@ class WriteManager:
         # Process snapshot session tracking
         self.process_snapshot_session_active = False
 
+        # Bundle upload tracking: accumulate files and upload as a single tar
+        self._pending_bundle: list[str] = []
+        self._bundle_lock = threading.Lock()
+        self._bundle_counter = 0
+        self.bundle_size = 5
+
     def _calculate_event_rate(self, event_type: str) -> float:
         """
         Calculate the event rate for a given event type.
@@ -600,7 +606,7 @@ class WriteManager:
             with open(dst, 'w') as f:
                 f.write(spec_str)
             if self.automatic_upload:
-                self.upload_manager.append_object(dst)
+                self._add_to_bundle(dst)
         except Exception as e:
             logger("error", f"Error writing device spec to {output_path}: {e}")
 
@@ -734,7 +740,7 @@ class WriteManager:
                     logger('info', f"Files Created: {str(self.created_files)} (filesystem snapshot with {num_parts} parts)", True)
                 for part_file in self.fs_snapshot_parts_pending_upload:
                     if os.path.exists(part_file):
-                        self.upload_manager.append_object(part_file)
+                        self._add_to_bundle(part_file)
                 self.fs_snapshot_parts_pending_upload.clear()
                 
         except Exception as e:
@@ -956,6 +962,8 @@ class WriteManager:
         self.compress_log(self.output_sockopt_file)
         self.compress_log(self.output_drop_file)
         self.compress_log(self.output_io_uring_file)
+        if self.automatic_upload:
+            self._flush_bundle()
         self.compress_dir(self.output_dir)
 
 
@@ -1147,6 +1155,52 @@ class WriteManager:
 
         self.clear_events()
 
+    def _add_to_bundle(self, file_path: str):
+        """Queue a compressed file for bundled upload."""
+        with self._bundle_lock:
+            self._pending_bundle.append(file_path)
+            should_flush = len(self._pending_bundle) >= self.bundle_size
+        if should_flush:
+            self._flush_bundle()
+
+    def _flush_bundle(self):
+        """Pack all pending files into one tar and queue it for upload."""
+        with self._bundle_lock:
+            if not self._pending_bundle:
+                return
+            files_to_bundle = list(self._pending_bundle)
+            self._pending_bundle.clear()
+            self._bundle_counter += 1
+            counter = self._bundle_counter
+
+        bundle_dir = os.path.dirname(self.output_dir.rstrip("/\\"))
+        bundle_ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+        bundle_path = os.path.join(bundle_dir, f"bundle_{counter:04d}_{bundle_ts}.tar")
+
+        try:
+            with tarfile.open(bundle_path, "w") as tar:
+                for f in files_to_bundle:
+                    if os.path.exists(f):
+                        tar.add(f, arcname=os.path.relpath(f, bundle_dir))
+            # Tar closed successfully — safe to delete sources now
+            for f in files_to_bundle:
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except OSError as rm_err:
+                        logger("warning", f"Failed to remove bundled file {f}: {rm_err}")
+            self.upload_manager.append_object(bundle_path)
+        except Exception as e:
+            logger("error", f"Failed to create upload bundle: {e}")
+            if os.path.exists(bundle_path):
+                try:
+                    os.remove(bundle_path)
+                except OSError:
+                    pass
+            for f in files_to_bundle:
+                if os.path.exists(f):
+                    self.upload_manager.append_object(f)
+
     def compress_log(self, input_file: str):
         """
         Compress a log file with gzip and optionally upload.
@@ -1169,7 +1223,7 @@ class WriteManager:
             if self.automatic_upload:
                 self.created_files += 1
                 logger('info', f"Files Created: {str(self.created_files)}", True)
-                self.upload_manager.append_object(dst)
+                self._add_to_bundle(dst)
             os.remove(src)
         except Exception as e:
             logger("error", f"Failed compressing log {input_file}")
