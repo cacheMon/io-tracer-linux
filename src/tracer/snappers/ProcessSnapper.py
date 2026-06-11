@@ -96,7 +96,7 @@ class ProcessSnapper:
                 name = proc.info['name'] or ''
                 working_set_size = proc.info['memory_info'].rss / 1024 
                 virtual_mem = proc.info['memory_info'].vms / 1024
-                cmdline = ' '.join(proc.info['cmdline'])
+                cmdline = ' '.join(proc.info['cmdline'] or [])
                 if self.anonymous:
                     cmdline = simple_hash(cmdline, length=12)
                 create_time = float(proc.info['create_time'])
@@ -112,10 +112,10 @@ class ProcessSnapper:
                 self.wm.append_process_log(out)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:
                 # Expected errors while iterating over system processes; skip this process.
-                logger.debug(f"Skipping process {getattr(proc, 'pid', 'unknown')} due to psutil error: {e}")
+                logger("info", f"Skipping process {getattr(proc, 'pid', 'unknown')} due to psutil error: {e}")
             except Exception as e:
                 # Log unexpected errors to avoid silently hiding issues in the snapshot loop.
-                logger.warning("Unexpected error while collecting process snapshot data", exc_info=True)
+                logger("warning", f"Unexpected error while collecting process snapshot data: {e}")
         
         # Check one final time before flushing
         if not self.running:
