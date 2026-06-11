@@ -20,13 +20,6 @@
 #define BPF_NO_KFUNC_PROTO
 #include <linux/ptrace.h>
 
-/* Kernel version compatibility: BPF kfunc declarations were restructured
- * in kernel 6.14+, requiring empty struct placeholders */
-// #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,14,0)
-// #define BPF_NO_KFUNC_PROTO
-// struct bpf_wq {};
-// #endif
-
 /* ============================================================================
  * KERNEL VERSION COMPATIBILITY
  * ============================================================================
@@ -34,9 +27,37 @@
  * kernel versions by providing missing definitions.
  */
 
-/* bpf_timer struct was introduced in kernel 5.17 */
+/* ----------------------------------------------------------------------------
+ * BPF "special field" type compatibility
+ * ----------------------------------------------------------------------------
+ * <linux/bpf.h> defines btf_field_type_size() / btf_field_type_align() as
+ * static inline functions that apply sizeof()/__alignof__() to a family of
+ * special-field structs: bpf_timer, bpf_wq, bpf_task_work, bpf_list_head,
+ * bpf_list_node, bpf_rb_root, bpf_rb_node, bpf_refcount.
+ *
+ * That header is pulled into this BPF program transitively
+ * (net/sock.h -> linux/security.h -> linux/bpf.h). Depending on the kernel,
+ * some of these structs are only *forward-declared* in the headers BCC sees,
+ * so sizeof()/__alignof__() fail with "invalid application ... to an
+ * incomplete type". The program never instantiates these structs, so an empty
+ * placeholder is enough to complete the type for the compiler.
+ *
+ * We can only declare the ones the headers leave incomplete: defining a
+ * placeholder for a struct the headers already define fully is a redefinition
+ * error, and there is no preprocessor test for "is this type complete?".
+ * Hence the per-version guards below.
+ *
+ * MAINTENANCE: if a future kernel fails to compile with
+ *   "invalid application of 'sizeof' to an incomplete type 'struct bpf_<X>'"
+ * add `struct bpf_<X> {};` here under the matching version guard. The
+ * authoritative list lives in btf_field_type_size() in <linux/bpf.h>.
+ */
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
-struct bpf_timer {};
+struct bpf_timer {};       /* bpf_timer field, forward-declared from 5.17 on */
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
+struct bpf_wq {};          /* workqueue field, added in 6.14 */
+struct bpf_task_work {};   /* task_work field, added in 6.14 */
 #endif
 
 /* BPF atomic load/store instructions - fallback definitions */
@@ -54,11 +75,6 @@ struct bpf_timer {};
 
 #ifndef BPF_F_BROADCAST
 #define BPF_F_BROADCAST (1ULL << 3)  /**< Broadcast flag for BPF maps */
-#endif
-
-/* bpf_task_work struct introduced in kernel 6.14 */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-struct bpf_task_work {};
 #endif
 
 /* ============================================================================
