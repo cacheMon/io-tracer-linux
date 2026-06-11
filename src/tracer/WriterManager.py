@@ -1181,11 +1181,22 @@ class WriteManager:
             with tarfile.open(bundle_path, "w") as tar:
                 for f in files_to_bundle:
                     if os.path.exists(f):
-                        tar.add(f, arcname=os.path.basename(f))
+                        tar.add(f, arcname=os.path.relpath(f, bundle_dir))
+            # Tar closed successfully — safe to delete sources now
+            for f in files_to_bundle:
+                if os.path.exists(f):
+                    try:
                         os.remove(f)
+                    except OSError as rm_err:
+                        logger("warning", f"Failed to remove bundled file {f}: {rm_err}")
             self.upload_manager.append_object(bundle_path)
         except Exception as e:
             logger("error", f"Failed to create upload bundle: {e}")
+            if os.path.exists(bundle_path):
+                try:
+                    os.remove(bundle_path)
+                except OSError:
+                    pass
             for f in files_to_bundle:
                 if os.path.exists(f):
                     self.upload_manager.append_object(f)
