@@ -59,7 +59,31 @@ def main():
         ("kretprobe", "vfs_read", "trace_vfs_read_ret"),
         ("kprobe", "vfs_write", "trace_vfs_write"),
         ("kretprobe", "vfs_write", "trace_vfs_write_ret"),
+        # fsync de-dup pair: the kretprobe clears the nested-call marker.
+        ("kprobe", "vfs_fsync", "trace_vfs_fsync"),
+        ("kretprobe", "vfs_fsync", "trace_vfs_fsync_ret"),
+        ("kprobe", "vfs_fsync_range", "trace_vfs_fsync_range"),
     ]
+
+    # Symbol-conditional probes. These validate that the pt_regs-unwrapping
+    # *_x64 variants and the DIO direction entry probes were compiled in and
+    # attach — a guard mismatch would otherwise pass CI (BPF() load succeeds
+    # without them) and abort the tracer at startup instead.
+    conditional_probes = [
+        (b"__x64_sys_mremap", [("kprobe", "__x64_sys_mremap", "trace_mremap_entry_x64"),
+                               ("kretprobe", "__x64_sys_mremap", "trace_mremap_ret")]),
+        (b"__x64_sys_openat", [("kprobe", "__x64_sys_openat", "trace_openat_entry_x64")]),
+        (b"__x64_sys_io_uring_enter", [("kprobe", "__x64_sys_io_uring_enter", "trace_io_uring_enter_x64")]),
+        (b"iomap_dio_rw", [("kprobe", "iomap_dio_rw", "trace_dio_entry_iomap"),
+                           ("kretprobe", "iomap_dio_rw", "trace_dio_return")]),
+        (b"__blockdev_direct_IO", [("kprobe", "__blockdev_direct_IO", "trace_dio_entry_blockdev")]),
+    ]
+    for symbol, symbol_probes in conditional_probes:
+        if BPF.get_kprobe_functions(symbol):
+            probes.extend(symbol_probes)
+        else:
+            print(f"SKIP: {symbol.decode()} not present on this kernel")
+
     for kind, event, fn in probes:
         if kind == "kprobe":
             b.attach_kprobe(event=event, fn_name=fn)

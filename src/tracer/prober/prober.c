@@ -1158,7 +1158,7 @@ int trace_do_sys_openat2_entry(struct pt_regs *ctx) {
   return 0;
 }
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(bpf_target_x86)
 /**
  * @brief Kprobe entry for the __x64_sys_openat syscall wrapper.
  *
@@ -1622,7 +1622,7 @@ int trace_mremap_entry(struct pt_regs *ctx) {
   return 0;
 }
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(bpf_target_x86)
 /**
  * @brief kprobe entry for the __x64_sys_mremap syscall wrapper.
  *
@@ -3776,7 +3776,7 @@ int trace_io_uring_enter(struct pt_regs *ctx, unsigned int fd,
   return emit_io_uring_enter(ctx, fd, to_submit, min_complete, flags);
 }
 
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(bpf_target_x86)
 /**
  * @brief Kprobe entry for the __x64_sys_io_uring_enter syscall wrapper.
  *
