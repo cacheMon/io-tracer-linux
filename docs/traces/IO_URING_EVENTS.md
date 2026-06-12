@@ -4,11 +4,24 @@
 
 **Kernel Probes Attached:**
 - `__io_uring_enter` / `__sys_io_uring_enter` — io_uring_enter syscall
+- `io_prep_rw` (or per-op `io_prep_read{,v,_fixed}` / `io_prep_write{,v,_fixed}`) — SQE field capture
 - `io_queue_sqe` / `io_submit_sqe` — SQE submission
 - `io_req_complete_post` / `io_req_complete` — Completion
 - `io_wq_submit_work` — Async worker execution
 
 > **Note:** The `io_uring:io_uring_submit_sqe` and `io_uring:io_uring_complete` tracepoints are disabled by default due to incompatible struct field layouts across kernel versions. The kprobe-based implementations above provide cross-kernel compatibility.
+
+### SQE field capture and file correlation
+
+The SUBMIT kprobe on `io_queue_sqe` only receives the internal `struct io_kiocb`, whose layout is **not** ABI-stable across kernel releases, so reading `opcode`/`fd`/`len`/`offset`/`user_data` from it directly is unreliable. Instead these fields are captured at request-**prep** time:
+
+- `trace_io_uring_prep_rw` attaches to the read/write prep handler (`io_prep_rw`), which is dispatched through the opcode table (`def->prep`) and therefore is not inlined. It receives the **UAPI `struct io_uring_sqe`** (PARM2), whose leading field offsets are stable for all io_uring kernels. A minimal mirror (`io_uring_sqe_min`) reads `opcode`, `flags`, `ioprio`, `fd`, `off`, `len`, `user_data` and `buf_index`.
+- The same probe reads `req->file` (the first member of `struct io_kiocb` on modern kernels) and, when it is a regular file on a real filesystem, records the backing **inode**, **device** and **superblock magic** via the same helpers used by the VFS probes.
+- These values are staged in the `io_uring_submit_map` (keyed by the `io_kiocb` pointer) and consumed by the SUBMIT, COMPLETE and WORKER probes.
+
+If the prep symbol is unavailable on a given kernel, the SUBMIT probe falls back to reading `req->file` directly for inode/device/fs, and the SQE-only fields (`opcode`, `len`, `offset`, `user_data`) simply remain empty — graceful degradation rather than failure.
+
+> **Note:** This captures SQE fields for the read/write opcode families (the bulk of filesystem I/O). Other opcodes (e.g. `OPENAT`, `STATX`) are not prepped through `io_prep_rw`, so their `opcode`/`fd`/`len`/`offset` columns may be empty.
 
 ## Data Captured
 
@@ -52,6 +65,12 @@
 | 36 | CQ Tail | `u32` | Completion queue tail (optional) |
 | 37 | SQ Depth | `u32` | SQ backlog (sq_tail - sq_head) |
 | 38 | CQ Depth | `u32` | CQ backlog (cq_tail - cq_head) |
+| 39 | Inode | `u64` | Backing file inode for file-backed ops; empty otherwise |
+| 40 | Filename | `string` | Resolved file path (from the inode→path cache populated by OPEN events); empty if unresolved |
+| 41 | Device | `string` | Backing device as `major:minor` (from `super_block->s_dev`); empty otherwise |
+| 42 | FS Type | `string` | Source filesystem name from the superblock magic (e.g. `EXT2/3/4`, `XFS`, `BTRFS`); empty otherwise |
+
+> Columns 39–42 are appended to the original 38-column schema, so parsers that read only the first 38 fields are unaffected.
 
 ## Event Types
 
@@ -140,6 +159,16 @@ SUBMIT and COMPLETE events share the same `Req Ptr`, enabling latency calculatio
 ```
 latency_ns = complete_ts_ns - submit_ts_ns
 ```
+
+## Mirroring into the fs/VFS trace
+
+io_uring read/write operations call `->read_iter`/`->write_iter` directly and **never pass through `vfs_read`/`vfs_write`**, so they are invisible to the VFS probes. To make async I/O visible alongside syscall I/O, each completed io_uring read/write is also emitted into the main **fs/VFS trace** (`fs/fs_*.csv`) using the standard VFS 22-column schema:
+
+- **Mirrored opcodes:** `READV`, `READ_FIXED`, `READ` → `READ`; `WRITEV`, `WRITE_FIXED`, `WRITE` → `WRITE`.
+- **Trigger:** COMPLETE events only (so `bytes_completed`/`duration_ns` are known), and only when a backing inode was resolved.
+- **Columns:** filename/inode/device/fs_type come from the prep-time file capture; `size` is the SQE length, `bytes_completed`/`errno` from the CQE result, `duration_ns` from the submit→complete latency. The generic `flags` column carries the decoded **SQE flags** (`FIXED_FILE|ASYNC|IO_LINK…`) in place of the open-file `O_*` flags, which are not available on the io_uring path.
+
+`fsync` is intentionally **not** mirrored: io_uring `FSYNC` calls `vfs_fsync` internally and is therefore already captured by the VFS fsync probe — mirroring it would double-count. The full async-specific detail (req_ptr, user_data, worker, queue depths) always remains in the dedicated io_uring CSV.
 
 ## Analysis Use Cases
 

@@ -22,6 +22,8 @@
 - `vfs_fallocate` — File space pre-allocation operations
 - `do_sendfile` / `__do_sendfile` — Efficient file-to-file transfer operations
 
+> **io_uring-origin rows:** `READ`/`WRITE` operations issued via io_uring bypass `vfs_read`/`vfs_write` (they call `->read_iter`/`->write_iter` directly), so they are mirrored into this trace from the io_uring instrumentation rather than captured by a VFS probe. They use the same schema; their `flags` column carries io_uring SQE flags (`FIXED_FILE|ASYNC|…`) instead of `O_*` flags, and `ppid`/`container_id` are empty. See [IO_URING_EVENTS.md](IO_URING_EVENTS.md#mirroring-into-the-fsvfs-trace). Each such row also has a full-detail counterpart in the io_uring CSV.
+
 ## Filename Resolution
 
 The `filename` field contains the best available path for the file at event time. Full absolute paths are resolved entirely inside the kernel at probe time before the process can exit, so even output from short-lived processes (e.g. `cat`, `ls`) contains correct paths.

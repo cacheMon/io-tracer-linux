@@ -387,6 +387,33 @@ class KernelProbeTracker:
                 if self.developer_mode:
                     logger("warning", "io_uring_enter probe not available - ENTER events disabled")
 
+            # io_uring SQE field capture (opcode/fd/len/offset/user_data + backing
+            # file). The SUBMIT kprobe on io_queue_sqe only has the io_kiocb, whose
+            # layout is not ABI-stable; the read/write prep handler receives the
+            # UAPI io_uring_sqe (stable offsets) and the io_kiocb, so we capture the
+            # SQE fields there and stage them for the SUBMIT/COMPLETE probes. The
+            # shared helper io_prep_rw covers all rw opcodes; fall back to the
+            # per-op prep handlers when it is inlined/renamed on a given kernel.
+            prep_attached = False
+            for sym in (b'io_prep_rw', b'__io_prep_rw'):
+                if BPF.get_kprobe_functions(sym):
+                    self.add_kprobe(sym.decode(), "trace_io_uring_prep_rw")
+                    prep_attached = True
+                    if self.developer_mode:
+                        logger("info", f"io_uring SQE capture enabled via {sym.decode()}")
+                    break
+            if not prep_attached:
+                for sym in (b'io_prep_readv', b'io_prep_writev',
+                            b'io_prep_read', b'io_prep_write',
+                            b'io_prep_read_fixed', b'io_prep_write_fixed'):
+                    if BPF.get_kprobe_functions(sym):
+                        self.add_kprobe(sym.decode(), "trace_io_uring_prep_rw")
+                        prep_attached = True
+                if self.developer_mode and prep_attached:
+                    logger("info", "io_uring SQE capture enabled via per-op prep handlers")
+            if not prep_attached and self.developer_mode:
+                logger("warning", "io_uring SQE prep probe not available - opcode/fd/len/offset may be empty")
+
             # io_uring SQE submission probe (kprobe fallback for SUBMIT events)
             # Note: TRACEPOINT_PROBE(io_uring, io_uring_submit_sqe) in BPF is preferred
             if BPF.get_kprobe_functions(b'io_queue_sqe'):
