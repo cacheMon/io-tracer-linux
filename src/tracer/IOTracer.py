@@ -1111,55 +1111,60 @@ class IOTracer:
         #     lost_cb=self._lost_cb
         # )
 
-        self.b["net_events"].open_perf_buffer(
-            self._print_event_net,
-            page_cnt=self.page_cnt,
-            lost_cb=self._lost_cb
-        )
+        # Network logging is disabled: the network perf buffers below are left
+        # unopened so the polling thread never reads them. With no reader, the
+        # auto-attached network probes' events are simply discarded and nothing
+        # is processed, written to nw*/ CSVs, or uploaded.
+        #
+        # self.b["net_events"].open_perf_buffer(
+        #     self._print_event_net,
+        #     page_cnt=self.page_cnt,
+        #     lost_cb=self._lost_cb
+        # )
 
         # Connection lifecycle events (Phase 1)
-        try:
-            self.b["net_conn_events"].open_perf_buffer(
-                self._print_event_conn,
-                page_cnt=self.page_cnt,
-                lost_cb=self._lost_cb
-            )
-        except KeyError:
-            if self.verbose:
-                logger("warning", "net_conn_events buffer not available")
+        # try:
+        #     self.b["net_conn_events"].open_perf_buffer(
+        #         self._print_event_conn,
+        #         page_cnt=self.page_cnt,
+        #         lost_cb=self._lost_cb
+        #     )
+        # except KeyError:
+        #     if self.verbose:
+        #         logger("warning", "net_conn_events buffer not available")
 
         # Epoll/multiplexing events (Phase 2)
-        try:
-            self.b["net_epoll_events"].open_perf_buffer(
-                self._print_event_epoll,
-                page_cnt=self.page_cnt,
-                lost_cb=self._lost_cb
-            )
-        except KeyError:
-            if self.verbose:
-                logger("warning", "net_epoll_events buffer not available")
+        # try:
+        #     self.b["net_epoll_events"].open_perf_buffer(
+        #         self._print_event_epoll,
+        #         page_cnt=self.page_cnt,
+        #         lost_cb=self._lost_cb
+        #     )
+        # except KeyError:
+        #     if self.verbose:
+        #         logger("warning", "net_epoll_events buffer not available")
 
         # Socket option events (Phase 4)
-        try:
-            self.b["net_sockopt_events"].open_perf_buffer(
-                self._print_event_sockopt,
-                page_cnt=self.page_cnt,
-                lost_cb=self._lost_cb
-            )
-        except KeyError:
-            if self.verbose:
-                logger("warning", "net_sockopt_events buffer not available")
+        # try:
+        #     self.b["net_sockopt_events"].open_perf_buffer(
+        #         self._print_event_sockopt,
+        #         page_cnt=self.page_cnt,
+        #         lost_cb=self._lost_cb
+        #     )
+        # except KeyError:
+        #     if self.verbose:
+        #         logger("warning", "net_sockopt_events buffer not available")
 
         # Network drop/retransmission events (Phase 5)
-        try:
-            self.b["net_drop_events"].open_perf_buffer(
-                self._print_event_drop,
-                page_cnt=self.page_cnt,
-                lost_cb=self._lost_cb
-            )
-        except KeyError:
-            if self.verbose:
-                logger("warning", "net_drop_events buffer not available")
+        # try:
+        #     self.b["net_drop_events"].open_perf_buffer(
+        #         self._print_event_drop,
+        #         page_cnt=self.page_cnt,
+        #         lost_cb=self._lost_cb
+        #     )
+        # except KeyError:
+        #     if self.verbose:
+        #         logger("warning", "net_drop_events buffer not available")
 
         # Page fault events for mmap I/O tracking
         # try:
