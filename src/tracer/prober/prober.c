@@ -501,6 +501,12 @@ struct io_uring_event_data {
   u32 worker_cpu;               /**< io-wq worker CPU */
   u8 is_async;                  /**< 1 if executed by io-wq worker */
   
+  /* File correlation — populated for file-backed ops from req->file so that
+   * io_uring I/O can be joined with the fs/VFS trace by inode/device. */
+  u64 inode;                    /**< Backing file inode (0 if not a file op) */
+  u32 dev;                      /**< Backing device id (super_block->s_dev) */
+  u32 fs_magic;                 /**< Superblock magic for fs-type classification */
+
   /* Ring state (optional) */
   u32 sq_head;
   u32 sq_tail;
@@ -518,6 +524,12 @@ struct io_uring_submit_ctx {
   s32 fd;                     /**< Target FD */
   u32 len;                    /**< I/O length */
   u64 offset;                 /**< File offset */
+  u8 sqe_flags;               /**< SQE flags (IOSQE_*) */
+  u16 ioprio;                 /**< I/O priority */
+  u16 buf_index;              /**< Fixed-buffer index */
+  u64 inode;                  /**< Backing file inode (file ops) */
+  u32 dev;                    /**< Backing device id */
+  u32 fs_magic;               /**< Superblock magic */
 };
 
 /**
@@ -3632,10 +3644,111 @@ int trace_io_uring_enter(struct pt_regs *ctx, unsigned int fd,
 }
 
 /**
+ * @brief ABI-stable subset of the io_uring SQE (uapi/linux/io_uring.h).
+ *
+ * struct io_uring_sqe is a UAPI structure whose leading field offsets are
+ * stable across every kernel that supports io_uring. We mirror that prefix so
+ * the prep probe can read the opcode/fd/len/offset/user_data directly from the
+ * SQE — values that the internal struct io_kiocb does NOT expose at stable
+ * offsets (its layout changes substantially between releases). The trailing
+ * fields of the real SQE are not needed and are intentionally omitted.
+ */
+struct io_uring_sqe_min {
+  u8  opcode;     /* 0  : IORING_OP_* */
+  u8  flags;      /* 1  : IOSQE_* */
+  u16 ioprio;     /* 2  : I/O priority */
+  s32 fd;         /* 4  : target file descriptor */
+  u64 off;        /* 8  : off / addr2 union */
+  u64 addr;       /* 16 : addr / splice_off_in union */
+  u32 len;        /* 24 : I/O length in bytes */
+  u32 op_flags;   /* 28 : rw_flags / fsync_flags / ... union */
+  u64 user_data;  /* 32 : caller correlation token */
+  u16 buf_index;  /* 40 : buf_index / buf_group union */
+};
+
+/**
+ * @brief Capture io_uring SQE fields at request-prep time.
+ *
+ * Attached to the read/write prep handler, which is invoked through the opcode
+ * dispatch table (def->prep) and therefore is not inlined away. It receives the
+ * io_kiocb request and the UAPI SQE:
+ *
+ *   int io_prep_rw(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ *
+ * Reading the SQE (stable ABI offsets) yields the opcode, fd, length, offset,
+ * priority and user_data. The req->file pointer — the first member of io_kiocb
+ * on modern kernels — yields the backing file's inode/device/filesystem so the
+ * io_uring I/O can be joined with the fs/VFS trace. Results are staged in
+ * io_uring_submit_map keyed by the req pointer and consumed by the SUBMIT and
+ * COMPLETE probes. If the prep symbol is unavailable on a given kernel these
+ * fields simply stay empty (graceful degradation).
+ *
+ * @param ctx BPF context
+ * @param req io_kiocb request structure pointer (PARM1)
+ * @param sqe UAPI io_uring_sqe pointer (PARM2)
+ * @return    0
+ */
+int trace_io_uring_prep_rw(struct pt_regs *ctx, void *req, void *sqe) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 pid = pid_tgid >> 32;
+
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) {
+    return 0;
+  }
+
+  if (!req || !sqe) {
+    return 0;
+  }
+
+  struct io_uring_sqe_min s = {};
+  /* The SQE normally lives in kernel-allocated ring memory (mmapped to
+   * userspace), so a kernel read works. With IORING_SETUP_NO_MMAP (6.5+) the
+   * ring is allocated in application memory and the pointer is a user address,
+   * for which the kernel read fails — fall back to a user read so the SQE
+   * fields are still captured. */
+  if (bpf_probe_read_kernel(&s, sizeof(s), sqe) != 0) {
+    bpf_probe_read_user(&s, sizeof(s), sqe);
+  }
+
+  struct io_uring_submit_ctx submit_ctx = {};
+  submit_ctx.opcode    = s.opcode;
+  submit_ctx.sqe_flags = s.flags;
+  submit_ctx.ioprio    = s.ioprio;
+  submit_ctx.fd        = s.fd;
+  submit_ctx.offset    = s.off;
+  submit_ctx.len       = s.len;
+  submit_ctx.user_data = s.user_data;
+  submit_ctx.buf_index = s.buf_index;
+
+  /* req->file is the first member of struct io_kiocb on modern kernels. Pull
+   * the backing file identity when it is a regular file on a real filesystem;
+   * is_regular_file() filters sockets/pipes/pseudo-fs and bad reads. */
+  struct file *file = NULL;
+  bpf_probe_read_kernel(&file, sizeof(file), req);
+  if (is_regular_file(file)) {
+    submit_ctx.inode = get_file_inode(file);
+    get_file_source(file, &submit_ctx.dev, &submit_ctx.fs_magic);
+  }
+
+  u64 req_ptr = (u64)req;
+  io_uring_submit_map.update(&req_ptr, &submit_ctx);
+  return 0;
+}
+
+/**
  * @brief Trace io_uring SQE submission (via io_submit_sqes or io_queue_sqe)
  *
  * Captures individual SQE submissions with operation details.
  * Stores submit timestamp for latency calculation on completion.
+ *
+ * The opcode/fd/len/offset/user_data are read from the SQE by the prep probe
+ * (trace_io_uring_prep_rw) and staged in io_uring_submit_map before this probe
+ * runs. We reuse that staged context and stamp the submission timestamp so the
+ * completion probe can compute latency. When no prep data exists (a non-rw op,
+ * or a kernel without the prep symbol) we still recover the backing file from
+ * req->file on a best-effort basis.
  *
  * @param ctx BPF context
  * @param req io_kiocb request structure pointer
@@ -3654,30 +3767,23 @@ int trace_io_uring_submit(struct pt_regs *ctx, void *req) {
   u64 ts = bpf_ktime_get_ns();
   u64 req_ptr = (u64)req;
 
-  /* Read io_kiocb fields - structure offsets may vary by kernel version */
-  /* These are common fields that exist in most kernel versions */
-  u8 opcode = 0;
-  u64 user_data = 0;
-  s32 fd = -1;
-  u32 len = 0;
-  u64 offset = 0;
-  u8 flags = 0;
-
-  /* 
-   * Note: io_kiocb structure layout varies significantly across kernel versions.
-   * We read from known stable offsets. For production use, consider using
-   * tracepoints when available (io_uring:io_uring_submit_sqe).
-   */
-  
-  /* Store submission context for correlation on completion */
+  /* Reuse the SQE context staged by the prep probe; fall back to reading the
+   * backing file directly when this request was not prepped through the rw
+   * handler (e.g. fsync/openat ops, or a kernel without the prep symbol). */
   struct io_uring_submit_ctx submit_ctx = {};
+  struct io_uring_submit_ctx *staged = io_uring_submit_map.lookup(&req_ptr);
+  if (staged) {
+    submit_ctx = *staged;
+  } else {
+    submit_ctx.fd = -1;
+    struct file *file = NULL;
+    bpf_probe_read_kernel(&file, sizeof(file), req);
+    if (is_regular_file(file)) {
+      submit_ctx.inode = get_file_inode(file);
+      get_file_source(file, &submit_ctx.dev, &submit_ctx.fs_magic);
+    }
+  }
   submit_ctx.submit_ts_ns = ts;
-  submit_ctx.user_data = user_data;
-  submit_ctx.opcode = opcode;
-  submit_ctx.fd = fd;
-  submit_ctx.len = len;
-  submit_ctx.offset = offset;
-  
   io_uring_submit_map.update(&req_ptr, &submit_ctx);
 
   struct io_uring_event_data e = {};
@@ -3688,12 +3794,17 @@ int trace_io_uring_submit(struct pt_regs *ctx, void *req) {
   bpf_get_current_comm(&e.comm, sizeof(e.comm));
   e.cpu = bpf_get_smp_processor_id();
   e.req_ptr = req_ptr;
-  e.user_data = user_data;
-  e.opcode = opcode;
-  e.fd = fd;
-  e.len = len;
-  e.offset = offset;
-  e.sqe_flags = flags;
+  e.user_data = submit_ctx.user_data;
+  e.opcode = submit_ctx.opcode;
+  e.fd = submit_ctx.fd;
+  e.len = submit_ctx.len;
+  e.offset = submit_ctx.offset;
+  e.sqe_flags = submit_ctx.sqe_flags;
+  e.ioprio = submit_ctx.ioprio;
+  e.buf_index = submit_ctx.buf_index;
+  e.inode = submit_ctx.inode;
+  e.dev = submit_ctx.dev;
+  e.fs_magic = submit_ctx.fs_magic;
   e.submit_ts_ns = ts;
 
   io_uring_events.perf_submit(ctx, &e, sizeof(e));
@@ -3745,13 +3856,21 @@ int trace_io_uring_complete(struct pt_regs *ctx, void *req, s32 result) {
   struct io_uring_submit_ctx *submit_ctx = io_uring_submit_map.lookup(&req_ptr);
   if (submit_ctx) {
     e.submit_ts_ns = submit_ctx->submit_ts_ns;
-    e.latency_ns = ts - submit_ctx->submit_ts_ns;
+    if (submit_ctx->submit_ts_ns) {
+      e.latency_ns = ts - submit_ctx->submit_ts_ns;
+    }
     e.user_data = submit_ctx->user_data;
     e.opcode = submit_ctx->opcode;
     e.fd = submit_ctx->fd;
     e.len = submit_ctx->len;
     e.offset = submit_ctx->offset;
-    
+    e.sqe_flags = submit_ctx->sqe_flags;
+    e.ioprio = submit_ctx->ioprio;
+    e.buf_index = submit_ctx->buf_index;
+    e.inode = submit_ctx->inode;
+    e.dev = submit_ctx->dev;
+    e.fs_magic = submit_ctx->fs_magic;
+
     /* Clean up the map entry */
     io_uring_submit_map.delete(&req_ptr);
   }
@@ -3801,6 +3920,13 @@ int trace_io_uring_worker(struct pt_regs *ctx, void *req) {
     e.user_data = submit_ctx->user_data;
     e.opcode = submit_ctx->opcode;
     e.submit_ts_ns = submit_ctx->submit_ts_ns;
+    e.fd = submit_ctx->fd;
+    e.len = submit_ctx->len;
+    e.offset = submit_ctx->offset;
+    e.sqe_flags = submit_ctx->sqe_flags;
+    e.inode = submit_ctx->inode;
+    e.dev = submit_ctx->dev;
+    e.fs_magic = submit_ctx->fs_magic;
   }
 
   io_uring_events.perf_submit(ctx, &e, sizeof(e));

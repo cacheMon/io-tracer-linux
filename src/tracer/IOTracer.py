@@ -800,6 +800,31 @@ class IOTracer:
         sq_depth = str(e.sq_depth) if e.sq_depth else ""
         cq_depth = str(e.cq_depth) if e.cq_depth else ""
 
+        # File correlation — the prep probe records the backing file's inode,
+        # device and filesystem for file-backed ops. Resolve the path from the
+        # inode→path cache populated by OPEN events (same strategy as VFS events)
+        # so io_uring I/O carries the same file identity as the fs trace.
+        inode_val = e.inode if getattr(e, "inode", 0) else ""
+        dev_val = self._format_dev(e.dev) if getattr(e, "dev", 0) else ""
+        fs_type_val = (
+            self.flag_mapper.format_fs_type(e.fs_magic)
+            if getattr(e, "fs_magic", 0) else ""
+        )
+        filename = ""
+        if getattr(e, "inode", 0):
+            cached = self.path_resolver.inode_to_path.get(e.inode)
+            if cached:
+                filename = cached
+            if self.anonymous and filename:
+                filename = hash_filename_in_path(Path(filename))
+
+        # Surface io_uring file READ/WRITE in the main fs/VFS trace stream so
+        # async I/O appears alongside syscall reads/writes. Mirror only on
+        # COMPLETE (result/latency known) and only read/write opcodes, which
+        # bypass vfs_read/vfs_write and would otherwise be invisible there.
+        if e.event_type == 2:
+            self._mirror_io_uring_to_fs(e, comm, filename, ts, dev_val, fs_type_val)
+
         # Build CSV row matching the unified schema from the guide
         output = format_csv_row(
             ts.strftime("%Y-%m-%d %H:%M:%S.%f"),
@@ -840,8 +865,75 @@ class IOTracer:
             cq_tail,
             sq_depth,
             cq_depth,
+            inode_val,
+            filename,
+            dev_val,
+            fs_type_val,
         )
         self.writer.append_io_uring_log(output)
+
+    def _mirror_io_uring_to_fs(self, e, comm, filename, ts, dev_val, fs_type_val):
+        """
+        Emit an fs/VFS-shaped row for a completed io_uring file READ/WRITE.
+
+        io_uring read/write operations call ``->read_iter``/``->write_iter``
+        directly and never pass through ``vfs_read``/``vfs_write``, so they are
+        invisible to the VFS probes. To make async I/O visible alongside
+        syscall I/O, this mirrors COMPLETE events for the read/write opcode
+        families into the fs log using the same 22-column schema as
+        ``_print_event``.
+
+        fsync is intentionally not mirrored: io_uring FSYNC calls ``vfs_fsync``
+        internally and is therefore already captured by the VFS fsync probe;
+        mirroring it would double-count.
+
+        Args:
+            e: The io_uring perf event.
+            comm: Decoded process name.
+            filename: Resolved file path (may be empty).
+            ts: Event datetime (matches the fs-log timestamp format).
+            dev_val: Pre-formatted ``major:minor`` device string.
+            fs_type_val: Pre-formatted filesystem name.
+        """
+        # IORING_OP_* read/write opcode families → unified fs operation name.
+        op_map = {
+            1: "READ",   # READV
+            4: "READ",   # READ_FIXED
+            22: "READ",  # READ
+            2: "WRITE",  # WRITEV
+            5: "WRITE",  # WRITE_FIXED
+            23: "WRITE", # WRITE
+        }
+        op_name = op_map.get(e.opcode)
+        if not op_name or not getattr(e, "inode", 0):
+            return
+
+        ret = e.result
+        return_value = str(ret)
+        errno_val = ""
+        bytes_completed = ""
+        if ret < 0:
+            errno_val = self.flag_mapper.format_errno(-ret)
+        else:
+            bytes_completed = str(ret)
+        duration_ns = str(e.latency_ns) if e.latency_ns else ""
+
+        offset_val = e.offset if e.offset else ""
+        tid_val = e.tid if e.tid else ""
+        size_val = e.len if e.len else 0
+        # io_uring rows carry the SQE flags (FIXED_FILE|ASYNC|IO_LINK…) in the
+        # generic flags column in place of the open-file O_* flags, which are
+        # not available on the io_uring path.
+        flags_val = self.flag_mapper.format_io_uring_sqe_flags(e.sqe_flags)
+        cmdline = self._read_cmdline_cached(e.pid)
+
+        output = format_csv_row(
+            ts, op_name, e.pid, comm, filename, size_val, e.inode,
+            flags_val, offset_val, tid_val, "", "", "", cmdline,
+            return_value, errno_val, bytes_completed, duration_ns,
+            dev_val, "", "", fs_type_val
+        )
+        self.writer.append_fs_log(output)
 
     def _cleanup(self, signum, frame):
         self.running = False
