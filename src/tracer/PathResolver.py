@@ -95,14 +95,14 @@ class PathResolver:
                             files[inode] = target
                             # Update global inode cache
                             self.inode_to_path[inode] = target
-                    except:
+                    except OSError:
                         continue
-            
+
             self.pid_to_files[pid] = files
             self.last_update[pid] = current_time
             return files
-            
-        except:
+
+        except OSError:
             return {}
     
     def resolve_by_fd(self, pid: int, fd: int, inode: int = 0, filename: str = "") -> str:
@@ -234,8 +234,8 @@ class PathResolver:
                 pids_to_remove.append(pid)
         
         for pid in pids_to_remove:
-            del self.pid_to_files[pid]
-            del self.last_update[pid]
+            self.pid_to_files.pop(pid, None)
+            self.last_update.pop(pid, None)
         
         # Optionally limit inode cache size
         if len(self.inode_to_path) > 10000:
