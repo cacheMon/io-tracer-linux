@@ -95,14 +95,14 @@ class PathResolver:
                             files[inode] = target
                             # Update global inode cache
                             self.inode_to_path[inode] = target
-                    except:
+                    except OSError:
                         continue
-            
+
             self.pid_to_files[pid] = files
             self.last_update[pid] = current_time
             return files
-            
-        except:
+
+        except OSError:
             return {}
     
     def resolve_by_fd(self, pid: int, fd: int, inode: int = 0, filename: str = "") -> str:
@@ -225,10 +225,10 @@ class PathResolver:
         - Process entries older than cache_timeout * 10 seconds
         - Limits inode cache to 5000 most recent entries
 
-        Thread-safety: this runs on the main thread while perf-buffer
-        callbacks mutate these dicts from the polling thread, so iteration
-        works on list() snapshots (atomic in CPython) and removals tolerate
-        entries that disappeared concurrently.
+        Thread-safety: this runs on the polling thread (from the perf-buffer
+        callbacks via cache maintenance), the same thread that mutates these
+        dicts. Iteration still works on list() snapshots and removals
+        tolerate missing entries as defense in depth.
         """
         current_time = time.time()
 
@@ -241,6 +241,7 @@ class PathResolver:
         for pid in pids_to_remove:
             self.pid_to_files.pop(pid, None)
             self.last_update.pop(pid, None)
+
 
         # Optionally limit inode cache size
         if len(self.inode_to_path) > 10000:

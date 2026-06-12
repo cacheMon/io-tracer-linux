@@ -141,7 +141,15 @@ class IOTracer:
         self.path_resolver      = PathResolver()
         self.mmap_regions       = {}
         self.cmdline_cache      = {}  # pid -> cmdline, populated on first successful read
-        self._last_cache_cleanup = time.time()
+
+        # Bounded-cache maintenance. The path resolver and cmdline caches are
+        # only evicted on PROCESS_EXEC, so over a long-running trace they would
+        # otherwise grow without bound. Maintenance runs from the perf-callback
+        # (polling) thread — the only thread that mutates these caches — so it
+        # never races with event processing.
+        self._event_count           = 0
+        self._maintenance_interval  = 50000  # events between cache sweeps
+        self._cmdline_cache_max     = 100000  # hard cap on cmdline cache entries
 
         if cache_sample_rate > 1:
             self.writer.set_cache_sampling(cache_sample_rate)
@@ -192,9 +200,11 @@ class IOTracer:
             data: Raw event data pointer
             size: Size of the event data
         """
+        self._tick_maintenance()
+
         event = self.b["events"].event(data)
         op_name = self.flag_mapper.op_fs_types.get(event.op, "[unknown]")
-        
+
         try:
             filename = event.filename.decode()
             if self.anonymous:
@@ -518,6 +528,46 @@ class IOTracer:
         self.cmdline_cache[pid] = result
         return result
 
+    def _tick_maintenance(self) -> None:
+        """
+        Advance the event counter and run cache maintenance when it is due.
+
+        Called from every perf callback that runs on the polling thread and
+        touches the long-lived caches (``_print_event``, ``_print_event_dual``,
+        ``_print_event_io_uring``) so a workload dominated by any single event
+        family — e.g. rename/link/symlink (dual) or async io_uring I/O — still
+        triggers eviction instead of growing the caches unbounded.
+        """
+        self._event_count += 1
+        if self._event_count % self._maintenance_interval == 0:
+            self._run_cache_maintenance()
+
+    def _run_cache_maintenance(self) -> None:
+        """
+        Bound the long-lived caches so an indefinite trace does not leak memory.
+
+        Runs from the perf-callback (polling) thread, which is the only thread
+        that mutates ``cmdline_cache`` and the path resolver caches, so no
+        locking is required.
+
+        - Delegates to ``PathResolver.cleanup_old_cache`` (otherwise never
+          called), which prunes stale per-PID entries and caps ``inode_to_path``.
+        - Caps ``cmdline_cache`` at ``_cmdline_cache_max`` entries. Entries are
+          deliberately retained past process exit so that CLOSE/EXIT events
+          buffered after the process is gone can still resolve a cmdline; when
+          the cap is exceeded we drop the oldest half (dicts preserve insertion
+          order), keeping the most recently seen PIDs.
+        """
+        try:
+            self.path_resolver.cleanup_old_cache()
+        except Exception as e:
+            if self.verbose:
+                logger("warning", f"Path resolver cache cleanup failed: {e}")
+
+        if len(self.cmdline_cache) > self._cmdline_cache_max:
+            items = list(self.cmdline_cache.items())
+            self.cmdline_cache = dict(items[len(items) // 2:])
+
     def _handle_process_exec(self, pid: int) -> None:
         """
         Clear the mmap_regions and cmdline caches for a PID on exec.
@@ -528,31 +578,6 @@ class IOTracer:
         """
         self.mmap_regions.pop(pid, None)
         self.cmdline_cache.pop(pid, None)
-
-    def _maybe_cleanup_caches(self) -> None:
-        """
-        Periodically bound the userspace caches during long traces.
-
-        path_resolver.inode_to_path gains an entry for every opened inode and
-        cmdline_cache for every observed PID; without pruning an indefinite
-        trace grows them without bound.
-        """
-        now = time.time()
-        if now - self._last_cache_cleanup < 60:
-            return
-        self._last_cache_cleanup = now
-        # The polling thread mutates these caches concurrently; cleanup uses
-        # snapshot-based iteration, but guard regardless — a rare race must
-        # degrade to a skipped cleanup, not terminate the trace loop.
-        try:
-            self.path_resolver.cleanup_old_cache()
-            # Keep the most recently added entries (insertion order) so
-            # cmdlines for recently exited PIDs — the reason this cache
-            # exists — survive; entries for live PIDs are re-read on demand.
-            if len(self.cmdline_cache) > 20000:
-                self.cmdline_cache = dict(list(self.cmdline_cache.items())[-5000:])
-        except Exception as e:
-            logger("warning", f"Cache cleanup skipped: {e}")
 
     def _handle_process_exit(self, pid: int) -> None:
         """
@@ -577,6 +602,8 @@ class IOTracer:
             data: Raw event data pointer
             size: Size of the event data
         """
+        self._tick_maintenance()
+
         event = self.b["events_dual"].event(data)
         op_name = self.flag_mapper.op_fs_types.get(event.op, "[unknown]")
         
@@ -778,6 +805,8 @@ class IOTracer:
             data: Raw event data pointer
             size: Size of the event data
         """
+        self._tick_maintenance()
+
         e = self.b["io_uring_events"].event(data)
         ts = datetime.today()
         
@@ -1081,7 +1110,6 @@ class IOTracer:
                 while remaining > 0 and self.running:
                     sleep_time = min(0.1, remaining)
                     time.sleep(sleep_time)
-                    self._maybe_cleanup_caches()
 
                     current = time.time()
                     remaining = end_time - current # type: ignore
@@ -1095,7 +1123,6 @@ class IOTracer:
                 # Run indefinitely until Ctrl+C
                 while self.running:
                     time.sleep(0.1)
-                    self._maybe_cleanup_caches()
 
                     if self.verbose:
                         current = time.time()
@@ -1124,10 +1151,10 @@ class IOTracer:
             run_with_spinner("Compressing trace output", self.writer.force_flush)
 
             if self.automatic_upload:
-                # server_mode=True drains the queue before stopping the worker;
-                # otherwise the final bundle queued by force_flush above may
-                # never be uploaded (the worker stops before picking it up).
-                run_with_spinner("Uploading traces", lambda: self.upload_manager.stop_worker(True, timeout=60))
+                # Drain the upload queue before stopping the workers — passing
+                # False here set the stop event immediately and abandoned any
+                # traces still queued for upload.
+                run_with_spinner("Uploading traces", lambda: self.upload_manager.stop_worker(True, timeout=30))
                 try:
                     os.removedirs(self.writer.output_dir)
                 except OSError:
