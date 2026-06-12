@@ -498,7 +498,7 @@ class WriteManager:
         Flush filesystem snapshot buffer to a multi-part file.
 
         Writes buffer to filesystem_snapshot_part####_TIMESTAMP_DEVICEID.csv,
-        compresses it with Zstandard, and increments the part counter.
+        compresses it with gzip, and increments the part counter.
         """
         with self._stream_locks['fs_snap']:
             if not self.fs_snap_buffer:
@@ -641,6 +641,7 @@ class WriteManager:
 
     def flush_process_state_only(self):
         """Flush process state buffer to file."""
+        rotated = None
         with self._stream_locks['process']:
             if self.process_buffer:
                 if self._process_handle is None:
@@ -648,19 +649,21 @@ class WriteManager:
                 self.current_datetime = datetime.now()
 
                 self._write_buffer_to_file(self.process_buffer, self._process_handle, "Process State")
-                self.compress_log(self.output_process_file)
-                self.output_process_file = f"{self.output_dir}/process/process_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-
                 self._process_handle.close()
+                rotated = self.output_process_file
+                self.output_process_file = f"{self.output_dir}/process/process_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
                 self._process_handle = open(self.output_process_file, 'a', buffering=8192)
                 self._reset_flush_timer()
 
                 # Mark process snapshot as complete
                 self.process_snapshot_session_active = False
                 logger("info", "Process Snapshot: completed and flushed")
+        if rotated is not None:
+            self.compress_log(rotated)
 
     def flush_cache_only(self):
         """Flush cache buffer to file."""
+        rotated = None
         with self._stream_locks['cache']:
             if self.cache_buffer:
                 if self._cache_handle is None:
@@ -668,16 +671,18 @@ class WriteManager:
                 self.current_datetime = datetime.now()
 
                 self._write_buffer_to_file(self.cache_buffer, self._cache_handle, "Cache")
-                self.compress_log(self.output_cache_file)
-                self.output_cache_file = f"{self.output_dir}/cache/cache_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-
                 self._cache_handle.close()
+                rotated = self.output_cache_file
+                self.output_cache_file = f"{self.output_dir}/cache/cache_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
                 self._cache_handle = open(self.output_cache_file, 'a', buffering=8192)
                 self._reset_flush_timer()
+        if rotated is not None:
+            self.compress_log(rotated)
 
 
     def flush_vfs_only(self):
         """Flush VFS buffer to file."""
+        rotated = None
         with self._stream_locks['vfs']:
             if self.vfs_buffer:
                 if self._vfs_handle is None:
@@ -685,15 +690,21 @@ class WriteManager:
                 self.current_datetime = datetime.now()
 
                 self._write_buffer_to_file(self.vfs_buffer, self._vfs_handle, "VFS")
-                self.compress_log(self.output_vfs_file)
-                self.output_vfs_file = f"{self.output_dir}/fs/fs_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-
+                # Close before compressing so we never gzip/delete a file that
+                # still has an open descriptor; rotate to a fresh output file.
                 self._vfs_handle.close()
+                rotated = self.output_vfs_file
+                self.output_vfs_file = f"{self.output_dir}/fs/fs_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
                 self._vfs_handle = open(self.output_vfs_file, 'a', buffering=8192)
                 self._reset_flush_timer()
+        # Compress outside the lock: gzip + disk I/O is slow and must not block
+        # the perf-callback flush or the periodic writer for this stream.
+        if rotated is not None:
+            self.compress_log(rotated)
 
     def flush_block_only(self):
         """Flush block buffer to file."""
+        rotated = None
         with self._stream_locks['block']:
             if self.block_buffer:
                 if self._block_handle is None:
@@ -701,15 +712,17 @@ class WriteManager:
                 self.current_datetime = datetime.now()
 
                 self._write_buffer_to_file(self.block_buffer, self._block_handle, "Block")
-                self.compress_log(self.output_block_file)
-                self.output_block_file = f"{self.output_dir}/ds/ds_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-
                 self._block_handle.close()
+                rotated = self.output_block_file
+                self.output_block_file = f"{self.output_dir}/ds/ds_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
                 self._block_handle = open(self.output_block_file, 'a', buffering=8192)
                 self._reset_flush_timer()
+        if rotated is not None:
+            self.compress_log(rotated)
 
     def flush_pagefault_only(self):
         """Flush pagefault buffer to file."""
+        rotated = None
         with self._stream_locks['pagefault']:
             if self.pagefault_buffer:
                 if self._pagefault_handle is None:
@@ -717,15 +730,17 @@ class WriteManager:
                 self.current_datetime = datetime.now()
 
                 self._write_buffer_to_file(self.pagefault_buffer, self._pagefault_handle, "PageFault")
-                self.compress_log(self.output_pagefault_file)
-                self.output_pagefault_file = f"{self.output_dir}/pagefault/pagefault_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-
                 self._pagefault_handle.close()
+                rotated = self.output_pagefault_file
+                self.output_pagefault_file = f"{self.output_dir}/pagefault/pagefault_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
                 self._pagefault_handle = open(self.output_pagefault_file, 'a', buffering=8192)
                 self._reset_flush_timer()
+        if rotated is not None:
+            self.compress_log(rotated)
 
     def flush_io_uring_only(self):
         """Flush io_uring buffer to file."""
+        rotated = None
         with self._stream_locks['io_uring']:
             if self.io_uring_buffer:
                 if self._io_uring_handle is None:
@@ -733,15 +748,24 @@ class WriteManager:
                 self.current_datetime = datetime.now()
 
                 self._write_buffer_to_file(self.io_uring_buffer, self._io_uring_handle, "IO_Uring")
-                self.compress_log(self.output_io_uring_file)
-                self.output_io_uring_file = f"{self.output_dir}/io_uring/io_uring_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-
                 self._io_uring_handle.close()
+                rotated = self.output_io_uring_file
+                self.output_io_uring_file = f"{self.output_dir}/io_uring/io_uring_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
                 self._io_uring_handle = open(self.output_io_uring_file, 'a', buffering=8192)
                 self._reset_flush_timer()
+        if rotated is not None:
+            self.compress_log(rotated)
 
     def force_flush(self):
         """Flush all buffers and compress all output files."""
+        # Make sure every buffer is on disk and all handles are closed before we
+        # compress. _cleanup normally does this, but it is bypassed on the
+        # unhandled-exception exit path in IOTracer.trace(); without this we
+        # would compress files that are missing buffered rows or still hold an
+        # open descriptor. Both calls are idempotent when _cleanup already ran.
+        self.write_to_disk()
+        self.close_handles()
+
         self.compress_log(self.output_block_file)
         self.compress_log(self.output_vfs_file)
         self.compress_log(self.output_cache_file)

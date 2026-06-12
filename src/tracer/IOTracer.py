@@ -200,9 +200,7 @@ class IOTracer:
             data: Raw event data pointer
             size: Size of the event data
         """
-        self._event_count += 1
-        if self._event_count % self._maintenance_interval == 0:
-            self._run_cache_maintenance()
+        self._tick_maintenance()
 
         event = self.b["events"].event(data)
         op_name = self.flag_mapper.op_fs_types.get(event.op, "[unknown]")
@@ -530,6 +528,20 @@ class IOTracer:
         self.cmdline_cache[pid] = result
         return result
 
+    def _tick_maintenance(self) -> None:
+        """
+        Advance the event counter and run cache maintenance when it is due.
+
+        Called from every perf callback that runs on the polling thread and
+        touches the long-lived caches (``_print_event``, ``_print_event_dual``,
+        ``_print_event_io_uring``) so a workload dominated by any single event
+        family — e.g. rename/link/symlink (dual) or async io_uring I/O — still
+        triggers eviction instead of growing the caches unbounded.
+        """
+        self._event_count += 1
+        if self._event_count % self._maintenance_interval == 0:
+            self._run_cache_maintenance()
+
     def _run_cache_maintenance(self) -> None:
         """
         Bound the long-lived caches so an indefinite trace does not leak memory.
@@ -590,6 +602,8 @@ class IOTracer:
             data: Raw event data pointer
             size: Size of the event data
         """
+        self._tick_maintenance()
+
         event = self.b["events_dual"].event(data)
         op_name = self.flag_mapper.op_fs_types.get(event.op, "[unknown]")
         
@@ -791,6 +805,8 @@ class IOTracer:
             data: Raw event data pointer
             size: Size of the event data
         """
+        self._tick_maintenance()
+
         e = self.b["io_uring_events"].event(data)
         ts = datetime.today()
         
