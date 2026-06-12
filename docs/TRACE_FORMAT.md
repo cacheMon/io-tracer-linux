@@ -11,11 +11,6 @@ linux_trace_v3_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── fs/                    # VFS (Virtual File System) traces
 ├── ds/                    # Block device traces
 ├── cache/                 # Page cache events
-├── nw/                    # Network I/O traces
-├── nw_conn/               # Connection lifecycle events
-├── nw_epoll/              # Epoll/multiplexing events
-├── nw_sockopt/            # Socket configuration events
-├── nw_drop/               # Packet drops & retransmissions
 ├── pagefault/             # Memory-mapped page fault events
 ├── io_uring/              # io_uring async I/O events
 ├── process/               # Process state snapshots
@@ -78,87 +73,7 @@ For event types and examples, see [PAGE_CACHE_EVENTS.md](traces/PAGE_CACHE_EVENT
 
 ---
 
-## 4. Network Traces
-
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/nw/nw_*.csv.gz`
-
-**Description:** Captures TCP and UDP network I/O operations with address, port, protocol, latency, error codes, and message flag information.
-
-### CSV Header
-
-```csv
-timestamp,pid,command,protocol,ip_version,source_addr,dest_addr,source_port,dest_port,size,direction,latency_ns,error_code,msg_flags
-```
-
-For protocols captured and examples, see [NETWORK_EVENTS.md](traces/NETWORK_EVENTS.md).
-
----
-
-## 4a. Connection Lifecycle Events
-
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/nw_conn/nw_conn_*.csv.gz`
-
-**Description:** Captures the full connection lifecycle: socket creation, bind, listen, accept, connect, shutdown.
-
-### CSV Header
-
-```csv
-timestamp,event_type,pid,tid,command,domain,sock_type,protocol,ip_version,local_addr,remote_addr,local_port,remote_port,fd,backlog,latency_ns,return_value
-```
-
-For event types and examples, see [CONNECTION_LIFECYCLE_EVENTS.md](traces/CONNECTION_LIFECYCLE_EVENTS.md).
-
----
-
-## 4b. Epoll/Multiplexing Events
-
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/nw_epoll/nw_epoll_*.csv.gz`
-
-**Description:** Captures I/O multiplexing operations: epoll_create, epoll_ctl, epoll_wait, poll, select.
-
-### CSV Header
-
-```csv
-timestamp,event_type,pid,tid,command,epoll_fd,target_fd,operation,event_mask,max_events,ready_count,timeout_ms,latency_ns
-```
-
-For event types and examples, see [EPOLL_EVENTS.md](traces/EPOLL_EVENTS.md).
-
----
-
-## 4c. Socket Configuration Events
-
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/nw_sockopt/nw_sockopt_*.csv.gz`
-
-**Description:** Captures setsockopt/getsockopt operations for SOL_SOCKET and IPPROTO_TCP level options.
-
-### CSV Header
-
-```csv
-timestamp,event_type,pid,command,fd,level,option_name,option_value,return_value
-```
-
-For tracked options and examples, see [SOCKET_CONFIG_EVENTS.md](traces/SOCKET_CONFIG_EVENTS.md).
-
----
-
-## 4d. Network Drops & Retransmissions
-
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/nw_drop/nw_drop_*.csv.gz`
-
-**Description:** Captures TCP retransmissions using the stable `tcp:tcp_retransmit_skb` kernel tracepoint.
-
-### CSV Header
-
-```csv
-timestamp,event_type,pid,command,protocol,ip_version,source_addr,dest_addr,source_port,dest_port,packet_size,drop_reason,tcp_state
-```
-
-For TCP states and examples, see [NETWORK_DROPS_EVENTS.md](traces/NETWORK_DROPS_EVENTS.md).
-
----
-
-## 5. Page Fault Events
+## 4. Page Fault Events
 
 **Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/pagefault/pagefault_*.csv.gz`
 
@@ -174,7 +89,7 @@ For fault types and examples, see [PAGE_FAULT_EVENTS.md](traces/PAGE_FAULT_EVENT
 
 ---
 
-## 6. io_uring Events
+## 5. io_uring Events
 
 **Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/io_uring/io_uring_*.csv.gz`
 
@@ -184,7 +99,7 @@ For CSV format and examples, see [IO_URING_EVENTS.md](traces/IO_URING_EVENTS.md)
 
 ---
 
-## 7. Process Snapshots
+## 6. Process Snapshots
 
 **Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/process/process_*.csv.gz`
 
@@ -200,7 +115,7 @@ For field details and examples, see [PROCESS_SNAPSHOT.md](traces/PROCESS_SNAPSHO
 
 ---
 
-## 8. Filesystem Snapshots
+## 7. Filesystem Snapshots
 
 **Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/filesystem_snapshot/filesystem_snapshot_*.csv.gz`
 
@@ -216,7 +131,7 @@ For field details and examples, see [FILESYSTEM_SNAPSHOT.md](traces/FILESYSTEM_S
 
 ---
 
-## 9. System Specification Files
+## 8. System Specification Files
 
 **Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/system_spec/`
 
