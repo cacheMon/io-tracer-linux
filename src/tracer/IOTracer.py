@@ -508,8 +508,13 @@ class IOTracer:
         if cached is not None:
             return cached
         result = self._read_cmdline(pid)
-        if result:
-            self.cmdline_cache[pid] = result
+        # Cache even an empty result. A PID that yields no cmdline is either a
+        # kernel thread (always empty) or an already-exited process (empty going
+        # forward), so without this every event from such PIDs — which can be
+        # very high-rate under load — would re-open /proc/<pid>/cmdline and fail
+        # again. Stale entries after PID reuse are handled by the PROCESS_EXEC
+        # eviction, which fires for the new process before its events.
+        self.cmdline_cache[pid] = result
         return result
 
     def _handle_process_exec(self, pid: int) -> None:
