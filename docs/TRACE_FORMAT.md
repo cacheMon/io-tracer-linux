@@ -34,8 +34,10 @@ Each subdirectory contains CSV files that are automatically compressed to `.csv.
 ### CSV Header
 
 ```csv
-timestamp,operation,pid,command,filename,size,inode,flags,offset,tid
+timestamp,operation,pid,command,filename,size,inode,flags,offset,tid,mmap_prot,mmap_flags,address,cmdline,return_value,errno,bytes_completed,duration_ns,device,ppid,container_id,fs_type
 ```
+
+`return_value`, `errno`, `bytes_completed`, and `duration_ns` are populated for `READ`/`WRITE`; `device`, `ppid`, `container_id`, and `fs_type` are populated for `READ`/`WRITE`/`OPEN`. All are empty for operations that do not carry them.
 
 For operations captured and examples, see [VFS_EVENTS.md](traces/VFS_EVENTS.md).
 

@@ -232,6 +232,14 @@ struct data_t {
   u32 mmap_flags;                 /**< mmap mapping flags (MAP_*) for MMAP events */
   u64 old_addr;                   /**< mremap: old mapping start address (0 for other ops) */
   u64 old_size;                   /**< mremap: old mapping length (0 for other ops) */
+  /* Completion metadata (populated by the READ/WRITE return probes) */
+  s64 ret_val;                    /**< Syscall return value: bytes moved on success, -errno on failure (READ/WRITE) */
+  u64 latency_ns;                 /**< Operation duration in ns from entry to return (READ/WRITE) */
+  /* Provenance metadata (populated for READ/WRITE/OPEN) */
+  u32 dev;                        /**< Backing device id (super_block->s_dev, major:minor encoded) */
+  u32 ppid;                       /**< Parent process ID (real_parent->tgid) */
+  u64 cgroup_id;                  /**< cgroup v2 id — container identifier */
+  u32 fs_magic;                   /**< Superblock magic for filesystem-type classification */
 };
 
 /**
@@ -572,6 +580,10 @@ BPF_HASH(open_staging, u64, struct data_t, 4096);
 /* Staged MMAP event from do_mmap entry, completed by the do_mmap kretprobe. */
 BPF_HASH(mmap_staging, u64, struct data_t, 4096);
 
+/* Staged READ/WRITE event from the vfs_read/vfs_write entry probe, completed by
+ * the matching kretprobe which fills in the return value and latency. */
+BPF_HASH(rw_staging, u64, struct data_t, 10240);
+
 /* Staged mremap args from sys_mremap entry, consumed by the kretprobe. */
 BPF_HASH(mremap_staging, u64, struct mremap_args, 4096);
 
@@ -610,6 +622,48 @@ static u64 get_file_inode(struct file *file) {
     inode = file->f_path.dentry->d_inode->i_ino;
   }
   return inode;
+}
+
+/**
+ * @brief Get the parent process ID (tgid of real_parent) of the current task.
+ *
+ * @return Parent PID, or 0 if it cannot be read.
+ */
+static __always_inline u32 get_ppid(void) {
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+  struct task_struct *parent = NULL;
+  u32 ppid = 0;
+  if (task) {
+    bpf_probe_read_kernel(&parent, sizeof(parent), &task->real_parent);
+    if (parent) {
+      bpf_probe_read_kernel(&ppid, sizeof(ppid), &parent->tgid);
+    }
+  }
+  return ppid;
+}
+
+/**
+ * @brief Read the backing device id and filesystem magic from a file's
+ *        superblock, used to record the mount/device and to classify the
+ *        filesystem source (physical vs network vs overlay, etc.).
+ *
+ * @param file     Kernel file structure
+ * @param dev      Out: super_block->s_dev (major:minor encoded); untouched on failure
+ * @param fs_magic Out: super_block->s_magic; untouched on failure
+ */
+static __always_inline void get_file_source(struct file *file, u32 *dev,
+                                            u32 *fs_magic) {
+  if (!file) return;
+  struct dentry *dentry = NULL;
+  bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
+  if (!dentry) return;
+  struct super_block *sb = NULL;
+  bpf_probe_read_kernel(&sb, sizeof(sb), &dentry->d_sb);
+  if (!sb) return;
+  bpf_probe_read_kernel(dev, sizeof(*dev), &sb->s_dev);
+  unsigned long magic = 0;
+  bpf_probe_read_kernel(&magic, sizeof(magic), &sb->s_magic);
+  *fs_magic = (u32)magic;
 }
 
 /**
@@ -894,8 +948,39 @@ int trace_vfs_read(struct pt_regs *ctx, struct file *file, char __user *buf,
   // We capture 0 to indicate it needs user-space correlation
   data.fd = 0;
 
-  events.perf_submit(ctx, &data, sizeof(data));
+  // Provenance metadata: parent PID, container (cgroup) id, backing
+  // device, and filesystem magic for source classification.
+  data.ppid = get_ppid();
+  data.cgroup_id = bpf_get_current_cgroup_id();
+  get_file_source(file, &data.dev, &data.fs_magic);
 
+  // Defer submission to the kretprobe, which records the return value
+  // (bytes read or negative errno) and the operation latency.
+  rw_staging.update(&pid_tgid, &data);
+
+  return 0;
+}
+
+/**
+ * @brief Trace vfs_read() return — record bytes read / errno and latency.
+ *
+ * Completes the event staged by trace_vfs_read() with the syscall return
+ * value and the entry-to-return duration, then submits it.
+ *
+ * @param ctx  BPF context (return value via PT_REGS_RC)
+ * @return     0
+ */
+int trace_vfs_read_ret(struct pt_regs *ctx) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  struct data_t *data = rw_staging.lookup(&pid_tgid);
+  if (!data) {
+    return 0;
+  }
+  long ret = PT_REGS_RC(ctx);
+  data->ret_val = (s64)ret;
+  data->latency_ns = bpf_ktime_get_ns() - data->ts;
+  events.perf_submit(ctx, data, sizeof(*data));
+  rw_staging.delete(&pid_tgid);
   return 0;
 }
 
@@ -941,11 +1026,42 @@ int trace_vfs_write(struct pt_regs *ctx, struct file *file,
   if (pos) {
     bpf_probe_read_kernel(&data.offset, sizeof(data.offset), pos);
   }
-  
+
   data.fd = 0;
 
-  events.perf_submit(ctx, &data, sizeof(data));
+  // Provenance metadata: parent PID, container (cgroup) id, backing
+  // device, and filesystem magic for source classification.
+  data.ppid = get_ppid();
+  data.cgroup_id = bpf_get_current_cgroup_id();
+  get_file_source(file, &data.dev, &data.fs_magic);
 
+  // Defer submission to the kretprobe, which records the return value
+  // (bytes written or negative errno) and the operation latency.
+  rw_staging.update(&pid_tgid, &data);
+
+  return 0;
+}
+
+/**
+ * @brief Trace vfs_write() return — record bytes written / errno and latency.
+ *
+ * Completes the event staged by trace_vfs_write() with the syscall return
+ * value and the entry-to-return duration, then submits it.
+ *
+ * @param ctx  BPF context (return value via PT_REGS_RC)
+ * @return     0
+ */
+int trace_vfs_write_ret(struct pt_regs *ctx) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  struct data_t *data = rw_staging.lookup(&pid_tgid);
+  if (!data) {
+    return 0;
+  }
+  long ret = PT_REGS_RC(ctx);
+  data->ret_val = (s64)ret;
+  data->latency_ns = bpf_ktime_get_ns() - data->ts;
+  events.perf_submit(ctx, data, sizeof(*data));
+  rw_staging.delete(&pid_tgid);
   return 0;
 }
 
@@ -1031,6 +1147,12 @@ int trace_vfs_open(struct pt_regs *ctx, const struct path *path,
   data.op = OP_OPEN;
   data.size = 0;
   bpf_probe_read_kernel(&data.flags, sizeof(data.flags), &file->f_flags);
+
+  // Provenance metadata: parent PID, container (cgroup) id, backing
+  // device, and filesystem magic for source classification.
+  data.ppid = get_ppid();
+  data.cgroup_id = bpf_get_current_cgroup_id();
+  get_file_source(file, &data.dev, &data.fs_magic);
 
   // Prefer the full path captured from the syscall entry (trace_do_sys_openat2_entry).
   // This is the string the caller passed — for library loads and most file opens

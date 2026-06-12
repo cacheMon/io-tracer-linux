@@ -6,8 +6,8 @@
 - `do_sys_openat2` (entry) — Captures the user-provided filename string before kernel resolution
 - `do_sys_openat2` (return) — Captures the allocated file descriptor after a successful open
 - `vfs_open` — File open operations (inode and flags)
-- `vfs_read` — File read operations
-- `vfs_write` — File write operations
+- `vfs_read` (entry + return) — File read operations; the return probe records bytes read / errno and latency
+- `vfs_write` (entry + return) — File write operations; the return probe records bytes written / errno and latency
 - `vfs_fsync` / `vfs_fsync_range` — File sync operations
 - `vfs_unlink` — File deletion operations
 - `vfs_getattr` — File attribute queries
@@ -172,6 +172,16 @@ The path captured is relative to the mount namespace of the probed process. In c
 | 12 | mmap_flags | `string` | MMAP mapping flags (`MAP_*`, pipe-separated); empty for non-MMAP operations |
 | 13 | address | `string` | Mapping start address as hex (`0x...`) for `MMAP` and `MUNMAP`; for `MREMAP` formatted as `old_address -> new_address`; empty for other operations |
 | 14 | cmdline | `string` | Full command line (`argv` joined by spaces) of the process that triggered the event; empty if unresolvable (see below) |
+| 15 | return_value | `s64` | Raw syscall return value for `READ`/`WRITE` (bytes moved if `>= 0`, negative `errno` on failure); empty for other operations |
+| 16 | errno | `string` | Error name (e.g. `EAGAIN`) when a `READ`/`WRITE` failed (`return_value < 0`); empty on success or for other operations |
+| 17 | bytes_completed | `u64` | Bytes actually read/written for `READ`/`WRITE` (`return_value` when `>= 0`); empty on failure or for other operations |
+| 18 | duration_ns | `u64` | Operation duration in nanoseconds (entry → return) for `READ`/`WRITE`; empty for other operations |
+| 19 | device | `string` | Backing device of the file as `major:minor` (from `super_block->s_dev`); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
+| 20 | ppid | `u32` | Parent process ID (`real_parent->tgid`); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
+| 21 | container_id | `u64` | cgroup v2 id of the process (container identifier); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
+| 22 | fs_type | `string` | Source filesystem name derived from the superblock magic (e.g. `EXT2/3/4`, `XFS`, `BTRFS`, `OVERLAYFS`, `NFS`), letting physical-disk I/O be distinguished from network/overlay sources; populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
+
+> **Note on filesystem classification (`fs_type`) and sockets:** virtual/pseudo filesystems (procfs, sysfs, tmpfs, cgroupfs, debugfs, …) and sockets/pipes are filtered out at the eBPF layer by `is_regular_file()`, so they never appear as fs-trace rows. Their *absence* is the signal that an access was virtual/socket I/O rather than physical filesystem I/O. The `fs_type` column then names the concrete backing filesystem of the events that do appear, so physical-disk filesystems (`EXT2/3/4`, `XFS`, `BTRFS`, …) can be told apart from network (`NFS`, `CIFS`) and container-overlay (`OVERLAYFS`) sources.
 
 ## `cmdline` Field
 

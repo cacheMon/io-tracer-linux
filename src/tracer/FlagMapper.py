@@ -746,3 +746,56 @@ class FlagMapper:
             if flags & flag:
                 result.append(name)
         return "|".join(result) if result else ""
+
+    # =====================================================================
+    # VFS completion / provenance mappings
+    # =====================================================================
+
+    # Common errno values (magnitude) seen on VFS read/write failures.
+    errno_map = {
+        1: "EPERM", 2: "ENOENT", 4: "EINTR", 5: "EIO", 9: "EBADF",
+        11: "EAGAIN", 12: "ENOMEM", 13: "EACCES", 14: "EFAULT", 16: "EBUSY",
+        21: "EISDIR", 22: "EINVAL", 24: "EMFILE", 27: "EFBIG", 28: "ENOSPC",
+        32: "EPIPE", 36: "ENAMETOOLONG", 40: "ELOOP", 75: "EOVERFLOW",
+        122: "EDQUOT",
+    }
+
+    # Superblock magic -> filesystem name. Used to classify the source of an
+    # I/O event (physical disk fs vs network fs vs container overlay, etc.).
+    fs_type_map = {
+        0xEF53: "EXT2/3/4",
+        0x58465342: "XFS",
+        0x9123683E: "BTRFS",
+        0xF2F52010: "F2FS",
+        0x4D44: "FAT",
+        0x2011BAB0: "EXFAT",
+        0x5346544E: "NTFS",
+        0x73717368: "SQUASHFS",
+        0x9660: "ISOFS",
+        0x52654973: "REISERFS",
+        0x3434: "NILFS",
+        0x6969: "NFS",
+        0xFF534D42: "CIFS",
+        0x65735546: "FUSE",
+        0x794C7630: "OVERLAYFS",
+        0x01021994: "TMPFS",
+        0x858458F6: "RAMFS",
+        0x9FA0: "PROCFS",
+        0x62656572: "SYSFS",
+        0x1373: "DEVFS",
+    }
+
+    @classmethod
+    def format_errno(cls, code):
+        """Map an errno magnitude to its name. Returns '' for 0."""
+        if not code:
+            return ""
+        code = abs(int(code))
+        return cls.errno_map.get(code, f"ERRNO({code})")
+
+    @classmethod
+    def format_fs_type(cls, magic):
+        """Map a superblock magic number to a filesystem name."""
+        if not magic:
+            return ""
+        return cls.fs_type_map.get(int(magic), f"FS(0x{int(magic):x})")
