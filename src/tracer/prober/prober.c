@@ -3703,7 +3703,14 @@ int trace_io_uring_prep_rw(struct pt_regs *ctx, void *req, void *sqe) {
   }
 
   struct io_uring_sqe_min s = {};
-  bpf_probe_read_kernel(&s, sizeof(s), sqe);
+  /* The SQE normally lives in kernel-allocated ring memory (mmapped to
+   * userspace), so a kernel read works. With IORING_SETUP_NO_MMAP (6.5+) the
+   * ring is allocated in application memory and the pointer is a user address,
+   * for which the kernel read fails — fall back to a user read so the SQE
+   * fields are still captured. */
+  if (bpf_probe_read_kernel(&s, sizeof(s), sqe) != 0) {
+    bpf_probe_read_user(&s, sizeof(s), sqe);
+  }
 
   struct io_uring_submit_ctx submit_ctx = {};
   submit_ctx.opcode    = s.opcode;
