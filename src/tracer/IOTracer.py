@@ -579,9 +579,18 @@ class IOTracer:
         inode_val = f"{inode_old}" if inode_old else ""
         
         flags_val = self.flag_mapper.format_vfs_flags(op_name, event.flags)
+        cmdline = self._read_cmdline_cached(event.pid)
+
+        # Emit the same 22-column schema as _print_event so the shared fs log
+        # stays a well-formed CSV. Dual-path ops (RENAME/LINK/SYMLINK) do not
+        # carry offset/tid/mmap/address or the READ/WRITE/OPEN completion and
+        # provenance fields, so those columns are empty.
         output = format_csv_row(
             timestamp, op_name, event.pid, comm, dual_filename, 0, inode_val,
-            flags_val, "", "", "", ""
+            flags_val, "", "", "", "",   # offset, tid, mmap_prot, mmap_flags
+            "", cmdline,                 # address, cmdline
+            "", "", "", "",              # return_value, errno, bytes_completed, duration_ns
+            "", "", "", ""               # device, ppid, container_id, fs_type
         )
         self.writer.append_fs_log(output)
     
