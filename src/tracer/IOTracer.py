@@ -141,6 +141,7 @@ class IOTracer:
         self.path_resolver      = PathResolver()
         self.mmap_regions       = {}
         self.cmdline_cache      = {}  # pid -> cmdline, populated on first successful read
+        self._last_cache_cleanup = time.time()
 
         if cache_sample_rate > 1:
             self.writer.set_cache_sampling(cache_sample_rate)
@@ -527,6 +528,23 @@ class IOTracer:
         """
         self.mmap_regions.pop(pid, None)
         self.cmdline_cache.pop(pid, None)
+
+    def _maybe_cleanup_caches(self) -> None:
+        """
+        Periodically bound the userspace caches during long traces.
+
+        path_resolver.inode_to_path gains an entry for every opened inode and
+        cmdline_cache for every observed PID; without pruning an indefinite
+        trace grows them without bound.
+        """
+        now = time.time()
+        if now - self._last_cache_cleanup < 60:
+            return
+        self._last_cache_cleanup = now
+        self.path_resolver.cleanup_old_cache()
+        # Crude but bounded: cmdlines for live PIDs are re-read on demand.
+        if len(self.cmdline_cache) > 20000:
+            self.cmdline_cache.clear()
 
     def _handle_process_exit(self, pid: int) -> None:
         """
@@ -1055,10 +1073,11 @@ class IOTracer:
                 while remaining > 0 and self.running:
                     sleep_time = min(0.1, remaining)
                     time.sleep(sleep_time)
-                    
+                    self._maybe_cleanup_caches()
+
                     current = time.time()
                     remaining = end_time - current # type: ignore
-                    
+
                     if self.verbose and int(current) % 10 == 0 and int(current) > int(current - sleep_time):
                         elapsed = current - start
                         logger("info", f"Progress: {elapsed:.1f}s/{duration_target}s") # type: ignore
@@ -1068,7 +1087,8 @@ class IOTracer:
                 # Run indefinitely until Ctrl+C
                 while self.running:
                     time.sleep(0.1)
-                    
+                    self._maybe_cleanup_caches()
+
                     if self.verbose:
                         current = time.time()
                         if int(current) % 30 == 0:  # Every 30 seconds
@@ -1096,7 +1116,10 @@ class IOTracer:
             run_with_spinner("Compressing trace output", self.writer.force_flush)
 
             if self.automatic_upload:
-                run_with_spinner("Uploading traces", lambda: self.upload_manager.stop_worker(False))
+                # server_mode=True drains the queue before stopping the worker;
+                # otherwise the final bundle queued by force_flush above may
+                # never be uploaded (the worker stops before picking it up).
+                run_with_spinner("Uploading traces", lambda: self.upload_manager.stop_worker(True, timeout=60))
                 try:
                     os.removedirs(self.writer.output_dir)
                 except OSError:
