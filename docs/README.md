@@ -19,11 +19,6 @@ linux_trace_v3_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── fs/                    # VFS traces
 ├── ds/                    # Block device traces
 ├── cache/                 # Page cache events
-├── nw/                    # Network I/O traces
-├── nw_conn/               # Connection lifecycle events
-├── nw_epoll/              # Epoll/multiplexing events
-├── nw_sockopt/            # Socket configuration events
-├── nw_drop/               # Packet drops & retransmissions
 ├── pagefault/             # Page fault events
 ├── io_uring/              # io_uring async I/O events
 ├── process/               # Process state snapshots

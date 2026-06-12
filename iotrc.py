@@ -3,7 +3,7 @@
 IO Tracer - A Linux I/O syscall tracing utility.
 
 This module serves as the entry point for the IO Tracer application, which
-traces file system, block device, cache, and network I/O operations on Linux
+traces file system, block device, and cache I/O operations on Linux
 systems using eBPF/BPF technology.
 
 Usage:

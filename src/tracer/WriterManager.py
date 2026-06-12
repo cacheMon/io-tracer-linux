@@ -9,7 +9,7 @@ This module provides the WriteManager class which handles:
 - Optionally uploading files to cloud storage
 
 The manager uses adaptive buffering to handle high event rates and
-supports multiple output streams (VFS, block, cache, network, etc.).
+supports multiple output streams (VFS, block, cache, etc.).
 
 Example:
     writer = WriteManager(
@@ -58,7 +58,6 @@ class WriteManager:
         ds/*.csv: Block device traces
         cache/*.csv: Page cache event traces
         process/*.csv: Process state snapshots
-        nw/*.csv: Network operation traces
         filesystem_snapshot/*.csv: Filesystem snapshot
         system_spec/*: System specification files
     """
@@ -82,13 +81,8 @@ class WriteManager:
         self.output_block_file = f"{self.output_dir}/ds/ds_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_cache_file = f"{self.output_dir}/cache/cache_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_process_file = f"{self.output_dir}/process/process_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-        self.output_network_file = f"{self.output_dir}/nw/nw_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_fs_snapshot_file = f"{self.output_dir}/filesystem_snapshot/filesystem_snapshot_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_pagefault_file = f"{self.output_dir}/pagefault/pagefault_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-        self.output_conn_file = f"{self.output_dir}/nw_conn/nw_conn_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-        self.output_epoll_file = f"{self.output_dir}/nw_epoll/nw_epoll_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-        self.output_sockopt_file = f"{self.output_dir}/nw_sockopt/nw_sockopt_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-        self.output_drop_file = f"{self.output_dir}/nw_drop/nw_drop_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_io_uring_file = f"{self.output_dir}/io_uring/io_uring_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
 
         # Create output directories
@@ -98,12 +92,7 @@ class WriteManager:
         os.makedirs(f"{self.output_dir}/cache", exist_ok=True)
         os.makedirs(f"{self.output_dir}/process", exist_ok=True)
         os.makedirs(f"{self.output_dir}/filesystem_snapshot", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/nw", exist_ok=True)
         os.makedirs(f"{self.output_dir}/pagefault", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/nw_conn", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/nw_epoll", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/nw_sockopt", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/nw_drop", exist_ok=True)
         os.makedirs(f"{self.output_dir}/io_uring", exist_ok=True)
 
         self.upload_manager = upload_manager
@@ -113,14 +102,9 @@ class WriteManager:
         self.vfs_buffer = deque()
         self.block_buffer = deque()
         self.cache_buffer = deque()
-        self.network_buffer = deque()
         self.process_buffer = deque()
         self.fs_snap_buffer = deque()
         self.pagefault_buffer = deque()
-        self.conn_buffer = deque()
-        self.epoll_buffer = deque()
-        self.sockopt_buffer = deque()
-        self.drop_buffer = deque()
         self.io_uring_buffer = deque()
         
         # Event rate tracking
@@ -128,14 +112,9 @@ class WriteManager:
             'vfs': deque(maxlen=1000),
             'block': deque(maxlen=1000),
             'cache': deque(maxlen=1000),
-            'network': deque(maxlen=1000),
             'fs_state': deque(maxlen=1000),
             'proc_state': deque(maxlen=1000),
             'pagefault': deque(maxlen=1000),
-            'conn': deque(maxlen=1000),
-            'epoll': deque(maxlen=1000),
-            'sockopt': deque(maxlen=1000),
-            'drop': deque(maxlen=1000),
             'io_uring': deque(maxlen=1000),
         }
         
@@ -144,14 +123,9 @@ class WriteManager:
             'vfs': (8000, 500000),
             'block': (8000, 50000),
             'cache': (20000, 1000000),
-            'network': (8000, 200000),
             'fs_state': (8000, 20000),
             'proc_state': (8000, 10000),  # Match new process_max_events threshold
             'pagefault': (8000, 100000),
-            'conn': (8000, 100000),
-            'epoll': (8000, 200000),
-            'sockopt': (8000, 50000),
-            'drop': (8000, 50000),
             'io_uring': (8000, 200000),
         }
         
@@ -170,28 +144,18 @@ class WriteManager:
         self.cache_max_events = 20000
         self.vfs_max_events = 8000
         self.block_max_events = 8000
-        self.network_max_events = 8000
         self.process_max_events = 8000  # Large enough to fit entire hourly snapshot
         self.fs_snap_max_events = 8000
         self.pagefault_max_events = 8000
-        self.conn_max_events = 8000
-        self.epoll_max_events = 8000
-        self.sockopt_max_events = 8000
-        self.drop_max_events = 8000
         self.io_uring_max_events = 8000
 
         # File handles for each output
         self._vfs_handle = None
         self._block_handle = None
         self._cache_handle = None
-        self._network_handle = None
         self._process_handle = None
         self._pagefault_handle = None
         self._fs_snap_handle = None
-        self._conn_handle = None
-        self._epoll_handle = None
-        self._sockopt_handle = None
-        self._drop_handle = None
         self._io_uring_handle = None
 
         # Cache sampling configuration
@@ -244,7 +208,7 @@ class WriteManager:
         while True:
             time.sleep(10)  
             
-            for event_type in ['vfs', 'block', 'cache', 'network','fs_state','proc_state', 'pagefault', 'conn', 'epoll', 'sockopt', 'drop', 'io_uring']:
+            for event_type in ['vfs', 'block', 'cache', 'fs_state','proc_state', 'pagefault', 'io_uring']:
                 rate = self._calculate_event_rate(event_type)
                 min_limit, max_limit = self.dynamic_limits[event_type]
                 
@@ -263,22 +227,12 @@ class WriteManager:
                     self.block_max_events = new_limit
                 elif event_type == 'cache':
                     self.cache_max_events = new_limit
-                elif event_type == 'network':
-                    self.network_max_events = new_limit
                 elif event_type == 'fs_state':
                     self.fs_snap_max_events = new_limit
                 elif event_type == 'proc_state':
                     self.process_max_events = new_limit
                 elif event_type == 'pagefault':
                     self.pagefault_max_events = new_limit
-                elif event_type == 'conn':
-                    self.conn_max_events = new_limit
-                elif event_type == 'epoll':
-                    self.epoll_max_events = new_limit
-                elif event_type == 'sockopt':
-                    self.sockopt_max_events = new_limit
-                elif event_type == 'drop':
-                    self.drop_max_events = new_limit
                 elif event_type == 'io_uring':
                     self.io_uring_max_events = new_limit
 
@@ -328,18 +282,8 @@ class WriteManager:
             buffer_info.append(f"Block:{len(self.block_buffer)}")
         if len(self.cache_buffer) > 0:
             buffer_info.append(f"Cache:{len(self.cache_buffer)}")
-        if len(self.network_buffer) > 0:
-            buffer_info.append(f"Net:{len(self.network_buffer)}")
         if len(self.pagefault_buffer) > 0:
             buffer_info.append(f"PgFault:{len(self.pagefault_buffer)}")
-        if len(self.conn_buffer) > 0:
-            buffer_info.append(f"Conn:{len(self.conn_buffer)}")
-        if len(self.epoll_buffer) > 0:
-            buffer_info.append(f"Epoll:{len(self.epoll_buffer)}")
-        if len(self.sockopt_buffer) > 0:
-            buffer_info.append(f"Sockopt:{len(self.sockopt_buffer)}")
-        if len(self.drop_buffer) > 0:
-            buffer_info.append(f"Drop:{len(self.drop_buffer)}")
         if len(self.io_uring_buffer) > 0:
             buffer_info.append(f"IO_Uring:{len(self.io_uring_buffer)}")
         
@@ -397,29 +341,9 @@ class WriteManager:
         """Check if filesystem snapshot buffer should be flushed."""
         return (len(self.fs_snap_buffer) >= self.fs_snap_max_events)
 
-    def should_flush_network(self) -> bool:
-        """Check if network buffer should be flushed."""
-        return (len(self.network_buffer) >= self.network_max_events)
-
     def should_flush_pagefault(self) -> bool:
         """Check if pagefault buffer should be flushed."""
         return (len(self.pagefault_buffer) >= self.pagefault_max_events)
-
-    def should_flush_conn(self) -> bool:
-        """Check if connection lifecycle buffer should be flushed."""
-        return (len(self.conn_buffer) >= self.conn_max_events)
-
-    def should_flush_epoll(self) -> bool:
-        """Check if epoll buffer should be flushed."""
-        return (len(self.epoll_buffer) >= self.epoll_max_events)
-
-    def should_flush_sockopt(self) -> bool:
-        """Check if sockopt buffer should be flushed."""
-        return (len(self.sockopt_buffer) >= self.sockopt_max_events)
-
-    def should_flush_drop(self) -> bool:
-        """Check if drop buffer should be flushed."""
-        return (len(self.drop_buffer) >= self.drop_max_events)
 
     def should_flush_io_uring(self) -> bool:
         """Check if io_uring buffer should be flushed."""
@@ -511,22 +435,6 @@ class WriteManager:
         else:
             logger("error", "Invalid cache log output format. Expected a string.")
 
-    def append_network_log(self, log_output: str):
-        """
-        Add a network event log entry.
-        
-        Args:
-            log_output: CSV-formatted log string
-        """
-        if isinstance(log_output, str):
-            self.network_buffer.append(log_output)
-            self.event_timestamps['network'].append(time.time())
-
-            if self.should_flush_network():
-                self.flush_network_only()
-        else:
-            logger("error", "Invalid network log output format. Expected a string.")
-
     def append_pagefault_log(self, log_output: str):
         """
         Add a page fault event log entry.
@@ -542,46 +450,6 @@ class WriteManager:
                 self.flush_pagefault_only()
         else:
             logger("error", "Invalid pagefault log output format. Expected a string.")
-
-    def append_conn_log(self, log_output: str):
-        """Add a connection lifecycle event log entry."""
-        if isinstance(log_output, str):
-            self.conn_buffer.append(log_output)
-            self.event_timestamps['conn'].append(time.time())
-            if self.should_flush_conn():
-                self.flush_conn_only()
-        else:
-            logger("error", "Invalid conn log output format. Expected a string.")
-
-    def append_epoll_log(self, log_output: str):
-        """Add an epoll/multiplexing event log entry."""
-        if isinstance(log_output, str):
-            self.epoll_buffer.append(log_output)
-            self.event_timestamps['epoll'].append(time.time())
-            if self.should_flush_epoll():
-                self.flush_epoll_only()
-        else:
-            logger("error", "Invalid epoll log output format. Expected a string.")
-
-    def append_sockopt_log(self, log_output: str):
-        """Add a socket option event log entry."""
-        if isinstance(log_output, str):
-            self.sockopt_buffer.append(log_output)
-            self.event_timestamps['sockopt'].append(time.time())
-            if self.should_flush_sockopt():
-                self.flush_sockopt_only()
-        else:
-            logger("error", "Invalid sockopt log output format. Expected a string.")
-
-    def append_drop_log(self, log_output: str):
-        """Add a network drop/retransmission event log entry."""
-        if isinstance(log_output, str):
-            self.drop_buffer.append(log_output)
-            self.event_timestamps['drop'].append(time.time())
-            if self.should_flush_drop():
-                self.flush_drop_only()
-        else:
-            logger("error", "Invalid drop log output format. Expected a string.")
 
     def append_io_uring_log(self, log_output: str):
         """Add an io_uring event log entry."""
@@ -819,21 +687,6 @@ class WriteManager:
             self._block_handle = open(self.output_block_file, 'a', buffering=8192)
             self._reset_flush_timer()
 
-    def flush_network_only(self):
-        """Flush network buffer to file."""
-        if self.network_buffer:
-            if self._network_handle is None:
-                self._network_handle = open(self.output_network_file, 'a', buffering=8192)
-            self.current_datetime = datetime.now()
-            
-            self._write_buffer_to_file(self.network_buffer, self._network_handle, "Network")
-            self.compress_log(self.output_network_file)
-            self.output_network_file = f"{self.output_dir}/nw/nw_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-
-            self._network_handle.close()
-            self._network_handle = open(self.output_network_file, 'a', buffering=8192)
-            self._reset_flush_timer()
-
     def flush_pagefault_only(self):
         """Flush pagefault buffer to file."""
         if self.pagefault_buffer:
@@ -847,66 +700,6 @@ class WriteManager:
 
             self._pagefault_handle.close()
             self._pagefault_handle = open(self.output_pagefault_file, 'a', buffering=8192)
-            self._reset_flush_timer()
-
-    def flush_conn_only(self):
-        """Flush connection lifecycle buffer to file."""
-        if self.conn_buffer:
-            if self._conn_handle is None:
-                self._conn_handle = open(self.output_conn_file, 'a', buffering=8192)
-            self.current_datetime = datetime.now()
-
-            self._write_buffer_to_file(self.conn_buffer, self._conn_handle, "Connection")
-            self.compress_log(self.output_conn_file)
-            self.output_conn_file = f"{self.output_dir}/nw_conn/nw_conn_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-
-            self._conn_handle.close()
-            self._conn_handle = open(self.output_conn_file, 'a', buffering=8192)
-            self._reset_flush_timer()
-
-    def flush_epoll_only(self):
-        """Flush epoll/multiplexing buffer to file."""
-        if self.epoll_buffer:
-            if self._epoll_handle is None:
-                self._epoll_handle = open(self.output_epoll_file, 'a', buffering=8192)
-            self.current_datetime = datetime.now()
-
-            self._write_buffer_to_file(self.epoll_buffer, self._epoll_handle, "Epoll")
-            self.compress_log(self.output_epoll_file)
-            self.output_epoll_file = f"{self.output_dir}/nw_epoll/nw_epoll_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-
-            self._epoll_handle.close()
-            self._epoll_handle = open(self.output_epoll_file, 'a', buffering=8192)
-            self._reset_flush_timer()
-
-    def flush_sockopt_only(self):
-        """Flush socket option buffer to file."""
-        if self.sockopt_buffer:
-            if self._sockopt_handle is None:
-                self._sockopt_handle = open(self.output_sockopt_file, 'a', buffering=8192)
-            self.current_datetime = datetime.now()
-
-            self._write_buffer_to_file(self.sockopt_buffer, self._sockopt_handle, "Sockopt")
-            self.compress_log(self.output_sockopt_file)
-            self.output_sockopt_file = f"{self.output_dir}/nw_sockopt/nw_sockopt_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-
-            self._sockopt_handle.close()
-            self._sockopt_handle = open(self.output_sockopt_file, 'a', buffering=8192)
-            self._reset_flush_timer()
-
-    def flush_drop_only(self):
-        """Flush network drop buffer to file."""
-        if self.drop_buffer:
-            if self._drop_handle is None:
-                self._drop_handle = open(self.output_drop_file, 'a', buffering=8192)
-            self.current_datetime = datetime.now()
-
-            self._write_buffer_to_file(self.drop_buffer, self._drop_handle, "Drop")
-            self.compress_log(self.output_drop_file)
-            self.output_drop_file = f"{self.output_dir}/nw_drop/nw_drop_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-
-            self._drop_handle.close()
-            self._drop_handle = open(self.output_drop_file, 'a', buffering=8192)
             self._reset_flush_timer()
 
     def flush_io_uring_only(self):
@@ -955,12 +748,7 @@ class WriteManager:
             self.fs_snapshot_parts_pending_upload.clear()
             self.fs_snap_buffer.clear()
         
-        self.compress_log(self.output_network_file)
         self.compress_log(self.output_pagefault_file)
-        self.compress_log(self.output_conn_file)
-        self.compress_log(self.output_epoll_file)
-        self.compress_log(self.output_sockopt_file)
-        self.compress_log(self.output_drop_file)
         self.compress_log(self.output_io_uring_file)
         if self.automatic_upload:
             self._flush_bundle()
@@ -975,12 +763,7 @@ class WriteManager:
         self.cache_buffer.clear()
         self.process_buffer.clear()
         self.fs_snap_buffer.clear()
-        self.network_buffer.clear()
         self.pagefault_buffer.clear()
-        self.conn_buffer.clear()
-        self.epoll_buffer.clear()
-        self.sockopt_buffer.clear()
-        self.drop_buffer.clear()
         self.io_uring_buffer.clear()
 
     def _write_buffer_to_file(self, buffer, file_handle, buffer_name: str):
@@ -1044,41 +827,11 @@ class WriteManager:
                     self._fs_snap_handle = open(self.output_fs_snapshot_file, 'a', buffering=8192)
                 self._write_buffer_to_file(self.fs_snap_buffer, self._fs_snap_handle, "Filesystem Snapshot")
 
-        def write_network():
-            if self.network_buffer:
-                if self._network_handle is None:
-                    self._network_handle = open(self.output_network_file, 'a', buffering=8192)
-                self._write_buffer_to_file(self.network_buffer, self._network_handle, "Network")
-
         def write_pagefault():
             if self.pagefault_buffer:
                 if self._pagefault_handle is None:
                     self._pagefault_handle = open(self.output_pagefault_file, 'a', buffering=8192)
                 self._write_buffer_to_file(self.pagefault_buffer, self._pagefault_handle, "PageFault")
-
-        def write_conn():
-            if self.conn_buffer:
-                if self._conn_handle is None:
-                    self._conn_handle = open(self.output_conn_file, 'a', buffering=8192)
-                self._write_buffer_to_file(self.conn_buffer, self._conn_handle, "Connection")
-
-        def write_epoll():
-            if self.epoll_buffer:
-                if self._epoll_handle is None:
-                    self._epoll_handle = open(self.output_epoll_file, 'a', buffering=8192)
-                self._write_buffer_to_file(self.epoll_buffer, self._epoll_handle, "Epoll")
-
-        def write_sockopt():
-            if self.sockopt_buffer:
-                if self._sockopt_handle is None:
-                    self._sockopt_handle = open(self.output_sockopt_file, 'a', buffering=8192)
-                self._write_buffer_to_file(self.sockopt_buffer, self._sockopt_handle, "Sockopt")
-
-        def write_drop():
-            if self.drop_buffer:
-                if self._drop_handle is None:
-                    self._drop_handle = open(self.output_drop_file, 'a', buffering=8192)
-                self._write_buffer_to_file(self.drop_buffer, self._drop_handle, "Drop")
 
         def write_io_uring():
             if self.io_uring_buffer:
@@ -1114,35 +867,10 @@ class WriteManager:
             threads.append(t5)
             t5.start()
 
-        if self.network_buffer:
-            t6 = threading.Thread(target=write_network)
-            threads.append(t6)
-            t6.start()
-
         if self.pagefault_buffer:
             t7 = threading.Thread(target=write_pagefault)
             threads.append(t7)
             t7.start()
-
-        if self.conn_buffer:
-            t9 = threading.Thread(target=write_conn)
-            threads.append(t9)
-            t9.start()
-
-        if self.epoll_buffer:
-            t10 = threading.Thread(target=write_epoll)
-            threads.append(t10)
-            t10.start()
-
-        if self.sockopt_buffer:
-            t11 = threading.Thread(target=write_sockopt)
-            threads.append(t11)
-            t11.start()
-
-        if self.drop_buffer:
-            t12 = threading.Thread(target=write_drop)
-            threads.append(t12)
-            t12.start()
 
         if self.io_uring_buffer:
             t13 = threading.Thread(target=write_io_uring)
@@ -1264,12 +992,7 @@ class WriteManager:
             (self._cache_handle, "Cache"),
             (self._process_handle, "Process State"),
             (self._fs_snap_handle, "Filesystem Snapshot"),
-            (self._network_handle, "Network"),
             (self._pagefault_handle, "PageFault"),
-            (self._conn_handle, "Connection"),
-            (self._epoll_handle, "Epoll"),
-            (self._sockopt_handle, "Sockopt"),
-            (self._drop_handle, "Drop"),
             (self._io_uring_handle, "IO_Uring"),
         ]
         
@@ -1287,10 +1010,5 @@ class WriteManager:
         self._cache_handle = None
         self._process_handle = None
         self._fs_snap_handle = None
-        self._network_handle = None
         self._pagefault_handle = None
-        self._conn_handle = None
-        self._epoll_handle = None
-        self._sockopt_handle = None
-        self._drop_handle = None
         self._io_uring_handle = None
