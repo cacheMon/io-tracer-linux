@@ -653,7 +653,7 @@ static __always_inline u32 get_ppid(void) {
  */
 static __always_inline void get_file_source(struct file *file, u32 *dev,
                                             u32 *fs_magic) {
-  if (!file) return;
+  if (!file || !dev || !fs_magic) return;
   struct dentry *dentry = NULL;
   bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
   if (!dentry) return;

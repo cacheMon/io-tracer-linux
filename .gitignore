@@ -7,4 +7,9 @@ result*
 overhead_analysis
 bin
 .*
+# Keep CI config tracked despite the broad dotfile ignore above
+!.github/
+!.github/**
+# ...but still ignore caches under it
+.github/**/__pycache__/
 .idea

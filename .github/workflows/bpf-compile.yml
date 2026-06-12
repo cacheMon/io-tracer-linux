@@ -1,0 +1,44 @@
+name: BPF Compile
+
+# Compiles prober.c with BCC and loads it into the kernel (running the eBPF
+# verifier) on a real runner. This is the validation that cannot be done in the
+# sandboxed dev environment, which lacks bcc + kernel headers/BTF.
+
+on:
+  push:
+    paths:
+      - 'src/tracer/prober/prober.c'
+      - 'src/tracer/IOTracer.py'
+      - 'src/tracer/KernelProbeTracker.py'
+      - '.github/workflows/bpf-compile.yml'
+      - '.github/scripts/bpf_smoke.py'
+  pull_request:
+    paths:
+      - 'src/tracer/prober/prober.c'
+      - 'src/tracer/IOTracer.py'
+      - 'src/tracer/KernelProbeTracker.py'
+      - '.github/workflows/bpf-compile.yml'
+      - '.github/scripts/bpf_smoke.py'
+  workflow_dispatch:
+
+jobs:
+  bpf-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show kernel
+        run: uname -a
+
+      - name: Install BCC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-bpfcc bpfcc-tools libbpfcc
+
+      - name: Install kernel headers (best effort)
+        run: |
+          sudo apt-get install -y "linux-headers-$(uname -r)" \
+            || echo "matching headers not in apt; BCC will fall back to BTF if present"
+
+      - name: Compile + verifier-load prober.c
+        run: sudo python3 .github/scripts/bpf_smoke.py
