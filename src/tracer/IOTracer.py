@@ -541,12 +541,18 @@ class IOTracer:
         if now - self._last_cache_cleanup < 60:
             return
         self._last_cache_cleanup = now
-        self.path_resolver.cleanup_old_cache()
-        # Keep the most recently added entries (insertion order) so cmdlines
-        # for recently exited PIDs — the reason this cache exists — survive;
-        # entries for live PIDs are re-read on demand if dropped.
-        if len(self.cmdline_cache) > 20000:
-            self.cmdline_cache = dict(list(self.cmdline_cache.items())[-5000:])
+        # The polling thread mutates these caches concurrently; cleanup uses
+        # snapshot-based iteration, but guard regardless — a rare race must
+        # degrade to a skipped cleanup, not terminate the trace loop.
+        try:
+            self.path_resolver.cleanup_old_cache()
+            # Keep the most recently added entries (insertion order) so
+            # cmdlines for recently exited PIDs — the reason this cache
+            # exists — survive; entries for live PIDs are re-read on demand.
+            if len(self.cmdline_cache) > 20000:
+                self.cmdline_cache = dict(list(self.cmdline_cache.items())[-5000:])
+        except Exception as e:
+            logger("warning", f"Cache cleanup skipped: {e}")
 
     def _handle_process_exit(self, pid: int) -> None:
         """

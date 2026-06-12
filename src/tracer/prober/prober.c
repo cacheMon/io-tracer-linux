@@ -569,11 +569,25 @@ struct block_issue_ctx {
   char comm[TASK_COMM_LEN]; /**< Submitting process name */
 };
 
+/**
+ * @brief Collision-free correlation key for block requests.
+ *
+ * dev and sector are kept as separate fields (not folded into one u64) so
+ * distinct (dev, sector) pairs can never collide. Built exclusively via
+ * block_rq_key() (see the block tracepoint section), which zeroes the
+ * padding — hash map key comparison covers every byte.
+ */
+struct block_rq_key_t {
+  u32 dev;     /**< Device number (major:minor encoded) */
+  u32 pad;     /**< Explicit padding — always zero */
+  u64 sector;  /**< Full 64-bit starting sector */
+};
+
 /* Block layer latency tracking maps. LRU so that requests that never
  * complete (e.g. merged into another request) cannot permanently fill the
  * map and starve later requests. */
-BPF_TABLE("lru_hash", u64, struct block_issue_ctx, block_start_times, 10240); /**< Issue time + submitter, keyed by dev+sector */
-BPF_TABLE("lru_hash", u64, u64, block_insert_times, 10240);  /**< Tracks block request insert time (queue latency) */
+BPF_TABLE("lru_hash", struct block_rq_key_t, struct block_issue_ctx, block_start_times, 10240); /**< Issue time + submitter, keyed by dev+sector */
+BPF_TABLE("lru_hash", struct block_rq_key_t, u64, block_insert_times, 10240);  /**< Tracks block request insert time (queue latency) */
 
 /* Configuration map - stores tracer PID to exclude self-tracing */
 BPF_HASH(tracer_config, u32, u32, 1);    /**< Key 0 = tracer PID to exclude */
@@ -2465,8 +2479,11 @@ int trace_sendfile(struct pt_regs *ctx, int out_fd, int in_fd, loff_t *offset,
  * trace. CPU ID is intentionally not part of the key because completion may
  * run on a different CPU than submission.
  */
-static __always_inline u64 block_rq_key(u32 dev, u64 sector) {
-  return ((u64)dev << 32) ^ sector;
+static __always_inline struct block_rq_key_t block_rq_key(u32 dev, u64 sector) {
+  struct block_rq_key_t key = {};
+  key.dev = dev;
+  key.sector = sector;
+  return key;
 }
 
 /**
@@ -2483,7 +2500,7 @@ TRACEPOINT_PROBE(block, block_rq_insert) {
     return 0;
 
   // Store insert timestamp for queue time calculation
-  u64 key = block_rq_key(args->dev, args->sector);
+  struct block_rq_key_t key = block_rq_key(args->dev, args->sector);
   u64 ts = bpf_ktime_get_ns();
   block_insert_times.update(&key, &ts);
 
@@ -2506,7 +2523,7 @@ TRACEPOINT_PROBE(block, block_rq_issue) {
   if (tracer_pid && pid == *tracer_pid)
     return 0;
 
-  u64 key = block_rq_key(args->dev, args->sector);
+  struct block_rq_key_t key = block_rq_key(args->dev, args->sector);
   struct block_issue_ctx ictx = {};
   ictx.ts = bpf_ktime_get_ns();
   ictx.pid = pid;
@@ -2526,7 +2543,7 @@ TRACEPOINT_PROBE(block, block_rq_issue) {
  */
 TRACEPOINT_PROBE(block, block_rq_complete) {
   // Must use the same key formula as block_rq_issue/insert.
-  u64 key = block_rq_key(args->dev, args->sector);
+  struct block_rq_key_t key = block_rq_key(args->dev, args->sector);
   struct block_issue_ctx *ictx = block_start_times.lookup(&key);
   if (!ictx)
     return 0;
