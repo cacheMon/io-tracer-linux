@@ -167,6 +167,10 @@ class KernelProbeTracker:
             # VFS (Virtual File System) probes
             self.add_kprobe("vfs_read", "trace_vfs_read")
             self.add_kprobe("vfs_write", "trace_vfs_write")
+            # Return probes complete READ/WRITE events with the syscall return
+            # value (bytes moved / errno) and the operation latency.
+            self.add_kretprobe("vfs_read", "trace_vfs_read_ret")
+            self.add_kretprobe("vfs_write", "trace_vfs_write_ret")
             # Capture the user-provided filename before the kernel resolves it.
             # Must be registered BEFORE vfs_open so the path is staged in time.
             # Uses the same fallback chain as the kretprobe.

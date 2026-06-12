@@ -299,12 +299,47 @@ class IOTracer:
                 # CLOSE events buffered after PROCESS_EXIT can still resolve it.
                 self.mmap_regions.pop(event.pid, None)
 
+        # Completion metadata — READ/WRITE carry the syscall return value, errno,
+        # completed byte count, and duration (filled by the kretprobes).
+        return_value = ""
+        errno_val = ""
+        bytes_completed = ""
+        duration_ns = ""
+        if op_name in ("READ", "WRITE"):
+            ret = event.ret_val
+            return_value = str(ret)
+            if ret < 0:
+                errno_val = self.flag_mapper.format_errno(-ret)
+            else:
+                bytes_completed = str(ret)
+            duration_ns = str(event.latency_ns) if event.latency_ns else ""
+
+        # Provenance metadata — populated for READ/WRITE/OPEN.
+        dev_val = self._format_dev(event.dev) if getattr(event, "dev", 0) else ""
+        ppid_val = event.ppid if getattr(event, "ppid", 0) else ""
+        container_id = event.cgroup_id if getattr(event, "cgroup_id", 0) else ""
+        fs_type_val = (
+            self.flag_mapper.format_fs_type(event.fs_magic)
+            if getattr(event, "fs_magic", 0) else ""
+        )
+
         output = format_csv_row(
             timestamp, op_name, event.pid, comm, filename, size_val, inode_val,
             flags_val, offset_val, tid_val, mmap_prot_val, mmap_flags_val,
-            address_val, cmdline
+            address_val, cmdline,
+            return_value, errno_val, bytes_completed, duration_ns,
+            dev_val, ppid_val, container_id, fs_type_val
         )
         self.writer.append_fs_log(output)
+
+    @staticmethod
+    def _format_dev(dev: int) -> str:
+        """Decode a dev_t (super_block->s_dev) into 'major:minor'."""
+        if not dev:
+            return ""
+        major = (dev >> 20) & 0xfff
+        minor = dev & 0xfffff
+        return f"{major}:{minor}"
 
     def _track_mmap_region(self, pid: int, start: int, length: int, filename: str) -> None:
         """Track file-backed mappings so later munmap events can recover filenames."""
