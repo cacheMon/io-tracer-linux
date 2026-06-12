@@ -542,9 +542,11 @@ class IOTracer:
             return
         self._last_cache_cleanup = now
         self.path_resolver.cleanup_old_cache()
-        # Crude but bounded: cmdlines for live PIDs are re-read on demand.
+        # Keep the most recently added entries (insertion order) so cmdlines
+        # for recently exited PIDs — the reason this cache exists — survive;
+        # entries for live PIDs are re-read on demand if dropped.
         if len(self.cmdline_cache) > 20000:
-            self.cmdline_cache.clear()
+            self.cmdline_cache = dict(list(self.cmdline_cache.items())[-5000:])
 
     def _handle_process_exit(self, pid: int) -> None:
         """
