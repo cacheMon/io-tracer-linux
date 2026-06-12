@@ -1110,10 +1110,10 @@ class IOTracer:
                 while remaining > 0 and self.running:
                     sleep_time = min(0.1, remaining)
                     time.sleep(sleep_time)
-                    
+
                     current = time.time()
                     remaining = end_time - current # type: ignore
-                    
+
                     if self.verbose and int(current) % 10 == 0 and int(current) > int(current - sleep_time):
                         elapsed = current - start
                         logger("info", f"Progress: {elapsed:.1f}s/{duration_target}s") # type: ignore
@@ -1123,7 +1123,7 @@ class IOTracer:
                 # Run indefinitely until Ctrl+C
                 while self.running:
                     time.sleep(0.1)
-                    
+
                     if self.verbose:
                         current = time.time()
                         if int(current) % 30 == 0:  # Every 30 seconds

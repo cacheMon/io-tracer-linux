@@ -697,7 +697,7 @@ class FlagMapper:
             str: Human-readable flags, or an empty string when the operation
                  does not define flag semantics for the current value.
         """
-        if op_name in {"OPEN", "READ", "WRITE", "CLOSE", "FSYNC", "READDIR"}:
+        if op_name in {"OPEN", "READ", "WRITE", "CLOSE", "FSYNC", "FDATASYNC", "READDIR"}:
             return self.format_fs_flags(flags)
         if op_name == "MKDIR":
             return self.format_mode_flags(flags)

@@ -174,10 +174,13 @@ class KernelProbeTracker:
             # Capture the user-provided filename before the kernel resolves it.
             # Must be registered BEFORE vfs_open so the path is staged in time.
             # Uses the same fallback chain as the kretprobe.
+            # NOTE: __x64_sys_* wrappers take a single pt_regs* holding the
+            # user registers, so they need the *_x64 probe variants that
+            # unwrap it; reading PARM1-4 directly there yields garbage.
             if BPF.get_kprobe_functions(b'do_sys_openat2'):
                 self.add_kprobe("do_sys_openat2", "trace_do_sys_openat2_entry")
             elif BPF.get_kprobe_functions(b'__x64_sys_openat'):
-                self.add_kprobe("__x64_sys_openat", "trace_do_sys_openat2_entry")
+                self.add_kprobe("__x64_sys_openat", "trace_openat_entry_x64")
             else:
                 self.add_kprobe("sys_openat", "trace_do_sys_openat2_entry")
             self.add_kprobe("vfs_open", "trace_vfs_open")
@@ -191,6 +194,9 @@ class KernelProbeTracker:
             else:
                 self.add_kretprobe("sys_openat", "trace_sys_openat_ret")
             self.add_kprobe("vfs_fsync", "trace_vfs_fsync")
+            # Return probe clears the marker that suppresses the duplicate
+            # event from the nested vfs_fsync -> vfs_fsync_range call.
+            self.add_kretprobe("vfs_fsync", "trace_vfs_fsync_ret")
             self.add_kprobe("ksys_sync", "trace_ksys_sync")
             self.add_kprobe("vfs_fsync_range", "trace_vfs_fsync_range")
             self.add_kprobe("__fput", "trace_fput")
@@ -200,9 +206,10 @@ class KernelProbeTracker:
             self.add_kretprobe("do_mmap", "trace_mmap_ret")
             self.add_kprobe("__vm_munmap", "trace_munmap")
 
-            # mremap probes — kernel may export the arch wrapper or the generic symbol
+            # mremap probes — kernel may export the arch wrapper or the generic
+            # symbol. The wrapper needs the pt_regs-unwrapping variant.
             if BPF.get_kprobe_functions(b'__x64_sys_mremap'):
-                self.add_kprobe("__x64_sys_mremap", "trace_mremap_entry")
+                self.add_kprobe("__x64_sys_mremap", "trace_mremap_entry_x64")
                 self.add_kretprobe("__x64_sys_mremap", "trace_mremap_ret")
             elif BPF.get_kprobe_functions(b'sys_mremap'):
                 self.add_kprobe("sys_mremap", "trace_mremap_entry")
@@ -251,12 +258,16 @@ class KernelProbeTracker:
             # else:
             #     logger("warning", "filemap_fault not available - mmap I/O tracking disabled")
             
-            # Direct I/O probe for bypass detection (return probe only - no latency tracking)
+            # Direct I/O probes. The entry probe stages the I/O direction from
+            # the iov_iter (the return value alone cannot distinguish a read
+            # from a write); the return probe emits the completion event.
             if BPF.get_kprobe_functions(b'iomap_dio_rw'):
+                self.add_kprobe("iomap_dio_rw", "trace_dio_entry_iomap")
                 self.add_kretprobe("iomap_dio_rw", "trace_dio_return")
                 if self.developer_mode:
                     logger("info", "Direct I/O tracing enabled via iomap_dio_rw")
             elif BPF.get_kprobe_functions(b'__blockdev_direct_IO'):
+                self.add_kprobe("__blockdev_direct_IO", "trace_dio_entry_blockdev")
                 self.add_kretprobe("__blockdev_direct_IO", "trace_dio_return")
                 if self.developer_mode:
                     logger("info", "Direct I/O tracing enabled via __blockdev_direct_IO")
@@ -376,7 +387,8 @@ class KernelProbeTracker:
                 if self.developer_mode:
                     logger("info", "io_uring tracing enabled via __io_uring_enter")
             elif BPF.get_kprobe_functions(b'__x64_sys_io_uring_enter'):
-                self.add_kprobe("__x64_sys_io_uring_enter", "trace_io_uring_enter")
+                # Syscall wrapper: needs the pt_regs-unwrapping variant.
+                self.add_kprobe("__x64_sys_io_uring_enter", "trace_io_uring_enter_x64")
                 if self.developer_mode:
                     logger("info", "io_uring tracing enabled via __x64_sys_io_uring_enter")
             elif BPF.get_kprobe_functions(b'__sys_io_uring_enter'):

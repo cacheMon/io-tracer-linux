@@ -220,23 +220,29 @@ class PathResolver:
     def cleanup_old_cache(self):
         """
         Remove old entries from cache to prevent memory bloat.
-        
+
         Removes:
         - Process entries older than cache_timeout * 10 seconds
         - Limits inode cache to 5000 most recent entries
+
+        Thread-safety: this runs on the polling thread (from the perf-buffer
+        callbacks via cache maintenance), the same thread that mutates these
+        dicts. Iteration still works on list() snapshots and removals
+        tolerate missing entries as defense in depth.
         """
         current_time = time.time()
-        
+
         # Clean up process cache
         pids_to_remove = []
-        for pid, last_time in self.last_update.items():
+        for pid, last_time in list(self.last_update.items()):
             if current_time - last_time > self.cache_timeout * 10:
                 pids_to_remove.append(pid)
-        
+
         for pid in pids_to_remove:
             self.pid_to_files.pop(pid, None)
             self.last_update.pop(pid, None)
-        
+
+
         # Optionally limit inode cache size
         if len(self.inode_to_path) > 10000:
             # Keep only the most recent 5000 entries

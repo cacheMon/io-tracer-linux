@@ -95,6 +95,7 @@ struct bpf_task_work {};   /* task_work field, added in 6.14 */
 #include <linux/stat.h>       /* File mode/permission macros (S_ISREG, etc.) */
 #include <linux/tcp.h>        /* TCP protocol structures */
 #include <linux/udp.h>        /* UDP protocol structures */
+#include <linux/uio.h>        /* iov_iter — direct I/O direction detection */
 #include <net/inet_sock.h>    /* Internet socket structures */
 #include <net/sock.h>         /* Generic socket structures */
 
@@ -552,22 +553,57 @@ struct vfs_info {
  * per-CPU arrays avoid lock contention, perf buffers stream events.
  */
 
-/* Block layer latency tracking maps */
-BPF_HASH(block_start_times, u64, u64);   /**< Tracks block request issue time */
-BPF_HASH(block_insert_times, u64, u64);  /**< Tracks block request insert time (queue latency) */
+/**
+ * @brief Submitter context captured at block_rq_issue time.
+ *
+ * block_rq_complete runs in IRQ/softirq context, where the current task is
+ * whatever happened to be running (frequently swapper/N), NOT the process
+ * that submitted the I/O. Attribution must therefore be captured at issue
+ * time and carried to the completion event via this struct.
+ */
+struct block_issue_ctx {
+  u64 ts;                   /**< Issue timestamp (device latency baseline) */
+  u32 pid;                  /**< Submitting process ID */
+  u32 tid;                  /**< Submitting thread ID */
+  u32 ppid;                 /**< Submitter's parent PID */
+  char comm[TASK_COMM_LEN]; /**< Submitting process name */
+};
 
-/* VFS operation tracking maps */
-BPF_HASH(start, u64, u64);               /**< Generic operation start times */
-BPF_HASH(file_positions, u64, u64, 1024); /**< File position cache for offset tracking */
+/**
+ * @brief Collision-free correlation key for block requests.
+ *
+ * dev and sector are kept as separate fields (not folded into one u64) so
+ * distinct (dev, sector) pairs can never collide. Built exclusively via
+ * block_rq_key() (see the block tracepoint section), which zeroes the
+ * padding — hash map key comparison covers every byte.
+ */
+struct block_rq_key_t {
+  u32 dev;     /**< Device number (major:minor encoded) */
+  u32 pad;     /**< Explicit padding — always zero */
+  u64 sector;  /**< Full 64-bit starting sector */
+};
+
+/* Block layer latency tracking maps. LRU so that requests that never
+ * complete (e.g. merged into another request) cannot permanently fill the
+ * map and starve later requests. */
+BPF_TABLE("lru_hash", struct block_rq_key_t, struct block_issue_ctx, block_start_times, 10240); /**< Issue time + submitter, keyed by dev+sector */
+BPF_TABLE("lru_hash", struct block_rq_key_t, u64, block_insert_times, 10240);  /**< Tracks block request insert time (queue latency) */
 
 /* Configuration map - stores tracer PID to exclude self-tracing */
 BPF_HASH(tracer_config, u32, u32, 1);    /**< Key 0 = tracer PID to exclude */
 
-// BPF_HASH(dio_start, u64, u64);           /**< Direct I/O operation start times (removed - no longer tracking latency) */
+/* Direct I/O direction staged at entry (1 = write), consumed by the
+ * iomap_dio_rw/__blockdev_direct_IO kretprobe. */
+BPF_HASH(dio_staging, u64, u8, 10240);
 
-/* io_uring request tracking maps */
-BPF_HASH(io_uring_submit_map, u64, struct io_uring_submit_ctx, 65536); /**< Track submissions by req_ptr */
-BPF_HASH(io_uring_enter_ctx, u64, u64);  /**< io_uring_enter start timestamp */
+/* vfs_fsync entry timestamp, used by trace_vfs_fsync_range to suppress the
+ * duplicate event for the nested vfs_fsync -> vfs_fsync_range call. */
+BPF_HASH(fsync_inflight, u64, u64, 10240);
+
+/* io_uring request tracking map. LRU because completions that bypass the
+ * probed completion path (batched completions on modern kernels) would
+ * otherwise leak entries until the map is permanently full. */
+BPF_TABLE("lru_hash", u64, struct io_uring_submit_ctx, io_uring_submit_map, 65536); /**< Track submissions by req_ptr */
 
 /* Per-CPU buffer for large structs that exceed 512-byte stack limit */
 BPF_PERCPU_ARRAY(dual_data_buffer, struct data_dual_t, 1);
@@ -1122,6 +1158,46 @@ int trace_do_sys_openat2_entry(struct pt_regs *ctx) {
   return 0;
 }
 
+#if defined(__x86_64__) || defined(bpf_target_x86)
+/**
+ * @brief Kprobe entry for the __x64_sys_openat syscall wrapper.
+ *
+ * __x64_sys_* wrappers receive the user pt_regs as their only argument
+ * (see trace_mremap_entry_x64); the filename pointer is the second syscall
+ * argument, i.e. uregs->si — not PT_REGS_PARM2 of the probe context.
+ *
+ * @param ctx  BPF context (PARM1 = user pt_regs)
+ * @return     0
+ */
+int trace_openat_entry_x64(struct pt_regs *ctx) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 pid = pid_tgid >> 32;
+
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) {
+    return 0;
+  }
+
+  struct pt_regs *uregs = (struct pt_regs *)PT_REGS_PARM1(ctx);
+  if (!uregs) {
+    return 0;
+  }
+
+  unsigned long filename_arg = 0;
+  bpf_probe_read_kernel(&filename_arg, sizeof(filename_arg), &uregs->si);
+  const char __user *user_path = (const char __user *)filename_arg;
+  if (!user_path) {
+    return 0;
+  }
+
+  struct open_path_t staged = {};
+  bpf_probe_read_user_str(staged.path, sizeof(staged.path), user_path);
+  open_path_staging.update(&pid_tgid, &staged);
+  return 0;
+}
+#endif /* __x86_64__ */
+
 /**
  * @brief Trace vfs_open()
  *
@@ -1272,16 +1348,31 @@ int trace_vfs_fsync(struct pt_regs *ctx, struct file *file, int datasync) {
 
   struct data_t data = {};
   data.pid = pid;
+  data.tid = (u32)pid_tgid;
   data.ts = bpf_ktime_get_ns();
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
-  data.op = OP_FSYNC;
+  data.op = datasync ? OP_FDATASYNC : OP_FSYNC;
   data.inode = get_file_inode(file);
   data.size = 0;
   get_file_path(file, data.filename, sizeof(data.filename));
   bpf_probe_read_kernel(&data.flags, sizeof(data.flags), &file->f_flags);
 
+  // vfs_fsync() is implemented as vfs_fsync_range(file, 0, LLONG_MAX,
+  // datasync); mark this thread so the vfs_fsync_range probe does not emit a
+  // second event for the same syscall. Cleared by the vfs_fsync kretprobe.
+  fsync_inflight.update(&pid_tgid, &data.ts);
+
   events.perf_submit(ctx, &data, sizeof(data));
 
+  return 0;
+}
+
+/**
+ * @brief vfs_fsync() kretprobe — clears the nested-call suppression marker.
+ */
+int trace_vfs_fsync_ret(struct pt_regs *ctx) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  fsync_inflight.delete(&pid_tgid);
   return 0;
 }
 
@@ -1313,6 +1404,17 @@ int trace_vfs_fsync_range(struct pt_regs *ctx, struct file *file, loff_t start,
     return 0;
   }
 
+  // Suppress the nested call from vfs_fsync(), which already emitted this
+  // event. Entries older than 1s are stale (missed kretprobe) and ignored so
+  // a single miss cannot permanently mute this thread's range events.
+  u64 *fsync_entry_ts = fsync_inflight.lookup(&pid_tgid);
+  if (fsync_entry_ts) {
+    if (bpf_ktime_get_ns() - *fsync_entry_ts < 1000000000ULL) {
+      return 0;
+    }
+    fsync_inflight.delete(&pid_tgid);
+  }
+
   loff_t range_size;
   loff_t file_size = 0;
   if (file && file->f_inode) {
@@ -1328,9 +1430,10 @@ int trace_vfs_fsync_range(struct pt_regs *ctx, struct file *file, loff_t start,
 
   struct data_t data = {};
   data.pid = pid;
+  data.tid = (u32)pid_tgid;
   data.ts = bpf_ktime_get_ns();
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
-  data.op = OP_FSYNC;
+  data.op = datasync ? OP_FDATASYNC : OP_FSYNC;
   data.inode = get_file_inode(file);
   data.size = range_size;
   get_file_path(file, data.filename, sizeof(data.filename));
@@ -1518,6 +1621,45 @@ int trace_mremap_entry(struct pt_regs *ctx) {
   mremap_staging.update(&pid_tgid, &args);
   return 0;
 }
+
+#if defined(__x86_64__) || defined(bpf_target_x86)
+/**
+ * @brief kprobe entry for the __x64_sys_mremap syscall wrapper.
+ *
+ * With CONFIG_ARCH_HAS_SYSCALL_WRAPPER (x86-64 since 4.17), __x64_sys_*
+ * functions receive a single struct pt_regs * holding the user registers;
+ * the syscall arguments are NOT in the probe's own PARM1-4 (reading them
+ * there yields the pt_regs pointer and junk). This variant unwraps the
+ * inner registers (di, si, dx, r10 per the syscall ABI).
+ *
+ * @param ctx  BPF context (PARM1 = user pt_regs)
+ * @return     0
+ */
+int trace_mremap_entry_x64(struct pt_regs *ctx) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 pid = pid_tgid >> 32;
+
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) {
+    return 0;
+  }
+
+  struct pt_regs *uregs = (struct pt_regs *)PT_REGS_PARM1(ctx);
+  if (!uregs) {
+    return 0;
+  }
+
+  struct mremap_args args = {};
+  bpf_probe_read_kernel(&args.old_addr, sizeof(args.old_addr), &uregs->di);
+  bpf_probe_read_kernel(&args.old_len, sizeof(args.old_len), &uregs->si);
+  bpf_probe_read_kernel(&args.new_len, sizeof(args.new_len), &uregs->dx);
+  bpf_probe_read_kernel(&args.flags, sizeof(args.flags), &uregs->r10);
+
+  mremap_staging.update(&pid_tgid, &args);
+  return 0;
+}
+#endif /* __x86_64__ */
 
 /**
  * @brief kretprobe return for sys_mremap - emit event with old + new addresses
@@ -1923,71 +2065,9 @@ int trace_ksys_sync(struct pt_regs *ctx) {
   return 0;
 }
 
-/**
- * @brief Syscall tracepoint for fdatasync() - data-only file synchronization
- *
- * fdatasync() flushes file data to storage but skips inode metadata updates
- * unless they are needed to retrieve the data (e.g. file size change).
- * Unlike vfs_fsync (datasync=1), this probe fires at the syscall boundary,
- * so we resolve the struct file * from the fd via the task's fd table.
- *
- * @param args  Tracepoint args: args->fd = file descriptor
- * @return      0
- */
-TRACEPOINT_PROBE(syscalls, sys_enter_fdatasync) {
-  u64 pid_tgid = bpf_get_current_pid_tgid();
-  u32 pid = pid_tgid >> 32;
-
-  u32 config_key = 0;
-  u32 *tracer_pid = tracer_config.lookup(&config_key);
-  if (tracer_pid && pid == *tracer_pid) {
-    return 0;
-  }
-
-  // Resolve struct file * from fd: task->files->fdt->fd[args->fd]
-  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-  struct files_struct *files = NULL;
-  bpf_probe_read_kernel(&files, sizeof(files), &task->files);
-  if (!files) {
-    return 0;
-  }
-
-  struct fdtable *fdt = NULL;
-  bpf_probe_read_kernel(&fdt, sizeof(fdt), &files->fdt);
-  if (!fdt) {
-    return 0;
-  }
-
-  struct file **fd_arr = NULL;
-  bpf_probe_read_kernel(&fd_arr, sizeof(fd_arr), &fdt->fd);
-  if (!fd_arr) {
-    return 0;
-  }
-
-  struct file *file = NULL;
-  bpf_probe_read_kernel(&file, sizeof(file), &fd_arr[args->fd]);
-  if (!file) {
-    return 0;
-  }
-
-  if (!is_regular_file(file)) {
-    return 0;
-  }
-
-  struct data_t data = {};
-  data.pid = pid;
-  data.tid = (u32)pid_tgid;
-  data.ts = bpf_ktime_get_ns();
-  bpf_get_current_comm(&data.comm, sizeof(data.comm));
-  data.op = OP_FDATASYNC;
-  data.inode = get_file_inode(file);
-  data.size = 0;
-  get_file_path(file, data.filename, sizeof(data.filename));
-  bpf_probe_read_kernel(&data.flags, sizeof(data.flags), &file->f_flags);
-
-  events.perf_submit(args, &data, sizeof(data));
-  return 0;
-}
+/* NOTE: fdatasync() is captured by trace_vfs_fsync/trace_vfs_fsync_range via
+ * the datasync argument (OP_FDATASYNC); a dedicated sys_enter_fdatasync
+ * tracepoint would double-count it. */
 
 /* ============================================================================
  * DUAL-PATH FILESYSTEM OPERATION PROBES
@@ -2182,8 +2262,13 @@ int trace_vfs_rmdir(struct pt_regs *ctx, struct inode *dir,
  * @param new_dentry  New link dentry
  * @return            0
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 int trace_vfs_link(struct pt_regs *ctx, struct dentry *old_dentry,
                    void *idmap, struct inode *dir, struct dentry *new_dentry) {
+#else
+int trace_vfs_link(struct pt_regs *ctx, struct dentry *old_dentry,
+                   struct inode *dir, struct dentry *new_dentry) {
+#endif
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 pid = pid_tgid >> 32;
 
@@ -2242,8 +2327,13 @@ int trace_vfs_link(struct pt_regs *ctx, struct dentry *old_dentry,
  * @param oldname Target path (symlink content)
  * @return        0
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
 int trace_vfs_symlink(struct pt_regs *ctx, void *idmap, struct inode *dir,
                       struct dentry *dentry, const char *oldname) {
+#else
+int trace_vfs_symlink(struct pt_regs *ctx, struct inode *dir,
+                      struct dentry *dentry, const char *oldname) {
+#endif
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 pid = pid_tgid >> 32;
 
@@ -2366,7 +2456,6 @@ int trace_sendfile(struct pt_regs *ctx, int out_fd, int in_fd, loff_t *offset,
   data.op = OP_SENDFILE;
   data.inode = 0;
   data.size = count;
-  __builtin_memcpy(data.filename, "", 11);
   data.flags = 0;
 
   events.perf_submit(ctx, &data, sizeof(data));
@@ -2379,6 +2468,23 @@ int trace_sendfile(struct pt_regs *ctx, int out_fd, int in_fd, loff_t *offset,
  * Block layer tracing captures disk I/O at the request queue level.
  * Three events track request lifecycle: insert -> issue -> complete
  */
+
+/**
+ * @brief Build the correlation key for a block request.
+ *
+ * MUST be used by insert, issue, and complete alike: any divergence (the
+ * complete probe previously masked the sector to 32 bits while insert/issue
+ * XOR'd the full value) makes lookups fail for sectors >= 2^32 — i.e. all
+ * I/O beyond the 2 TiB boundary of a device silently disappears from the
+ * trace. CPU ID is intentionally not part of the key because completion may
+ * run on a different CPU than submission.
+ */
+static __always_inline struct block_rq_key_t block_rq_key(u32 dev, u64 sector) {
+  struct block_rq_key_t key = {};
+  key.dev = dev;
+  key.sector = sector;
+  return key;
+}
 
 /**
  * @brief Block request insert tracepoint
@@ -2394,7 +2500,7 @@ TRACEPOINT_PROBE(block, block_rq_insert) {
     return 0;
 
   // Store insert timestamp for queue time calculation
-  u64 key = ((u64)args->dev << 32) ^ (u64)args->sector;
+  struct block_rq_key_t key = block_rq_key(args->dev, args->sector);
   u64 ts = bpf_ktime_get_ns();
   block_insert_times.update(&key, &ts);
 
@@ -2404,22 +2510,27 @@ TRACEPOINT_PROBE(block, block_rq_insert) {
 /**
  * @brief Block request issue tracepoint
  *
- * Records when a request is submitted to the device driver.
- * Start time is stored for latency calculation on completion.
- * Key is composite of device and sector for cross-CPU correlation.
+ * Records when a request is submitted to the device driver, together with
+ * the submitting task's identity. The completion handler runs in IRQ/softirq
+ * context where "current" is unrelated to the I/O, so pid/comm/ppid must be
+ * captured here and carried to the completion event.
  */
 TRACEPOINT_PROBE(block, block_rq_issue) {
-  u32 pid = bpf_get_current_pid_tgid() >> 32;
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 pid = pid_tgid >> 32;
   u32 key_pid = 0;
   u32 *tracer_pid = tracer_config.lookup(&key_pid);
   if (tracer_pid && pid == *tracer_pid)
     return 0;
 
-  // Use dev and sector as key to correlate issue with completion
-  // Note: CPU ID is NOT included because completion may occur on a different CPU
-  u64 key = ((u64)args->dev << 32) ^ (u64)args->sector;
-  u64 ts = bpf_ktime_get_ns();
-  block_start_times.update(&key, &ts);
+  struct block_rq_key_t key = block_rq_key(args->dev, args->sector);
+  struct block_issue_ctx ictx = {};
+  ictx.ts = bpf_ktime_get_ns();
+  ictx.pid = pid;
+  ictx.tid = (u32)pid_tgid;
+  ictx.ppid = get_ppid();
+  bpf_get_current_comm(&ictx.comm, sizeof(ictx.comm));
+  block_start_times.update(&key, &ictx);
 
   return 0;
 }
@@ -2431,44 +2542,41 @@ TRACEPOINT_PROBE(block, block_rq_issue) {
  * Computes both device latency (issue->complete) and queue latency.
  */
 TRACEPOINT_PROBE(block, block_rq_complete) {
-  u32 pid = bpf_get_current_pid_tgid() >> 32;
+  // Must use the same key formula as block_rq_issue/insert.
+  struct block_rq_key_t key = block_rq_key(args->dev, args->sector);
+  struct block_issue_ctx *ictx = block_start_times.lookup(&key);
+  if (!ictx)
+    return 0;
+
+  // Filter the tracer's own I/O by the SUBMITTER pid — the current pid here
+  // is the interrupted task, not the process that did the I/O.
   u32 key_pid = 0;
   u32 *tracer_pid = tracer_config.lookup(&key_pid);
-  if (tracer_pid && pid == *tracer_pid)
+  if (tracer_pid && ictx->pid == *tracer_pid) {
+    block_start_times.delete(&key);
+    block_insert_times.delete(&key);
     return 0;
-
-  // Use dev and sector to match the key from block_rq_issue
-  u64 key = ((u64)args->dev << 32) | (args->sector & 0xFFFFFFFF);
-  u64 *start_ts = block_start_times.lookup(&key);
-  if (!start_ts)
-    return 0;
+  }
 
   u64 end_ts = bpf_ktime_get_ns();
-  u64 latency = end_ts - *start_ts;
-  
+  u64 latency = end_ts - ictx->ts;
+
   // Calculate queue time (time from insert to issue)
   u64 queue_time = 0;
   u64 *insert_ts = block_insert_times.lookup(&key);
-  if (insert_ts && *start_ts >= *insert_ts) {
-    queue_time = *start_ts - *insert_ts;
+  if (insert_ts && ictx->ts >= *insert_ts) {
+    queue_time = ictx->ts - *insert_ts;
   }
 
   struct block_event event = {};
   event.ts = end_ts;
-  event.pid = pid;
-  event.tid = bpf_get_current_pid_tgid();
+  // Attribution from issue time: the submitting task, not the completion
+  // context (which is frequently swapper/N in softirq).
+  event.pid = ictx->pid;
+  event.tid = ictx->tid;
+  event.ppid = ictx->ppid;
+  __builtin_memcpy(event.comm, ictx->comm, sizeof(event.comm));
   event.cpu_id = bpf_get_smp_processor_id();
-  bpf_get_current_comm(&event.comm, sizeof(event.comm));
-
-  // Get parent PID
-  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-  struct task_struct *parent = NULL;
-  if (task) {
-    bpf_probe_read_kernel(&parent, sizeof(parent), &task->real_parent);
-    if (parent) {
-      bpf_probe_read_kernel(&event.ppid, sizeof(event.ppid), &parent->tgid);
-    }
-  }
 
   event.sector = args->sector;
   
@@ -2498,19 +2606,6 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
 
   block_start_times.delete(&key);
   block_insert_times.delete(&key);
-  return 0;
-}
-
-/**
- * @brief Helper to read filename from dentry
- *
- * @param dentry  Dentry to read from
- * @param buf     Output buffer
- * @return        0
- */
-static int get_filename(struct dentry *dentry, char *buf) {
-  struct qstr d_name = dentry->d_name;
-  bpf_probe_read_kernel_str(buf, DNAME_INLINE_LEN, d_name.name);
   return 0;
 }
 
@@ -3409,42 +3504,73 @@ int trace_filemap_fault_entry(struct pt_regs *ctx, struct vm_fault *vmf) {
  */
 
 /**
- * @brief Direct I/O entry probe (disabled - no longer tracking latency)
+ * @brief Stage the direct I/O direction from the iov_iter for the kretprobe.
  *
- * iomap_dio_rw() handles direct I/O on modern kernels.
- * Entry probe disabled since VFS latency tracking was removed.
- *
- * @param ctx   BPF context
- * @param iocb  I/O control block
- * @param iter  I/O vector iterator
- * @param ops   DIO operations table
- * @param flags DIO flags
- * @return      0
+ * The iov_iter encodes direction: data_source (>= 5.14) is true for writes;
+ * older kernels keep the WRITE bit (bit 0) in iter->type. The return value
+ * alone cannot distinguish read from write, so the direction must be read
+ * here at entry and consumed by trace_dio_return.
  */
-/*
-int trace_dio_entry(struct pt_regs *ctx, struct kiocb *iocb, struct iov_iter *iter,
-                    void *ops, int flags) {
+static __always_inline int stage_dio_direction(struct iov_iter *iter) {
+  if (!iter) {
+    return 0;
+  }
+  u8 is_write = 0;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
+  bool data_source = false;
+  bpf_probe_read_kernel(&data_source, sizeof(data_source), &iter->data_source);
+  is_write = data_source ? 1 : 0;
+#else
+  unsigned int type = 0;
+  bpf_probe_read_kernel(&type, sizeof(type), &iter->type);
+  is_write = (type & 1) ? 1 : 0;  /* WRITE == 1 */
+#endif
   u64 pid_tgid = bpf_get_current_pid_tgid();
-  u32 pid = pid_tgid >> 32;
+  dio_staging.update(&pid_tgid, &is_write);
+  return 0;
+}
 
+/**
+ * @brief Direct I/O entry probe for iomap_dio_rw (modern kernels).
+ *
+ * iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter, ...) — the
+ * iov_iter is the second argument.
+ */
+int trace_dio_entry_iomap(struct pt_regs *ctx, struct kiocb *iocb,
+                          struct iov_iter *iter) {
+  u32 pid = bpf_get_current_pid_tgid() >> 32;
   u32 config_key = 0;
   u32 *tracer_pid = tracer_config.lookup(&config_key);
   if (tracer_pid && pid == *tracer_pid)
     return 0;
-
-  // Store start time for latency calculation
-  u64 ts = bpf_ktime_get_ns();
-  dio_start.update(&pid_tgid, &ts);
-
-  return 0;
+  return stage_dio_direction(iter);
 }
-*/
+
+/**
+ * @brief Direct I/O entry probe for __blockdev_direct_IO (legacy path).
+ *
+ * __blockdev_direct_IO(struct kiocb *iocb, struct inode *inode,
+ *                      struct block_device *bdev, struct iov_iter *iter, ...)
+ * — the iov_iter is the fourth argument.
+ */
+int trace_dio_entry_blockdev(struct pt_regs *ctx, struct kiocb *iocb,
+                             struct inode *inode, struct block_device *bdev,
+                             struct iov_iter *iter) {
+  u32 pid = bpf_get_current_pid_tgid() >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid)
+    return 0;
+  return stage_dio_direction(iter);
+}
 
 /**
  * @brief Direct I/O return probe
  *
- * Emits DIO completion event (no latency tracking).
+ * Emits a DIO completion event with the direction staged by the entry probe.
  * Return value is bytes transferred (positive) or error (negative).
+ * If no direction was staged (probe attached mid-operation) the event is
+ * skipped rather than guessing the direction.
  */
 int trace_dio_return(struct pt_regs *ctx) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -3453,6 +3579,10 @@ int trace_dio_return(struct pt_regs *ctx) {
   u32 config_key = 0;
   u32 *tracer_pid = tracer_config.lookup(&config_key);
   if (tracer_pid && pid == *tracer_pid)
+    return 0;
+
+  u8 *is_write = dio_staging.lookup(&pid_tgid);
+  if (!is_write)
     return 0;
 
   ssize_t ret = PT_REGS_RC(ctx);
@@ -3464,11 +3594,12 @@ int trace_dio_return(struct pt_regs *ctx) {
   data.tid = (u32)pid_tgid;
   data.ts = end_ts;
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
-  data.op = (ret >= 0) ? OP_DIO_READ : OP_DIO_WRITE;  // Simplified - actual direction needs more context
+  data.op = (*is_write) ? OP_DIO_WRITE : OP_DIO_READ;
   data.size = (ret >= 0) ? (u64)ret : 0;
-  __builtin_memcpy(data.filename, "", 12);
+  data.ret_val = (s64)ret;
 
   events.perf_submit(ctx, &data, sizeof(data));
+  dio_staging.delete(&pid_tgid);
 
   return 0;
 }
@@ -3521,8 +3652,6 @@ int trace_splice(struct pt_regs *ctx, struct file *in, loff_t *off_in,
     if (off_in) {
       bpf_probe_read_kernel(&data.offset, sizeof(data.offset), off_in);
     }
-  } else {
-    __builtin_memcpy(data.filename, "", 9);
   }
 
   events.perf_submit(ctx, &data, sizeof(data));
@@ -3558,7 +3687,6 @@ TRACEPOINT_PROBE(syscalls, sys_enter_msync) {
   data.offset = args->start;  // Store address as offset
   data.size = args->len;
   data.flags = args->flags;
-  __builtin_memcpy(data.filename, "", 8);
 
   events.perf_submit(args, &data, sizeof(data));
   return 0;
@@ -3586,7 +3714,6 @@ TRACEPOINT_PROBE(syscalls, sys_enter_madvise) {
   data.offset = args->start;  // Store address as offset
   data.size = args->len_in;
   data.flags = args->behavior;
-  __builtin_memcpy(data.filename, "", 10);
 
   events.perf_submit(args, &data, sizeof(data));
   return 0;
@@ -3615,9 +3742,9 @@ TRACEPOINT_PROBE(syscalls, sys_enter_madvise) {
  * @param flags     Enter flags (IORING_ENTER_*)
  * @return          0
  */
-int trace_io_uring_enter(struct pt_regs *ctx, unsigned int fd,
-                         unsigned int to_submit, unsigned int min_complete,
-                         unsigned int flags) {
+static __always_inline int emit_io_uring_enter(struct pt_regs *ctx, u32 fd,
+                                               u32 to_submit, u32 min_complete,
+                                               u32 flags) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 pid = pid_tgid >> 32;
 
@@ -3642,6 +3769,39 @@ int trace_io_uring_enter(struct pt_regs *ctx, unsigned int fd,
   io_uring_events.perf_submit(ctx, &e, sizeof(e));
   return 0;
 }
+
+int trace_io_uring_enter(struct pt_regs *ctx, unsigned int fd,
+                         unsigned int to_submit, unsigned int min_complete,
+                         unsigned int flags) {
+  return emit_io_uring_enter(ctx, fd, to_submit, min_complete, flags);
+}
+
+#if defined(__x86_64__) || defined(bpf_target_x86)
+/**
+ * @brief Kprobe entry for the __x64_sys_io_uring_enter syscall wrapper.
+ *
+ * Unwraps the user pt_regs (see trace_mremap_entry_x64): fd/to_submit/
+ * min_complete/flags live in di/si/dx/r10, not in the probe's PARM1-4.
+ *
+ * @param ctx  BPF context (PARM1 = user pt_regs)
+ * @return     0
+ */
+int trace_io_uring_enter_x64(struct pt_regs *ctx) {
+  struct pt_regs *uregs = (struct pt_regs *)PT_REGS_PARM1(ctx);
+  if (!uregs) {
+    return 0;
+  }
+
+  unsigned long fd = 0, to_submit = 0, min_complete = 0, flags = 0;
+  bpf_probe_read_kernel(&fd, sizeof(fd), &uregs->di);
+  bpf_probe_read_kernel(&to_submit, sizeof(to_submit), &uregs->si);
+  bpf_probe_read_kernel(&min_complete, sizeof(min_complete), &uregs->dx);
+  bpf_probe_read_kernel(&flags, sizeof(flags), &uregs->r10);
+
+  return emit_io_uring_enter(ctx, (u32)fd, (u32)to_submit, (u32)min_complete,
+                             (u32)flags);
+}
+#endif /* __x86_64__ */
 
 /**
  * @brief ABI-stable subset of the io_uring SQE (uapi/linux/io_uring.h).
@@ -3843,14 +4003,22 @@ int trace_io_uring_complete(struct pt_regs *ctx, void *req, s32 result) {
   bpf_get_current_comm(&e.comm, sizeof(e.comm));
   e.cpu = bpf_get_smp_processor_id();
   e.req_ptr = req_ptr;
-  e.result = result;
   e.complete_ts_ns = ts;
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
+  e.result = result;
 
   /* Check if result indicates error */
   if (result < 0) {
     e.is_error = 1;
     e.cqe_errno = -result;
   }
+#else
+  /* On 6.0+ io_req_complete_post() no longer takes the result as a
+   * parameter (it lives in req->cqe.res, whose offset is not stable across
+   * releases); PARM2 here is issue_flags or garbage. Leave result/is_error
+   * unset rather than recording junk. */
+#endif
 
   /* Lookup submission context for latency calculation and correlation */
   struct io_uring_submit_ctx *submit_ctx = io_uring_submit_map.lookup(&req_ptr);
