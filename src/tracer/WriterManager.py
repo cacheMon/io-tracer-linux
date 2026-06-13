@@ -118,15 +118,19 @@ class WriteManager:
             'io_uring': deque(maxlen=1000),
         }
         
-        # Dynamic thresholds (min, max)
+        # Dynamic thresholds (min, max). Raised roughly 10x from the original
+        # sizes so each rotated/compressed log file is meaningfully larger,
+        # producing fewer, larger per-stream uploads instead of many tiny ones.
+        # The min is the steady-state file size at low event rates; the max
+        # caps memory by bounding how many events a buffer holds in RAM.
         self.dynamic_limits = {
-            'vfs': (8000, 500000),
-            'block': (8000, 50000),
-            'cache': (20000, 1000000),
-            'fs_state': (8000, 20000),
-            'proc_state': (8000, 10000),  # Match new process_max_events threshold
-            'pagefault': (8000, 100000),
-            'io_uring': (8000, 200000),
+            'vfs': (80000, 800000),
+            'block': (80000, 400000),
+            'cache': (100000, 1000000),
+            'fs_state': (80000, 200000),
+            'proc_state': (80000, 100000),
+            'pagefault': (80000, 400000),
+            'io_uring': (80000, 400000),
         }
         
         # Start adaptive sizing thread
@@ -140,14 +144,15 @@ class WriteManager:
         self.periodic_flush_thread.start()
         
 
-        # Buffer flush thresholds
-        self.cache_max_events = 20000
-        self.vfs_max_events = 8000
-        self.block_max_events = 8000
-        self.process_max_events = 8000  # Large enough to fit entire hourly snapshot
-        self.fs_snap_max_events = 8000
-        self.pagefault_max_events = 8000
-        self.io_uring_max_events = 8000
+        # Buffer flush thresholds. Raised ~10x so each rotated log file holds
+        # more events and uploads larger (kept in sync with dynamic_limits).
+        self.cache_max_events = 100000
+        self.vfs_max_events = 80000
+        self.block_max_events = 80000
+        self.process_max_events = 80000  # Large enough to fit entire hourly snapshot
+        self.fs_snap_max_events = 80000
+        self.pagefault_max_events = 80000
+        self.io_uring_max_events = 80000
 
         # Per-stream locks. Buffer flushes are triggered both from the
         # perf-callback (polling) thread via append_*_log -> flush_*_only and
@@ -186,21 +191,6 @@ class WriteManager:
 
         # Process snapshot session tracking
         self.process_snapshot_session_active = False
-
-        # Bundle upload tracking: buffer compressed files locally and only
-        # merge them into a single tar for upload once the accumulated size
-        # reaches bundle_max_bytes (100 MB) or the oldest buffered file has
-        # been waiting for bundle_max_interval (20 minutes), whichever comes
-        # first. The size trigger fires from _add_to_bundle; the time trigger
-        # is driven by the periodic flush thread.
-        self._pending_bundle: list[str] = []
-        self._bundle_lock = threading.Lock()
-        self._bundle_counter = 0
-        self._pending_bundle_bytes = 0
-        # Monotonic so the age check is unaffected by wall-clock adjustments.
-        self._bundle_window_start = time.monotonic()
-        self.bundle_max_bytes = 100 * 1024 * 1024  # 100 MB
-        self.bundle_max_interval = 20 * 60          # 20 minutes
 
     def _calculate_event_rate(self, event_type: str) -> float:
         """
@@ -289,35 +279,6 @@ class WriteManager:
                     self._last_flush_time = time.time()
                 except Exception as e:
                     logger("error", f"Error in periodic flush: {e}")
-
-            try:
-                self._maybe_flush_bundle_by_age()
-            except Exception as e:
-                logger("error", f"Error in periodic bundle flush: {e}")
-
-    def _maybe_flush_bundle_by_age(self, now: float | None = None) -> bool:
-        """Merge and upload buffered files if the oldest has waited too long.
-
-        Triggers a bundle flush once the buffering window has been open for at
-        least ``bundle_max_interval`` (20 min), even if the ``bundle_max_bytes``
-        size threshold was never reached. ``now`` is an injectable
-        ``time.monotonic()`` reading so the age trigger can be unit tested
-        without sleeping for the full interval.
-
-        Returns:
-            bool: True if a flush was triggered, False otherwise.
-        """
-        if not self.automatic_upload:
-            return False
-        if now is None:
-            now = time.monotonic()
-        with self._bundle_lock:
-            has_pending = bool(self._pending_bundle)
-            bundle_age = now - self._bundle_window_start
-        if has_pending and bundle_age >= self.bundle_max_interval:
-            self._flush_bundle()
-            return True
-        return False
 
     def _reset_flush_timer(self):
         """Reset the periodic flush timer (called after manual flushes)."""
@@ -527,7 +488,7 @@ class WriteManager:
             with open(dst, 'w') as f:
                 f.write(spec_str)
             if self.automatic_upload:
-                self._add_to_bundle(dst)
+                self.upload_manager.append_object(dst)
         except Exception as e:
             logger("error", f"Error writing device spec to {output_path}: {e}")
 
@@ -663,7 +624,7 @@ class WriteManager:
                     logger('info', f"Files Created: {str(self.created_files)} (filesystem snapshot with {num_parts} parts)", True)
                 for part_file in self.fs_snapshot_parts_pending_upload:
                     if os.path.exists(part_file):
-                        self._add_to_bundle(part_file)
+                        self.upload_manager.append_object(part_file)
                 self.fs_snapshot_parts_pending_upload.clear()
                 
         except Exception as e:
@@ -835,8 +796,6 @@ class WriteManager:
         
         self.compress_log(self.output_pagefault_file)
         self.compress_log(self.output_io_uring_file)
-        if self.automatic_upload:
-            self._flush_bundle()
         self.compress_dir(self.output_dir)
 
 
@@ -975,70 +934,6 @@ class WriteManager:
 
         self.clear_events()
 
-    def _add_to_bundle(self, file_path: str):
-        """Buffer a compressed file locally for a later merged upload.
-
-        Files accumulate on local disk until the buffered size reaches
-        ``bundle_max_bytes``, at which point this method triggers
-        ``_flush_bundle`` to merge them into a single tar and queue it for
-        upload. The age-based flush (``bundle_max_interval``) is handled
-        separately by the periodic flush thread.
-        """
-        try:
-            file_size = os.path.getsize(file_path)
-        except OSError:
-            file_size = 0
-        with self._bundle_lock:
-            if not self._pending_bundle:
-                # First file of a new window — start the age clock now so the
-                # 20 minute timer measures how long files have actually waited.
-                self._bundle_window_start = time.monotonic()
-            self._pending_bundle.append(file_path)
-            self._pending_bundle_bytes += file_size
-            should_flush = self._pending_bundle_bytes >= self.bundle_max_bytes
-        if should_flush:
-            self._flush_bundle()
-
-    def _flush_bundle(self):
-        """Merge all buffered files into one tar and queue it for upload."""
-        with self._bundle_lock:
-            if not self._pending_bundle:
-                return
-            files_to_bundle = list(self._pending_bundle)
-            self._pending_bundle.clear()
-            self._pending_bundle_bytes = 0
-            self._bundle_window_start = time.monotonic()
-            self._bundle_counter += 1
-            counter = self._bundle_counter
-
-        bundle_dir = os.path.dirname(self.output_dir.rstrip("/\\"))
-        bundle_ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
-        bundle_path = os.path.join(bundle_dir, f"bundle_{counter:04d}_{bundle_ts}.tar")
-
-        try:
-            with tarfile.open(bundle_path, "w") as tar:
-                for f in files_to_bundle:
-                    if os.path.exists(f):
-                        tar.add(f, arcname=os.path.relpath(f, bundle_dir))
-            # Tar closed successfully — safe to delete sources now
-            for f in files_to_bundle:
-                if os.path.exists(f):
-                    try:
-                        os.remove(f)
-                    except OSError as rm_err:
-                        logger("warning", f"Failed to remove bundled file {f}: {rm_err}")
-            self.upload_manager.append_object(bundle_path)
-        except Exception as e:
-            logger("error", f"Failed to create upload bundle: {e}")
-            if os.path.exists(bundle_path):
-                try:
-                    os.remove(bundle_path)
-                except OSError:
-                    pass
-            for f in files_to_bundle:
-                if os.path.exists(f):
-                    self.upload_manager.append_object(f)
-
     def compress_log(self, input_file: str):
         """
         Compress a log file with gzip and optionally upload.
@@ -1061,7 +956,9 @@ class WriteManager:
             if self.automatic_upload:
                 self.created_files += 1
                 logger('info', f"Files Created: {str(self.created_files)}", True)
-                self._add_to_bundle(dst)
+                # Upload each compressed log individually, preserving its
+                # subdirectory (fs, ds, cache, process, ...) on the backend.
+                self.upload_manager.append_object(dst)
             os.remove(src)
         except Exception as e:
             logger("error", f"Failed compressing log {input_file}: {e}")
