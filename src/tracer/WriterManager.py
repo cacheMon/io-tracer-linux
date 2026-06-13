@@ -197,7 +197,8 @@ class WriteManager:
         self._bundle_lock = threading.Lock()
         self._bundle_counter = 0
         self._pending_bundle_bytes = 0
-        self._bundle_window_start = time.time()
+        # Monotonic so the age check is unaffected by wall-clock adjustments.
+        self._bundle_window_start = time.monotonic()
         self.bundle_max_bytes = 100 * 1024 * 1024  # 100 MB
         self.bundle_max_interval = 20 * 60          # 20 minutes
 
@@ -295,7 +296,7 @@ class WriteManager:
             if self.automatic_upload:
                 with self._bundle_lock:
                     has_pending = bool(self._pending_bundle)
-                    bundle_age = time.time() - self._bundle_window_start
+                    bundle_age = time.monotonic() - self._bundle_window_start
                 if has_pending and bundle_age >= self.bundle_max_interval:
                     try:
                         self._flush_bundle()
@@ -974,7 +975,7 @@ class WriteManager:
             if not self._pending_bundle:
                 # First file of a new window — start the age clock now so the
                 # 20 minute timer measures how long files have actually waited.
-                self._bundle_window_start = time.time()
+                self._bundle_window_start = time.monotonic()
             self._pending_bundle.append(file_path)
             self._pending_bundle_bytes += file_size
             should_flush = self._pending_bundle_bytes >= self.bundle_max_bytes
@@ -989,7 +990,7 @@ class WriteManager:
             files_to_bundle = list(self._pending_bundle)
             self._pending_bundle.clear()
             self._pending_bundle_bytes = 0
-            self._bundle_window_start = time.time()
+            self._bundle_window_start = time.monotonic()
             self._bundle_counter += 1
             counter = self._bundle_counter
 

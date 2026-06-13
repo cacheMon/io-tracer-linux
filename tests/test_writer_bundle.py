@@ -99,7 +99,7 @@ class BundleBufferingTests(unittest.TestCase):
 
     def test_window_start_resets_on_new_buffer(self):
         self.wm.bundle_max_bytes = 10_000
-        old = time.time() - 9999
+        old = time.monotonic() - 9999
         self.wm._bundle_window_start = old
 
         f = self._make_file("a.csv.gz", 10)
