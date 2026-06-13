@@ -187,11 +187,19 @@ class WriteManager:
         # Process snapshot session tracking
         self.process_snapshot_session_active = False
 
-        # Bundle upload tracking: accumulate files and upload as a single tar
+        # Bundle upload tracking: buffer compressed files locally and only
+        # merge them into a single tar for upload once the accumulated size
+        # reaches bundle_max_bytes (100 MB) or the oldest buffered file has
+        # been waiting for bundle_max_interval (20 minutes), whichever comes
+        # first. The size trigger fires from _add_to_bundle; the time trigger
+        # is driven by the periodic flush thread.
         self._pending_bundle: list[str] = []
         self._bundle_lock = threading.Lock()
         self._bundle_counter = 0
-        self.bundle_size = 5
+        self._pending_bundle_bytes = 0
+        self._bundle_window_start = time.time()
+        self.bundle_max_bytes = 100 * 1024 * 1024  # 100 MB
+        self.bundle_max_interval = 20 * 60          # 20 minutes
 
     def _calculate_event_rate(self, event_type: str) -> float:
         """
@@ -280,6 +288,19 @@ class WriteManager:
                     self._last_flush_time = time.time()
                 except Exception as e:
                     logger("error", f"Error in periodic flush: {e}")
+
+            # Age-based bundle flush: merge and upload any locally buffered
+            # files once the oldest has waited bundle_max_interval (20 min),
+            # even if the 100 MB size threshold was never reached.
+            if self.automatic_upload:
+                with self._bundle_lock:
+                    has_pending = bool(self._pending_bundle)
+                    bundle_age = time.time() - self._bundle_window_start
+                if has_pending and bundle_age >= self.bundle_max_interval:
+                    try:
+                        self._flush_bundle()
+                    except Exception as e:
+                        logger("error", f"Error in periodic bundle flush: {e}")
 
     def _reset_flush_timer(self):
         """Reset the periodic flush timer (called after manual flushes)."""
@@ -938,20 +959,37 @@ class WriteManager:
         self.clear_events()
 
     def _add_to_bundle(self, file_path: str):
-        """Queue a compressed file for bundled upload."""
+        """Buffer a compressed file locally for a later merged upload.
+
+        Files accumulate on local disk until the buffered size reaches
+        ``bundle_max_bytes``; the age-based flush (``bundle_max_interval``) is
+        handled separately by the periodic flush thread. Nothing is uploaded
+        here, only queued for the eventual merge.
+        """
+        try:
+            file_size = os.path.getsize(file_path)
+        except OSError:
+            file_size = 0
         with self._bundle_lock:
+            if not self._pending_bundle:
+                # First file of a new window — start the age clock now so the
+                # 20 minute timer measures how long files have actually waited.
+                self._bundle_window_start = time.time()
             self._pending_bundle.append(file_path)
-            should_flush = len(self._pending_bundle) >= self.bundle_size
+            self._pending_bundle_bytes += file_size
+            should_flush = self._pending_bundle_bytes >= self.bundle_max_bytes
         if should_flush:
             self._flush_bundle()
 
     def _flush_bundle(self):
-        """Pack all pending files into one tar and queue it for upload."""
+        """Merge all buffered files into one tar and queue it for upload."""
         with self._bundle_lock:
             if not self._pending_bundle:
                 return
             files_to_bundle = list(self._pending_bundle)
             self._pending_bundle.clear()
+            self._pending_bundle_bytes = 0
+            self._bundle_window_start = time.time()
             self._bundle_counter += 1
             counter = self._bundle_counter
 
