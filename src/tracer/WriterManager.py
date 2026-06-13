@@ -290,18 +290,34 @@ class WriteManager:
                 except Exception as e:
                     logger("error", f"Error in periodic flush: {e}")
 
-            # Age-based bundle flush: merge and upload any locally buffered
-            # files once the oldest has waited bundle_max_interval (20 min),
-            # even if the 100 MB size threshold was never reached.
-            if self.automatic_upload:
-                with self._bundle_lock:
-                    has_pending = bool(self._pending_bundle)
-                    bundle_age = time.monotonic() - self._bundle_window_start
-                if has_pending and bundle_age >= self.bundle_max_interval:
-                    try:
-                        self._flush_bundle()
-                    except Exception as e:
-                        logger("error", f"Error in periodic bundle flush: {e}")
+            try:
+                self._maybe_flush_bundle_by_age()
+            except Exception as e:
+                logger("error", f"Error in periodic bundle flush: {e}")
+
+    def _maybe_flush_bundle_by_age(self, now: float | None = None) -> bool:
+        """Merge and upload buffered files if the oldest has waited too long.
+
+        Triggers a bundle flush once the buffering window has been open for at
+        least ``bundle_max_interval`` (20 min), even if the ``bundle_max_bytes``
+        size threshold was never reached. ``now`` is an injectable
+        ``time.monotonic()`` reading so the age trigger can be unit tested
+        without sleeping for the full interval.
+
+        Returns:
+            bool: True if a flush was triggered, False otherwise.
+        """
+        if not self.automatic_upload:
+            return False
+        if now is None:
+            now = time.monotonic()
+        with self._bundle_lock:
+            has_pending = bool(self._pending_bundle)
+            bundle_age = now - self._bundle_window_start
+        if has_pending and bundle_age >= self.bundle_max_interval:
+            self._flush_bundle()
+            return True
+        return False
 
     def _reset_flush_timer(self):
         """Reset the periodic flush timer (called after manual flushes)."""
@@ -963,9 +979,10 @@ class WriteManager:
         """Buffer a compressed file locally for a later merged upload.
 
         Files accumulate on local disk until the buffered size reaches
-        ``bundle_max_bytes``; the age-based flush (``bundle_max_interval``) is
-        handled separately by the periodic flush thread. Nothing is uploaded
-        here, only queued for the eventual merge.
+        ``bundle_max_bytes``, at which point this method triggers
+        ``_flush_bundle`` to merge them into a single tar and queue it for
+        upload. The age-based flush (``bundle_max_interval``) is handled
+        separately by the periodic flush thread.
         """
         try:
             file_size = os.path.getsize(file_path)

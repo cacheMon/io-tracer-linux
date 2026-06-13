@@ -43,18 +43,31 @@ class FakeUploadManager:
         self.uploaded.append(file_path)
 
 
+class SilentWriteManager(WriteManager):
+    """WriteManager with its background threads neutered for tests.
+
+    ``__init__`` still spins up the adaptive-sizing and periodic-flush threads,
+    but overriding their targets with no-ops makes them exit immediately so
+    they neither linger across test runs nor fire timers during assertions.
+    """
+
+    def _adaptive_sizing(self):
+        return
+
+    def _periodic_flush(self):
+        return
+
+
 class BundleBufferingTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.output_dir = os.path.join(self.tmp, "trace")
         self.upload = FakeUploadManager()
-        self.wm = WriteManager(
+        self.wm = SilentWriteManager(
             output_dir=self.output_dir,
             upload_manager=self.upload,
             automatic_upload=True,
         )
-        # Stop the background threads so they don't interfere with assertions.
-        self.wm._periodic_flush_active = False
 
     def tearDown(self):
         import shutil
@@ -96,6 +109,45 @@ class BundleBufferingTests(unittest.TestCase):
         # All three files made it into the merged tar.
         with tarfile.open(bundle_path) as tar:
             self.assertEqual(len(tar.getmembers()), 3)
+
+    def test_age_threshold_triggers_merge_and_upload(self):
+        # Keep the size threshold high so only the age trigger can fire.
+        self.wm.bundle_max_bytes = 10_000
+        self.wm.bundle_max_interval = 1200  # 20 minutes
+        f = self._make_file("a.csv.gz", 100)
+        self.wm._add_to_bundle(f)
+        self.assertEqual(self.upload.uploaded, [])  # not old enough yet
+
+        # Inject a monotonic reading just past the interval.
+        now = self.wm._bundle_window_start + 1201
+        flushed = self.wm._maybe_flush_bundle_by_age(now=now)
+
+        self.assertTrue(flushed)
+        self.assertEqual(len(self.upload.uploaded), 1)
+        bundle_path = self.upload.uploaded[0]
+        self.assertTrue(bundle_path.endswith(".tar"))
+        with tarfile.open(bundle_path) as tar:
+            self.assertEqual(len(tar.getmembers()), 1)
+        self.assertEqual(self.wm._pending_bundle, [])
+        self.assertEqual(self.wm._pending_bundle_bytes, 0)
+        self.assertFalse(os.path.exists(f))
+
+    def test_age_below_threshold_does_not_flush(self):
+        self.wm.bundle_max_bytes = 10_000
+        self.wm.bundle_max_interval = 1200
+        f = self._make_file("a.csv.gz", 100)
+        self.wm._add_to_bundle(f)
+
+        now = self.wm._bundle_window_start + 5  # well under the interval
+        self.assertFalse(self.wm._maybe_flush_bundle_by_age(now=now))
+        self.assertEqual(self.upload.uploaded, [])
+        self.assertEqual(self.wm._pending_bundle, [f])
+
+    def test_age_flush_is_noop_when_empty(self):
+        # No buffered files: even a huge age must not flush or upload.
+        now = self.wm._bundle_window_start + 999_999
+        self.assertFalse(self.wm._maybe_flush_bundle_by_age(now=now))
+        self.assertEqual(self.upload.uploaded, [])
 
     def test_window_start_resets_on_new_buffer(self):
         self.wm.bundle_max_bytes = 10_000
