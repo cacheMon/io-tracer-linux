@@ -199,6 +199,9 @@ class WriteManager:
         self.max_file_age = 20 * 60               # 20 minutes
         self.max_file_bytes = 100 * 1024 * 1024   # 100 MB (uncompressed on disk)
         self._stream_opened = {key: time.monotonic() for key in self._streams}
+        # Per-stream rotation sequence, appended to each rotated filename so two
+        # rotations in the same millisecond can't collide on the timestamp.
+        self._stream_seq = {key: 0 for key in self._streams}
 
         # Cache sampling configuration
         self.cache_sample_rate = 1  # Can be increased to reduce cache event volume
@@ -745,9 +748,11 @@ class WriteManager:
                 return
 
             rotated = cur_file
+            self._stream_seq[key] += 1
             new_file = (
                 f"{self.output_dir}/{s['subdir']}/{s['prefix']}_"
-                f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}_"
+                f"{self._stream_seq[key]:04d}.csv"
             )
             setattr(self, s['file'], new_file)
             setattr(self, s['handle'], open(new_file, 'a', buffering=8192))
