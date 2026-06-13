@@ -178,6 +178,28 @@ class WriteManager:
         self._fs_snap_handle = None
         self._io_uring_handle = None
 
+        # Registry of the continuous event streams that support generic
+        # rotation. Snapshots (process, fs_snap) are intentionally excluded:
+        # rotating one mid-session would split a single logical snapshot.
+        # Each entry names the attributes that hold its buffer, file handle,
+        # and current output path, plus its output subdir/prefix and log label.
+        self._streams = {
+            'vfs':       {'subdir': 'fs',        'prefix': 'fs',        'buf': 'vfs_buffer',       'handle': '_vfs_handle',       'file': 'output_vfs_file',       'log': 'VFS'},
+            'block':     {'subdir': 'ds',        'prefix': 'ds',        'buf': 'block_buffer',     'handle': '_block_handle',     'file': 'output_block_file',     'log': 'Block'},
+            'cache':     {'subdir': 'cache',     'prefix': 'cache',     'buf': 'cache_buffer',     'handle': '_cache_handle',     'file': 'output_cache_file',     'log': 'Cache'},
+            'pagefault': {'subdir': 'pagefault', 'prefix': 'pagefault', 'buf': 'pagefault_buffer', 'handle': '_pagefault_handle', 'file': 'output_pagefault_file', 'log': 'PageFault'},
+            'io_uring':  {'subdir': 'io_uring',  'prefix': 'io_uring',  'buf': 'io_uring_buffer',  'handle': '_io_uring_handle',  'file': 'output_io_uring_file',  'log': 'IO_Uring'},
+        }
+
+        # Time/size based rotation so a slow stream's log doesn't wait until
+        # shutdown to upload. A stream's current file is rotated (compressed +
+        # queued for upload) once it is older than max_file_age or larger than
+        # max_file_bytes, even if it never reaches its event-count threshold.
+        # Monotonic open-times so the age check ignores wall-clock jumps.
+        self.max_file_age = 20 * 60               # 20 minutes
+        self.max_file_bytes = 100 * 1024 * 1024   # 100 MB (uncompressed on disk)
+        self._stream_opened = {key: time.monotonic() for key in self._streams}
+
         # Cache sampling configuration
         self.cache_sample_rate = 1  # Can be increased to reduce cache event volume
         self.cache_event_counter = 0
@@ -279,6 +301,13 @@ class WriteManager:
                     self._last_flush_time = time.time()
                 except Exception as e:
                     logger("error", f"Error in periodic flush: {e}")
+
+            # Rotate+upload any log that has grown too large or aged too long,
+            # so slow streams don't defer their upload to shutdown.
+            try:
+                self._maybe_rotate_stale_logs()
+            except Exception as e:
+                logger("error", f"Error rotating stale logs: {e}")
 
     def _reset_flush_timer(self):
         """Reset the periodic flush timer (called after manual flushes)."""
@@ -661,99 +690,97 @@ class WriteManager:
             self.compress_log(rotated)
 
     def flush_cache_only(self):
-        """Flush cache buffer to file."""
-        rotated = None
-        with self._stream_locks['cache']:
-            if self.cache_buffer:
-                if self._cache_handle is None:
-                    self._cache_handle = open(self.output_cache_file, 'a', buffering=8192)
-                self.current_datetime = datetime.now()
-
-                self._write_buffer_to_file(self.cache_buffer, self._cache_handle, "Cache")
-                self._cache_handle.close()
-                rotated = self.output_cache_file
-                self.output_cache_file = f"{self.output_dir}/cache/cache_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-                self._cache_handle = open(self.output_cache_file, 'a', buffering=8192)
-                self._reset_flush_timer()
-        if rotated is not None:
-            self.compress_log(rotated)
-
+        """Flush cache buffer to file (rotate + compress + upload)."""
+        self._rotate_stream('cache')
 
     def flush_vfs_only(self):
-        """Flush VFS buffer to file."""
-        rotated = None
-        with self._stream_locks['vfs']:
-            if self.vfs_buffer:
-                if self._vfs_handle is None:
-                    self._vfs_handle = open(self.output_vfs_file, 'a', buffering=8192)
-                self.current_datetime = datetime.now()
+        """Flush VFS buffer to file (rotate + compress + upload)."""
+        self._rotate_stream('vfs')
 
-                self._write_buffer_to_file(self.vfs_buffer, self._vfs_handle, "VFS")
-                # Close before compressing so we never gzip/delete a file that
-                # still has an open descriptor; rotate to a fresh output file.
-                self._vfs_handle.close()
-                rotated = self.output_vfs_file
-                self.output_vfs_file = f"{self.output_dir}/fs/fs_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-                self._vfs_handle = open(self.output_vfs_file, 'a', buffering=8192)
-                self._reset_flush_timer()
+    def flush_block_only(self):
+        """Flush block buffer to file (rotate + compress + upload)."""
+        self._rotate_stream('block')
+
+    def flush_pagefault_only(self):
+        """Flush pagefault buffer to file (rotate + compress + upload)."""
+        self._rotate_stream('pagefault')
+
+    def flush_io_uring_only(self):
+        """Flush io_uring buffer to file (rotate + compress + upload)."""
+        self._rotate_stream('io_uring')
+
+    def _rotate_stream(self, key: str):
+        """Rotate one continuous stream's current log and queue it for upload.
+
+        Flushes any buffered rows into the current file, closes it, swaps in a
+        fresh timestamped output file, and compresses/uploads the rotated one.
+        Works whether the rows are still buffered (event-count flush) or were
+        already written to disk by the periodic writer (time/size rotation).
+        A no-op when there is nothing on disk or buffered to rotate.
+        """
+        s = self._streams[key]
+        rotated = None
+        with self._stream_locks[key]:
+            buf = getattr(self, s['buf'])
+            handle = getattr(self, s['handle'])
+            cur_file = getattr(self, s['file'])
+
+            # Land any buffered rows in the current file first.
+            if buf:
+                if handle is None:
+                    handle = open(cur_file, 'a', buffering=8192)
+                    setattr(self, s['handle'], handle)
+                self.current_datetime = datetime.now()
+                self._write_buffer_to_file(buf, handle, s['log'])
+
+            # Close before compressing so we never gzip/delete an open file.
+            if handle is not None:
+                handle.close()
+                setattr(self, s['handle'], None)
+
+            # Skip rotating an empty file (avoids zero-byte uploads); just keep
+            # appending to it.
+            if not os.path.exists(cur_file) or os.path.getsize(cur_file) == 0:
+                setattr(self, s['handle'], open(cur_file, 'a', buffering=8192))
+                return
+
+            rotated = cur_file
+            new_file = (
+                f"{self.output_dir}/{s['subdir']}/{s['prefix']}_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
+            )
+            setattr(self, s['file'], new_file)
+            setattr(self, s['handle'], open(new_file, 'a', buffering=8192))
+            self._stream_opened[key] = time.monotonic()
+            self._reset_flush_timer()
         # Compress outside the lock: gzip + disk I/O is slow and must not block
         # the perf-callback flush or the periodic writer for this stream.
         if rotated is not None:
             self.compress_log(rotated)
 
-    def flush_block_only(self):
-        """Flush block buffer to file."""
-        rotated = None
-        with self._stream_locks['block']:
-            if self.block_buffer:
-                if self._block_handle is None:
-                    self._block_handle = open(self.output_block_file, 'a', buffering=8192)
-                self.current_datetime = datetime.now()
+    def _maybe_rotate_stale_logs(self, now: float | None = None):
+        """Rotate continuous logs that have grown too large or aged too long.
 
-                self._write_buffer_to_file(self.block_buffer, self._block_handle, "Block")
-                self._block_handle.close()
-                rotated = self.output_block_file
-                self.output_block_file = f"{self.output_dir}/ds/ds_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-                self._block_handle = open(self.output_block_file, 'a', buffering=8192)
-                self._reset_flush_timer()
-        if rotated is not None:
-            self.compress_log(rotated)
-
-    def flush_pagefault_only(self):
-        """Flush pagefault buffer to file."""
-        rotated = None
-        with self._stream_locks['pagefault']:
-            if self.pagefault_buffer:
-                if self._pagefault_handle is None:
-                    self._pagefault_handle = open(self.output_pagefault_file, 'a', buffering=8192)
-                self.current_datetime = datetime.now()
-
-                self._write_buffer_to_file(self.pagefault_buffer, self._pagefault_handle, "PageFault")
-                self._pagefault_handle.close()
-                rotated = self.output_pagefault_file
-                self.output_pagefault_file = f"{self.output_dir}/pagefault/pagefault_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-                self._pagefault_handle = open(self.output_pagefault_file, 'a', buffering=8192)
-                self._reset_flush_timer()
-        if rotated is not None:
-            self.compress_log(rotated)
-
-    def flush_io_uring_only(self):
-        """Flush io_uring buffer to file."""
-        rotated = None
-        with self._stream_locks['io_uring']:
-            if self.io_uring_buffer:
-                if self._io_uring_handle is None:
-                    self._io_uring_handle = open(self.output_io_uring_file, 'a', buffering=8192)
-                self.current_datetime = datetime.now()
-
-                self._write_buffer_to_file(self.io_uring_buffer, self._io_uring_handle, "IO_Uring")
-                self._io_uring_handle.close()
-                rotated = self.output_io_uring_file
-                self.output_io_uring_file = f"{self.output_dir}/io_uring/io_uring_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-                self._io_uring_handle = open(self.output_io_uring_file, 'a', buffering=8192)
-                self._reset_flush_timer()
-        if rotated is not None:
-            self.compress_log(rotated)
+        Lets a slow stream upload mid-trace instead of waiting until shutdown:
+        any stream whose current file exceeds ``max_file_bytes`` or has been
+        open longer than ``max_file_age`` is rotated and queued for upload.
+        ``now`` is an injectable ``time.monotonic()`` reading for testing.
+        """
+        if now is None:
+            now = time.monotonic()
+        for key, s in self._streams.items():
+            cur_file = getattr(self, s['file'])
+            try:
+                if not os.path.exists(cur_file):
+                    continue
+                size = os.path.getsize(cur_file)
+            except OSError:
+                continue
+            if size <= 0:
+                continue
+            age = now - self._stream_opened.get(key, now)
+            if size >= self.max_file_bytes or age >= self.max_file_age:
+                self._rotate_stream(key)
 
     def force_flush(self):
         """Flush all buffers and compress all output files."""

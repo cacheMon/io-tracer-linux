@@ -124,5 +124,91 @@ class PerFileUploadTests(unittest.TestCase):
             self.assertLessEqual(lo, hi, name)
 
 
+class StaleLogRotationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.output_dir = os.path.join(self.tmp, "trace")
+        self.upload = FakeUploadManager()
+        self.wm = SilentWriteManager(
+            output_dir=self.output_dir,
+            upload_manager=self.upload,
+            automatic_upload=True,
+        )
+
+    def tearDown(self):
+        import shutil
+        try:
+            self.wm.close_handles()
+        except Exception:
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_current(self, file_attr, text):
+        """Simulate the periodic writer having flushed rows to a stream's file."""
+        path = getattr(self.wm, file_attr)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def test_size_triggers_rotation(self):
+        self.wm.max_file_bytes = 50
+        self.wm.max_file_age = 10**9  # disable age trigger
+        path = self._write_current("output_vfs_file", "x" * 100)  # > 50 bytes
+
+        self.wm._maybe_rotate_stale_logs()
+
+        self.assertEqual(len(self.upload.uploaded), 1)
+        uploaded = self.upload.uploaded[0]
+        self.assertTrue(uploaded.endswith(".csv.gz"))
+        self.assertEqual(os.path.basename(os.path.dirname(uploaded)), "fs")
+        # Rotated to a fresh file; the old .csv is gone (compressed away).
+        self.assertNotEqual(self.wm.output_vfs_file, path)
+        self.assertFalse(os.path.exists(path))
+
+    def test_age_triggers_rotation(self):
+        self.wm.max_file_bytes = 10**12  # disable size trigger
+        self._write_current("output_block_file", "row\n")
+
+        now = self.wm._stream_opened["block"] + self.wm.max_file_age + 1
+        self.wm._maybe_rotate_stale_logs(now=now)
+
+        self.assertEqual(len(self.upload.uploaded), 1)
+        self.assertEqual(
+            os.path.basename(os.path.dirname(self.upload.uploaded[0])), "ds"
+        )
+
+    def test_fresh_small_log_is_not_rotated(self):
+        self._write_current("output_vfs_file", "row\n")
+        self.wm._maybe_rotate_stale_logs()  # young and tiny
+        self.assertEqual(self.upload.uploaded, [])
+
+    def test_missing_or_empty_file_is_skipped(self):
+        self.wm.max_file_age = 0  # treat everything as old
+        # No file written yet, and an empty one for another stream.
+        open(self.wm.output_cache_file, "w").close()
+        self.wm._maybe_rotate_stale_logs()
+        self.assertEqual(self.upload.uploaded, [])
+
+    def test_rotate_flushes_buffered_rows(self):
+        self.wm.vfs_buffer.append("a,b,c")
+        self.wm.vfs_buffer.append("d,e,f")
+
+        self.wm._rotate_stream("vfs")
+
+        self.assertEqual(len(self.upload.uploaded), 1)
+        with gzip.open(self.upload.uploaded[0], "rt") as f:
+            content = f.read()
+        self.assertIn("a,b,c", content)
+        self.assertIn("d,e,f", content)
+        self.assertEqual(len(self.wm.vfs_buffer), 0)
+
+    def test_rotation_defaults(self):
+        self.assertEqual(self.wm.max_file_age, 20 * 60)
+        self.assertEqual(self.wm.max_file_bytes, 100 * 1024 * 1024)
+        # Snapshots must be excluded from generic rotation.
+        self.assertNotIn("process", self.wm._streams)
+        self.assertNotIn("fs_snap", self.wm._streams)
+
+
 if __name__ == "__main__":
     unittest.main()
