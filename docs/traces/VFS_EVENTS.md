@@ -164,7 +164,7 @@ The path captured is relative to the mount namespace of the probed process. In c
 | 2 | Operation | `string` | VFS operation type (see table below) |
 | 3 | PID | `u32` | Process ID |
 | 4 | Command | `string` | Process name (max 16 characters) |
-| 5 | Filename | `string` | File path; for dual-path operations (`RENAME`, `LINK`, `SYMLINK`) formatted as `old_path -> new_path` |
+| 5 | Filename | `string` | File path; for dual-path operations (`RENAME`, `LINK`, `SYMLINK`) formatted as `old_path -> new_path`. For `OPEN`, the path is resolved to absolute via `/proc/<pid>/fd`; if that races (fd already closed) and the captured path was relative, it is resolved against the openat `dirfd` / process cwd as a fallback |
 | 6 | Size (requested) | `u64` | **Requested** I/O size in bytes — the `count` argument to `read`/`write` (or operation size for others); `0` for non-I/O operations. The **actual** bytes transferred are in column 17 (`bytes_completed`), which can be smaller (short read/write). |
 | 7 | Inode | `u64` | File inode number; empty if `0` |
 | 8 | Flags | `string` | Operation-specific flags for non-MMAP operations (see tables below); empty when the operation has no defined flag value to render |

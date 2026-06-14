@@ -19,6 +19,7 @@ Usage:
 import shutil
 import signal
 import os
+import ctypes
 from bcc import BPF
 import time
 import sys
@@ -313,6 +314,14 @@ class IOTracer:
                     else:
                         filename = self.path_resolver.resolve_open_path(
                             pid=event.pid, inode=event.inode, filename=filename
+                        )
+                    # Last resort: if still relative (fd already closed / process
+                    # gone), resolve the captured relative path against the
+                    # openat dirfd or process cwd.
+                    if filename and not filename.startswith('/'):
+                        dirfd = event.dirfd if hasattr(event, 'dirfd') else self.path_resolver.AT_FDCWD
+                        filename = self.path_resolver.resolve_relative(
+                            pid=event.pid, dirfd=dirfd, relpath=filename, inode=event.inode
                         )
             else:
                 cached = self.path_resolver.inode_to_path.get(event.inode)
@@ -800,8 +809,11 @@ class IOTracer:
         # Note: op_code is 0 on kernel 5.17+ where cmd_flags is unavailable - don't decode it
         op_code = event.op_code if hasattr(event, 'op_code') else 0
         op_code_str = self.flag_mapper.decode_block_op_code(op_code) if (op_code is not None and op_code != 0) else ""
-        
-        output = format_csv_row(timestamp, pid, comm, sector, ops_str, bio_size, latency_ms, tid, cpu_id, ppid, dev_str, queue_time_ms, cmd_flags_str, op_code_str)
+
+        # Monotonic per-request id (disambiguates repeated I/O to the same sector)
+        req_id = event.req_id if hasattr(event, 'req_id') else ""
+
+        output = format_csv_row(timestamp, pid, comm, sector, ops_str, bio_size, latency_ms, tid, cpu_id, ppid, dev_str, queue_time_ms, cmd_flags_str, op_code_str, req_id)
 
 
         if sector == 0 and bio_size == 0:
@@ -971,10 +983,37 @@ class IOTracer:
 
         run_with_spinner("Flushing trace data", _flush)
 
+    def _log_block_diagnostics(self):
+        """Summarise block-tracing health from the per-CPU ``block_stats`` map.
+
+        Reports issued vs. completed requests and how many completions arrived
+        with no tracked issue context. A high miss rate means the issue map was
+        evicted under load (completions dropped) — the likely explanation if
+        block events appear to stop before the end of a long trace.
+        """
+        try:
+            stats = self.b["block_stats"]
+            issued    = sum(stats[ctypes.c_int(0)])
+            completed = sum(stats[ctypes.c_int(1)])
+            missed    = sum(stats[ctypes.c_int(2)])
+        except Exception:
+            return
+
+        if not (issued or completed or missed):
+            return
+
+        total_completions = completed + missed
+        miss_pct = (missed / total_completions * 100) if total_completions else 0.0
+        logger("info",
+               f"Block diagnostics: {issued} issued, {completed} completed, "
+               f"{missed} completions without a tracked issue "
+               f"({miss_pct:.1f}% of completions). A high miss rate indicates the "
+               f"issue map was evicted under load (dropped completions).")
+
     def _lost_cb(self, lost):
         """
         Callback for handling lost events in the perf buffer.
-        
+
         Args:
             lost: Number of events that were lost
         """
@@ -1113,7 +1152,9 @@ class IOTracer:
             if self.verbose:
                 actual_duration = time.time() - start
                 logger("info", f"Trace completed after {actual_duration:.2f} seconds")
-            
+
+            self._log_block_diagnostics()
+
             print()
             logger("info", "Trace stopped")
 

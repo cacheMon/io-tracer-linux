@@ -22,6 +22,7 @@
 | 12 | Queue Latency | `float` | Queue/scheduler latency in milliseconds (insert → issue); empty if unavailable |
 | 13 | Command Flags | `string` | Pipe-separated REQ_* flags (e.g., `REQ_SYNC\|REQ_META`); empty if no flags set or on kernel ≥ 5.17 |
 | 14 | Operation Code | `string` | Raw block operation code name (e.g., `REQ_OP_READ`, `REQ_OP_WRITE`); empty on kernel ≥ 5.17 |
+| 15 | Request ID | `u64` | Monotonic per-request id, unique within a trace session and assigned at issue time. Distinguishes separate I/Os that reuse the same `(Device, Sector)` pair, which are otherwise identical apart from their timestamps |
 
 > **Note:** Command Flags (field 13) and Operation Code (field 14) are only available on Linux kernel versions < 5.17. The `cmd_flags` field was removed from the `block_rq_complete` tracepoint in kernel 5.17+. On newer kernels (including 5.17, 6.x), these fields will always be empty. Use the Operation field (field 5) and RWBS flags to distinguish I/O types on newer kernels.
 

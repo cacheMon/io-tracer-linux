@@ -119,6 +119,12 @@ struct bpf_task_work {};   /* task_work field, added in 6.14 */
 /** Maximum length for captured filenames (including null terminator) */
 #define FILENAME_MAX_LEN 256
 
+/** openat() dirfd sentinel meaning "resolve relative to the cwd". Defined here
+ *  in case the BPF include set doesn't pull in <linux/fcntl.h>. */
+#ifndef AT_FDCWD
+#define AT_FDCWD -100
+#endif
+
 /** Length of block operation type string (e.g., "R", "W", "RA") */
 #define OP_LEN 8
 
@@ -241,6 +247,9 @@ struct data_t {
   u32 ppid;                       /**< Parent process ID (real_parent->tgid) */
   u64 cgroup_id;                  /**< cgroup v2 id — container identifier */
   u32 fs_magic;                   /**< Superblock magic for filesystem-type classification */
+  s32 dirfd;                      /**< OPEN only: openat dirfd, for userspace
+                                    *   resolution of relative paths against the
+                                    *   process cwd/dirfd. AT_FDCWD otherwise. */
 };
 
 /**
@@ -313,6 +322,9 @@ struct block_event {
   u32 dev;                  /**< Device number (major:minor encoded) for partition ID */
   u64 queue_time_ns;        /**< Time from insert to issue (scheduler latency) */
   u32 op_code;              /**< Raw block operation code (REQ_OP_*) */
+  u64 req_id;               /**< Monotonic per-request id, unique within a trace
+                              *   session. Disambiguates distinct I/Os that reuse
+                              *   the same (dev, sector). */
 };
 
 /* ============================================================================
@@ -563,6 +575,7 @@ struct vfs_info {
  */
 struct block_issue_ctx {
   u64 ts;                   /**< Issue timestamp (device latency baseline) */
+  u64 req_id;               /**< Monotonic per-request id (see block_event.req_id) */
   u32 pid;                  /**< Submitting process ID */
   u32 tid;                  /**< Submitting thread ID */
   u32 ppid;                 /**< Submitter's parent PID */
@@ -588,6 +601,19 @@ struct block_rq_key_t {
  * map and starve later requests. */
 BPF_TABLE("lru_hash", struct block_rq_key_t, struct block_issue_ctx, block_start_times, 10240); /**< Issue time + submitter, keyed by dev+sector */
 BPF_TABLE("lru_hash", struct block_rq_key_t, u64, block_insert_times, 10240);  /**< Tracks block request insert time (queue latency) */
+
+/* Monotonic generator for per-request IDs (see block_event.req_id). A single
+ * u64 bumped atomically at issue time; lets consumers disambiguate repeated
+ * I/O to the same (dev, sector) and correlate a request across its lifecycle. */
+BPF_ARRAY(block_req_id_gen, u64, 1);
+
+/* Block-tracing diagnostics counters (per-CPU, summed in userspace at exit):
+ *   [0] requests issued, [1] requests completed (emitted),
+ *   [2] completions with no matching issue ctx (LRU-evicted or pre-trace).
+ * A growing [2] relative to [1] indicates the issue map is being evicted under
+ * load (i.e. completions are being dropped), which would explain block events
+ * thinning out before the end of a long trace. */
+BPF_PERCPU_ARRAY(block_stats, u64, 3);
 
 /* Configuration map - stores tracer PID to exclude self-tracing */
 BPF_HASH(tracer_config, u32, u32, 1);    /**< Key 0 = tracer PID to exclude */
@@ -617,6 +643,7 @@ BPF_PERCPU_ARRAY(dual_data_buffer, struct data_dual_t, 1);
  */
 struct open_path_t {
   char path[FILENAME_MAX_LEN]; /**< User-space path string from openat args */
+  s32 dfd;                     /**< openat dirfd arg (AT_FDCWD for cwd-relative) */
 };
 
 /* Staged path from trace_do_sys_openat2_entry, consumed by trace_vfs_open */
@@ -1153,6 +1180,7 @@ int trace_do_sys_openat2_entry(struct pt_regs *ctx) {
   }
 
   struct open_path_t staged = {};
+  staged.dfd = (s32)PT_REGS_PARM1(ctx);  /* dirfd for relative-path resolution */
   bpf_probe_read_user_str(staged.path, sizeof(staged.path), user_path);
   open_path_staging.update(&pid_tgid, &staged);
   return 0;
@@ -1192,6 +1220,10 @@ int trace_openat_entry_x64(struct pt_regs *ctx) {
   }
 
   struct open_path_t staged = {};
+  /* openat dirfd is the first syscall arg (uregs->di). */
+  unsigned long dfd_arg = 0;
+  bpf_probe_read_kernel(&dfd_arg, sizeof(dfd_arg), &uregs->di);
+  staged.dfd = (s32)dfd_arg;
   bpf_probe_read_user_str(staged.path, sizeof(staged.path), user_path);
   open_path_staging.update(&pid_tgid, &staged);
   return 0;
@@ -1247,11 +1279,19 @@ int trace_vfs_open(struct pt_regs *ctx, const struct path *path,
   // this is already an absolute path (e.g. /etc/ld.so.cache, /lib/x86_64-linux-gnu/libc.so.6).
   // Fall back to d_name (basename) for opens that don't come through openat
   // (e.g. exec paths, kernel-internal opens).
+  // Default to cwd-relative; overridden below when an openat dirfd was captured.
+  data.dirfd = AT_FDCWD;
   struct open_path_t *staged_path = open_path_staging.lookup(&pid_tgid);
-  if (staged_path && staged_path->path[0] == '/') {
+  if (staged_path && staged_path->path[0] != '\0') {
+    // Use the caller's path string verbatim — absolute paths are already
+    // complete, and relative paths keep their directory components (rather than
+    // collapsing to a basename). data.dirfd carries the openat dirfd so
+    // userspace can resolve relative paths against the cwd/dirfd.
     bpf_probe_read_kernel(data.filename, sizeof(data.filename), staged_path->path);
+    data.dirfd = staged_path->dfd;
   } else {
-    // Fallback: read d_name (basename) from the dentry
+    // Fallback: read d_name (basename) from the dentry for opens that don't
+    // come through openat (e.g. exec paths, kernel-internal opens).
     struct dentry *path_dentry = NULL;
     bpf_probe_read_kernel(&path_dentry, sizeof(path_dentry), &path->dentry);
     if (path_dentry) {
@@ -2530,7 +2570,20 @@ TRACEPOINT_PROBE(block, block_rq_issue) {
   ictx.tid = (u32)pid_tgid;
   ictx.ppid = get_ppid();
   bpf_get_current_comm(&ictx.comm, sizeof(ictx.comm));
+
+  // Assign a monotonic per-request id, carried to the completion event.
+  u32 gen_key = 0;
+  u64 *gen = block_req_id_gen.lookup(&gen_key);
+  if (gen)
+    ictx.req_id = __sync_fetch_and_add(gen, 1);
+
   block_start_times.update(&key, &ictx);
+
+  // Diagnostics: count issued requests.
+  u32 stat_issued = 0;
+  u64 *issued = block_stats.lookup(&stat_issued);
+  if (issued)
+    *issued += 1;
 
   return 0;
 }
@@ -2545,8 +2598,16 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
   // Must use the same key formula as block_rq_issue/insert.
   struct block_rq_key_t key = block_rq_key(args->dev, args->sector);
   struct block_issue_ctx *ictx = block_start_times.lookup(&key);
-  if (!ictx)
+  if (!ictx) {
+    // No matching issue ctx: either evicted from the LRU map under load (a
+    // dropped completion) or issued before tracing started. Count it so the
+    // exit summary can flag whether block events are being lost.
+    u32 stat_miss = 2;
+    u64 *miss = block_stats.lookup(&stat_miss);
+    if (miss)
+      *miss += 1;
     return 0;
+  }
 
   // Filter the tracer's own I/O by the SUBMITTER pid — the current pid here
   // is the interrupted task, not the process that did the I/O.
@@ -2585,6 +2646,7 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
   
   event.latency_ns = latency;
   event.queue_time_ns = queue_time;  // New: queue time
+  event.req_id = ictx->req_id;       // Stable per-request id
   
 #ifdef HAS_CMD_FLAGS
   event.cmd_flags = args->cmd_flags; // Capture REQ_* command flags
@@ -2603,6 +2665,12 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
   bpf_probe_read_kernel(&event.op, sizeof(event.op), &args->rwbs);
 
   bl_events.perf_submit(args, &event, sizeof(event));
+
+  // Diagnostics: count completed (emitted) requests.
+  u32 stat_completed = 1;
+  u64 *completed = block_stats.lookup(&stat_completed);
+  if (completed)
+    *completed += 1;
 
   block_start_times.delete(&key);
   block_insert_times.delete(&key);
