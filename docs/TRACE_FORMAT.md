@@ -19,12 +19,13 @@ linux_trace_v4_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── pagefault/             # Memory-mapped page fault events
 ├── process/               # Process state snapshots
 ├── filesystem_snapshot/   # Filesystem metadata snapshots
-├── system_spec/           # System specification files
-└── manifest.json          # Self-describing schema for this session
+└── system_spec/           # System specification files
 ```
 
 - `{MACHINE_ID}`: Uppercase machine identifier
 - `{YYYYMMDD_HHMMSS_mmm}`: Timestamp with millisecond precision
+
+A self-describing `manifest.json` is also produced for each session (see below).
 
 Each subdirectory contains CSV files that are automatically compressed to `.csv.zst`
 (Zstandard) format. Every CSV begins with a header row, and every stream carries a
@@ -37,11 +38,13 @@ correlating records across streams.
 
 ### manifest.json
 
-A `manifest.json` is written once per session. It embeds `schema_version`, the full
-column list (name, type, unit, description) for every stream, and runtime diagnostics
-(per-stream row counts, the `CLOCK_MONOTONIC`→`CLOCK_REALTIME` offset used to derive
-wall-clock timestamps, etc.). Consumers should read the schema from `manifest.json`
-rather than hard-coding column positions.
+A `manifest.json` is written once per session at the session-directory root. It embeds
+`schema_version`, the full column list (name, type, unit, description) for every stream,
+and runtime diagnostics (per-stream row counts, the `CLOCK_MONOTONIC`→`CLOCK_REALTIME`
+offset used to derive wall-clock timestamps, etc.). It is delivered inside the session's
+compressed archive (a `.tar.zst` of the session directory) rather than as a standalone
+object under the prefix. Consumers should read the schema from `manifest.json` rather
+than hard-coding column positions.
 
 ---
 
@@ -278,5 +281,3 @@ This documentation applies to:
 - **BCC:** 0.18.0+
 
 Field availability may vary by kernel version. Check logs for warnings about unavailable probes.
-</content>
-</invoke>

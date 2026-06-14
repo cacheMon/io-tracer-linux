@@ -22,9 +22,11 @@ linux_trace_v4_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── pagefault/             # Page fault events
 ├── process/               # Process state snapshots
 ├── filesystem_snapshot/   # Filesystem metadata snapshots
-├── system_spec/           # System specification files
-└── manifest.json          # Self-describing schema for this session
+└── system_spec/           # System specification files
 ```
+
+A self-describing `manifest.json` (schema version, per-stream columns, and clock
+diagnostics) is written at the session root and delivered inside the session archive.
 
 - `{MACHINE_ID}`: Uppercase machine identifier
 - `{YYYYMMDD_HHMMSS_mmm}`: Timestamp with millisecond precision
