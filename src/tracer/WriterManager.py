@@ -32,7 +32,7 @@ from .ObjectStorageManager import ObjectStorageManager
 from . import schema
 from ..utility.utils import (
     logger, capture_machine_id,
-    compress_file_zstd, require_zstandard, ZSTD_LEVEL,
+    compress_file_zstd, zstandard_available, ZSTD_LEVEL,
 )
 import threading
 from collections import deque
@@ -565,17 +565,19 @@ class WriteManager:
             self._fs_snap_handle.close()
             self._fs_snap_handle = None
 
-            # Compress with Zstandard
+            # Compress with Zstandard. If zstandard is unavailable, keep the
+            # uncompressed part rather than losing it.
             if os.path.exists(part_filepath):
                 # Don't log or count each part - we'll log when snapshot is complete
-                compress_file_zstd(part_filepath, part_filepath + ".zst")
-
-                os.remove(part_filepath)
-                compressed_file = part_filepath + ".zst"
+                if compress_file_zstd(part_filepath, part_filepath + ".zst"):
+                    os.remove(part_filepath)
+                    part_output = part_filepath + ".zst"
+                else:
+                    part_output = part_filepath
 
                 # Store for later upload (after snapshot completion and final part rename)
                 if self.automatic_upload:
-                    self.fs_snapshot_parts_pending_upload.append(compressed_file)
+                    self.fs_snapshot_parts_pending_upload.append(part_output)
             else:
                 logger("warning", f"Snapshot file not found for compression: {part_filepath}")
 
@@ -608,64 +610,73 @@ class WriteManager:
         Renames the last part file to include '_complete_partsN' suffix
         indicating this is the final part and the total number of parts.
         """
-        if not self.fs_snapshot_session_active:
-            return
-        
-        total_parts = self.fs_snapshot_part_number - 1  # -1 because we increment after each flush
-        
-        if total_parts < 1:
-            # No parts were written
+        # Hold the fs_snap stream lock for the whole operation: the parallel
+        # writer/flush threads compress and write parts under the same lock, so
+        # renaming the last part here without it could race with an in-flight
+        # write or compression.
+        with self._stream_locks['fs_snap']:
+            if not self.fs_snapshot_session_active:
+                return
+
+            total_parts = self.fs_snapshot_part_number - 1  # -1 because we increment after each flush
+
+            if total_parts < 1:
+                # No parts were written
+                self.fs_snapshot_session_active = False
+                return
+
+            # Find the last part file. It is normally compressed (.csv.zst), but
+            # when zstandard is unavailable it is left uncompressed (.csv); detect
+            # whichever actually exists so the completion rename stays correct.
+            last_part_str = f"{total_parts:04d}"
+            snapshot_dir = f"{self.output_dir}/filesystem_snapshot"
+            base_name = (
+                f"filesystem_snapshot_part{last_part_str}_"
+                f"{self.fs_snapshot_timestamp}_"
+                f"{self.fs_snapshot_device_id}"
+            )
+            suffix = ".csv.zst"
+            if (not os.path.exists(f"{snapshot_dir}/{base_name}{suffix}")
+                    and os.path.exists(f"{snapshot_dir}/{base_name}.csv")):
+                suffix = ".csv"
+            old_filepath = f"{snapshot_dir}/{base_name}{suffix}"
+
+            # Construct new filename with completion marker
+            new_filepath = (
+                f"{snapshot_dir}/{base_name}_complete_parts{total_parts}{suffix}"
+            )
+
+            # Rename the file (only if it still exists locally)
+            try:
+                if os.path.exists(old_filepath):
+                    os.rename(old_filepath, new_filepath)
+                    logger("info", f"Filesystem snapshot complete: {total_parts} parts written")
+
+                    # Update the pending upload list with the new filename
+                    if self.automatic_upload and old_filepath in self.fs_snapshot_parts_pending_upload:
+                        self.fs_snapshot_parts_pending_upload.remove(old_filepath)
+                        self.fs_snapshot_parts_pending_upload.append(new_filepath)
+                else:
+                    # File doesn't exist (may have been already processed)
+                    logger("info", f"Filesystem snapshot complete: {total_parts} parts written")
+
+                # Upload all parts now that snapshot is complete
+                if self.automatic_upload:
+                    num_parts = len(self.fs_snapshot_parts_pending_upload)
+                    if num_parts > 0:
+                        # Count each part individually to match upload counter
+                        self.created_files += num_parts
+                        logger('info', f"Files Created: {str(self.created_files)} (filesystem snapshot with {num_parts} parts)", True)
+                    for part_file in self.fs_snapshot_parts_pending_upload:
+                        if os.path.exists(part_file):
+                            self.upload_manager.append_object(part_file)
+                    self.fs_snapshot_parts_pending_upload.clear()
+
+            except Exception as e:
+                logger("error", f"Failed to process final snapshot part: {e}")
+
+            # Reset session
             self.fs_snapshot_session_active = False
-            return
-        
-        # Find the last part file (compressed)
-        last_part_str = f"{total_parts:04d}"
-        old_filename = (
-            f"filesystem_snapshot_part{last_part_str}_"
-            f"{self.fs_snapshot_timestamp}_"
-            f"{self.fs_snapshot_device_id}.csv.zst"
-        )
-        old_filepath = f"{self.output_dir}/filesystem_snapshot/{old_filename}"
-        
-        # Construct new filename with completion marker
-        new_filename = (
-            f"filesystem_snapshot_part{last_part_str}_"
-            f"{self.fs_snapshot_timestamp}_"
-            f"{self.fs_snapshot_device_id}_complete_parts{total_parts}.csv.zst"
-        )
-        new_filepath = f"{self.output_dir}/filesystem_snapshot/{new_filename}"
-        
-        # Rename the file (only if it still exists locally)
-        try:
-            if os.path.exists(old_filepath):
-                os.rename(old_filepath, new_filepath)
-                logger("info", f"Filesystem snapshot complete: {total_parts} parts written")
-                
-                # Update the pending upload list with the new filename
-                if self.automatic_upload and old_filepath in self.fs_snapshot_parts_pending_upload:
-                    self.fs_snapshot_parts_pending_upload.remove(old_filepath)
-                    self.fs_snapshot_parts_pending_upload.append(new_filepath)
-            else:
-                # File doesn't exist (may have been already processed)
-                logger("info", f"Filesystem snapshot complete: {total_parts} parts written")
-                
-            # Upload all parts now that snapshot is complete
-            if self.automatic_upload:
-                num_parts = len(self.fs_snapshot_parts_pending_upload)
-                if num_parts > 0:
-                    # Count each part individually to match upload counter
-                    self.created_files += num_parts
-                    logger('info', f"Files Created: {str(self.created_files)} (filesystem snapshot with {num_parts} parts)", True)
-                for part_file in self.fs_snapshot_parts_pending_upload:
-                    if os.path.exists(part_file):
-                        self.upload_manager.append_object(part_file)
-                self.fs_snapshot_parts_pending_upload.clear()
-                
-        except Exception as e:
-            logger("error", f"Failed to process final snapshot part: {e}")
-        
-        # Reset session
-        self.fs_snapshot_session_active = False
 
     def start_process_snapshot_session(self):
         """Mark the beginning of a process snapshot session."""
@@ -977,15 +988,19 @@ class WriteManager:
             if not os.path.exists(src):
                 return
 
-            compress_file_zstd(src, dst)
+            # Fall back to the uncompressed file when zstandard is unavailable
+            # so trace data is still uploaded rather than lost.
+            compressed = compress_file_zstd(src, dst)
+            upload_target = dst if compressed else src
 
             if self.automatic_upload:
                 self.created_files += 1
                 logger('info', f"Files Created: {str(self.created_files)}", True)
-                # Upload each compressed log individually, preserving its
-                # subdirectory (fs, ds, cache, process, ...) on the backend.
-                self.upload_manager.append_object(dst)
-            os.remove(src)
+                # Upload each log individually, preserving its subdirectory
+                # (fs, ds, cache, process, ...) on the backend.
+                self.upload_manager.append_object(upload_target)
+            if compressed:
+                os.remove(src)
         except Exception as e:
             logger("error", f"Failed compressing log {input_file}: {e}")
             
@@ -997,15 +1012,23 @@ class WriteManager:
             input_dir: Path to the directory to compress
         """
         try:
-            zstandard = require_zstandard()
             src = input_dir
-            dst = input_dir.rstrip("/").rstrip("\\") + ".tar.zst"
+            base = input_dir.rstrip("/").rstrip("\\")
 
-            cctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL)
-            with open(dst, "wb") as f_out:
-                with cctx.stream_writer(f_out) as compressor:
-                    with tarfile.open(mode="w|", fileobj=compressor) as tar:
-                        tar.add(src, arcname=os.path.basename(src))
+            # Fall back to a plain (uncompressed) tar when zstandard is missing
+            # so the bundle is still produced rather than lost.
+            zstandard = zstandard_available()
+            if zstandard is not None:
+                dst = base + ".tar.zst"
+                cctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL)
+                with open(dst, "wb") as f_out:
+                    with cctx.stream_writer(f_out) as compressor:
+                        with tarfile.open(mode="w|", fileobj=compressor) as tar:
+                            tar.add(src, arcname=os.path.basename(src))
+            else:
+                dst = base + ".tar"
+                with tarfile.open(dst, mode="w") as tar:
+                    tar.add(src, arcname=os.path.basename(src))
 
             if self.automatic_upload:
                 self.created_files += 1

@@ -16,6 +16,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -139,6 +140,69 @@ class PerFileUploadTests(unittest.TestCase):
         for name, (lo, hi) in self.wm.dynamic_limits.items():
             self.assertGreaterEqual(lo, 80000, name)
             self.assertLessEqual(lo, hi, name)
+
+
+class ZstandardMissingFallbackTests(unittest.TestCase):
+    """When the optional ``zstandard`` library is unavailable, the tracer must
+    keep (and upload) trace files uncompressed rather than losing data. These
+    tests force the missing-dependency path so they run regardless of whether
+    ``zstandard`` happens to be installed.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.output_dir = os.path.join(self.tmp, "trace")
+        self.upload = FakeUploadManager()
+        self.wm = SilentWriteManager(
+            output_dir=self.output_dir,
+            upload_manager=self.upload,
+            automatic_upload=True,
+        )
+        # Pretend zstandard is not installed everywhere it is consulted.
+        import src.utility.utils as utils_mod
+        import src.tracer.WriterManager as wm_mod
+        self._patchers = [
+            unittest.mock.patch.object(utils_mod, "zstandard_available", lambda: None),
+            unittest.mock.patch.object(wm_mod, "zstandard_available", lambda: None),
+        ]
+        for p in self._patchers:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        import shutil
+        try:
+            self.wm.close_handles()
+        except Exception:
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_log(self, subdir, name, text):
+        path = os.path.join(self.output_dir, subdir, name)
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def test_compress_log_uploads_uncompressed_when_zstd_missing(self):
+        src = self._make_log("process", "process_x.csv", "a,b,c\n1,2,3\n")
+        self.wm.compress_log(src)
+
+        # The uncompressed .csv is uploaded and left on disk; no .zst created.
+        self.assertEqual(self.upload.uploaded, [src])
+        self.assertTrue(os.path.exists(src))
+        self.assertFalse(os.path.exists(src + ".zst"))
+        with open(src) as f:
+            self.assertEqual(f.read(), "a,b,c\n1,2,3\n")
+
+    def test_compress_dir_falls_back_to_plain_tar(self):
+        self.wm.automatic_upload = False
+        self._make_log("process", "process_x.csv", "row\n")
+        self.wm.compress_dir(self.output_dir)
+
+        # A plain .tar bundle is produced instead of .tar.zst.
+        self.assertTrue(os.path.exists(self.output_dir.rstrip("/") + ".tar"))
+        self.assertFalse(os.path.exists(self.output_dir.rstrip("/") + ".tar.zst"))
 
 
 class StaleLogRotationTests(unittest.TestCase):

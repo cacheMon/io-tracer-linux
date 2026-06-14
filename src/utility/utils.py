@@ -196,6 +196,14 @@ def logger(error_scale: str, string: str, timestamp: bool = False):
 ZSTD_LEVEL = 3
 
 
+# Set once we've reported a missing ``zstandard`` install, so the
+# uncompressed fallback is announced a single time rather than once per file
+# across a whole trace run. Guarded by a lock because the writer's parallel
+# stream threads can reach this concurrently.
+_zstandard_missing_warned = False
+_zstandard_warn_lock = threading.Lock()
+
+
 def require_zstandard():
     """
     Import and return the optional ``zstandard`` module.
@@ -214,7 +222,36 @@ def require_zstandard():
     return zstandard
 
 
-def compress_file_zstd(src: str, dst: str, level: int = ZSTD_LEVEL):
+def zstandard_available():
+    """
+    Return the ``zstandard`` module if installed, otherwise ``None``.
+
+    Unlike :func:`require_zstandard` this never raises, letting callers fall
+    back to leaving trace files uncompressed when the optional dependency is
+    missing. The first time it is found missing a single warning is logged so
+    the per-file fallback doesn't flood the logs across a trace run.
+    """
+    global _zstandard_missing_warned
+    try:
+        # Catch ImportError (not just ModuleNotFoundError) so a zstandard that
+        # is installed but fails to load — e.g. a broken C-extension or missing
+        # shared library — also falls back gracefully instead of crashing.
+        import zstandard
+    except ImportError:
+        with _zstandard_warn_lock:
+            if not _zstandard_missing_warned:
+                _zstandard_missing_warned = True
+                logger(
+                    "warning",
+                    "The 'zstandard' library is not installed; trace files will be "
+                    "kept uncompressed. Install it with 'pip install zstandard' "
+                    "(or 'pip install -r requirements.txt') to enable compression.",
+                )
+        return None
+    return zstandard
+
+
+def compress_file_zstd(src: str, dst: str, level: int = ZSTD_LEVEL) -> bool:
     """
     Stream-compress a file to Zstandard.
 
@@ -222,24 +259,34 @@ def compress_file_zstd(src: str, dst: str, level: int = ZSTD_LEVEL):
         src: Path to the source file
         dst: Path to write the compressed (.zst) output
         level: Zstandard compression level
+
+    Returns:
+        ``True`` if the file was compressed to ``dst``. If the optional
+        ``zstandard`` library is unavailable nothing is written and ``False``
+        is returned, so callers can fall back to the uncompressed source.
     """
-    zstandard = require_zstandard()
+    zstandard = zstandard_available()
+    if zstandard is None:
+        return False
     cctx = zstandard.ZstdCompressor(level=level)
     with open(src, "rb") as f_in, open(dst, "wb") as f_out:
         cctx.copy_stream(f_in, f_out)
+    return True
 
 
 def compress_log(input_file: str):
     """
     Compress a log file using Zstandard.
 
+    Creates ``input_file.zst`` and removes the original when compression
+    succeeds. If ``zstandard`` is unavailable the original file is left in
+    place uncompressed.
+
     Args:
         input_file: Path to the file to compress
-
-    Creates input_file.zst and removes the original.
     """
-    compress_file_zstd(input_file, input_file + ".zst")
-    os.remove(input_file)
+    if compress_file_zstd(input_file, input_file + ".zst"):
+        os.remove(input_file)
 
 def capture_machine_id() -> str:
     """
