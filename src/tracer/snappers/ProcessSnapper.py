@@ -83,7 +83,8 @@ class ProcessSnapper:
         # Mark snapshot session as active
         self.wm.start_process_snapshot_session()
         
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Millisecond resolution so snapshot rows can be ordered within a second.
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         for proc in psutil.process_iter(['pid', 'name', 'memory_info','cmdline','create_time','status']):
             # Check if stop was requested during iteration
             if not self.running:

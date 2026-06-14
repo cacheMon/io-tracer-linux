@@ -142,6 +142,17 @@ class IOTracer:
         self.mmap_regions       = {}
         self.cmdline_cache      = {}  # pid -> cmdline, populated on first successful read
 
+        # Wall-clock conversion for kernel event timestamps. bpf_ktime_get_ns()
+        # is CLOCK_MONOTONIC (ns since boot); adding this offset recovers
+        # wall-clock time. Using the kernel's per-event timestamp instead of the
+        # userspace receive time keeps rows correctly ordered in time across the
+        # per-CPU perf buffers (which deliver in batches, not global order).
+        self._mono_to_real_offset = time.time() - time.clock_gettime(time.CLOCK_MONOTONIC)
+        # The tracer (and its in-process snapshot/upload threads) read /proc,
+        # write the trace files, and upload them — all of which is self-noise we
+        # don't want in the trace. Filter events from our own pid.
+        self._self_pid = os.getpid()
+
         # Bounded-cache maintenance. The path resolver and cmdline caches are
         # only evicted on PROCESS_EXEC, so over a long-running trace they would
         # otherwise grow without bound. Maintenance runs from the perf-callback
@@ -183,10 +194,39 @@ class IOTracer:
             print("Your device are incompatible with this version of IO Tracer. Please notify us at io-tracer@googlegroups.com")
             sys.exit(1)
 
+    # Pseudo-filesystem superblock magics whose I/O is kernel/diagnostic noise
+    # (procfs, sysfs, cgroup v1/v2, debugfs, tracefs, bpf) rather than real
+    # storage traffic. Events backed by these filesystems are dropped.
+    _PSEUDO_FS_MAGICS = frozenset({
+        0x9FA0,      # PROCFS
+        0x62656572,  # SYSFS
+        0x27E0EB,    # CGROUP (v1)
+        0x63677270,  # CGROUP2
+        0x64626720,  # DEBUGFS
+        0x74726163,  # TRACEFS
+        0xCAFE4A11,  # BPF
+    })
+
     def _should_filter_process(self, comm: str) -> bool:
         """Helper to filter out I/O unrelated system processes."""
         prefixes = ("swapper/", "ksoftirqd/", "irq/", "migration/", "stopper/")
         return comm.startswith(prefixes)
+
+    def _skip_event(self, comm: str, pid: int) -> bool:
+        """Drop events from kernel threads and the tracer's own processes."""
+        return pid == self._self_pid or self._should_filter_process(comm)
+
+    def _event_walltime(self, event):
+        """Convert a kernel event's bpf_ktime_get_ns() timestamp to wall-clock.
+
+        Using the kernel's per-event monotonic time (rather than the userspace
+        receive time) yields correctly ordered timestamps across the per-CPU
+        perf buffers. Falls back to receive time when the event carries no ts.
+        """
+        ts_ns = getattr(event, "ts", 0)
+        if not ts_ns:
+            return datetime.today()
+        return datetime.fromtimestamp(ts_ns / 1e9 + self._mono_to_real_offset)
 
     def _print_event(self, cpu, data, size):        
         """
@@ -214,16 +254,21 @@ class IOTracer:
         except UnicodeDecodeError:
             filename = ""
         
-        timestamp = datetime.today()
-        
+        timestamp = self._event_walltime(event)
+
         try:
             comm = event.comm.decode()
         except UnicodeDecodeError:
             comm = "[decode_error]"
-            
-        if self._should_filter_process(comm):
+
+        if self._skip_event(comm, event.pid):
             return
-            
+
+        # Drop I/O backed by pseudo-filesystems (procfs/sysfs/cgroup/...), which
+        # is kernel/diagnostic noise rather than real storage traffic.
+        if getattr(event, "fs_magic", 0) in self._PSEUDO_FS_MAGICS:
+            return
+
         inode_val = event.inode if event.inode != 0 else ""
         
         size_val = event.size if event.size is not None else 0
@@ -617,16 +662,16 @@ class IOTracer:
             filename_old = ""
             filename_new = ""
         
-        timestamp = datetime.today()
-        
+        timestamp = self._event_walltime(event)
+
         try:
             comm = event.comm.decode()
         except UnicodeDecodeError:
             comm = "[decode_error]"
-            
-        if self._should_filter_process(comm):
+
+        if self._skip_event(comm, event.pid):
             return
-            
+
         inode_old = event.inode_old if event.inode_old != 0 else ""
         inode_new = event.inode_new if event.inode_new != 0 else ""
         
@@ -664,11 +709,11 @@ class IOTracer:
             size: Size of the event data
         """
         event = self.b["cache_events"].event(data)
-        timestamp = datetime.today()
+        timestamp = self._event_walltime(event)
         pid = event.pid
         comm = event.comm.decode('utf-8', errors='replace')
-        
-        if self._should_filter_process(comm):
+
+        if self._skip_event(comm, pid):
             return
         
         event_types = {
@@ -710,13 +755,13 @@ class IOTracer:
             size: Size of the event data
         """
         event = self.b["bl_events"].event(data)
-        
-        timestamp = datetime.today()
+
+        timestamp = self._event_walltime(event)
         pid = event.pid
         tid = event.tid
         comm = event.comm.decode('utf-8', errors='replace')
-        
-        if self._should_filter_process(comm):
+
+        if self._skip_event(comm, pid):
             return
             
         sector = event.sector
@@ -771,13 +816,13 @@ class IOTracer:
             size: Size of the event data
         """
         event = self.b["pagefault_events"].event(data)
-        timestamp = datetime.today()
-        
+        timestamp = self._event_walltime(event)
+
         pid = event.pid
         tid = event.tid
         comm = event.comm.decode('utf-8', errors='replace')
-        
-        if self._should_filter_process(comm):
+
+        if self._skip_event(comm, pid):
             return
             
         address = hex(event.address) if event.address else ""
