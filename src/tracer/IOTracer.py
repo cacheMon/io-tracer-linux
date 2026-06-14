@@ -147,7 +147,9 @@ class IOTracer:
         # wall-clock time. Using the kernel's per-event timestamp instead of the
         # userspace receive time keeps rows correctly ordered in time across the
         # per-CPU perf buffers (which deliver in batches, not global order).
-        self._mono_to_real_offset = time.time() - time.clock_gettime(time.CLOCK_MONOTONIC)
+        # Integer-ns math avoids the float precision loss of subtracting two
+        # large second-valued floats.
+        self._mono_to_real_offset_ns = time.time_ns() - time.monotonic_ns()
         # The tracer (and its in-process snapshot/upload threads) read /proc,
         # write the trace files, and upload them — all of which is self-noise we
         # don't want in the trace. Filter events from our own pid.
@@ -212,10 +214,6 @@ class IOTracer:
         prefixes = ("swapper/", "ksoftirqd/", "irq/", "migration/", "stopper/")
         return comm.startswith(prefixes)
 
-    def _skip_event(self, comm: str, pid: int) -> bool:
-        """Drop events from kernel threads and the tracer's own processes."""
-        return pid == self._self_pid or self._should_filter_process(comm)
-
     def _event_walltime(self, event):
         """Convert a kernel event's bpf_ktime_get_ns() timestamp to wall-clock.
 
@@ -226,7 +224,7 @@ class IOTracer:
         ts_ns = getattr(event, "ts", 0)
         if not ts_ns:
             return datetime.today()
-        return datetime.fromtimestamp(ts_ns / 1e9 + self._mono_to_real_offset)
+        return datetime.fromtimestamp((ts_ns + self._mono_to_real_offset_ns) / 1e9)
 
     def _print_event(self, cpu, data, size):        
         """
@@ -243,6 +241,9 @@ class IOTracer:
         self._tick_maintenance()
 
         event = self.b["events"].event(data)
+        # Drop the tracer's own I/O before any decode/timestamp work.
+        if event.pid == self._self_pid:
+            return
         op_name = self.flag_mapper.op_fs_types.get(event.op, "[unknown]")
 
         try:
@@ -261,7 +262,7 @@ class IOTracer:
         except UnicodeDecodeError:
             comm = "[decode_error]"
 
-        if self._skip_event(comm, event.pid):
+        if self._should_filter_process(comm):
             return
 
         # Drop I/O backed by pseudo-filesystems (procfs/sysfs/cgroup/...), which
@@ -650,6 +651,9 @@ class IOTracer:
         self._tick_maintenance()
 
         event = self.b["events_dual"].event(data)
+        # Drop the tracer's own I/O before any decode/timestamp work.
+        if event.pid == self._self_pid:
+            return
         op_name = self.flag_mapper.op_fs_types.get(event.op, "[unknown]")
         
         try:
@@ -669,7 +673,7 @@ class IOTracer:
         except UnicodeDecodeError:
             comm = "[decode_error]"
 
-        if self._skip_event(comm, event.pid):
+        if self._should_filter_process(comm):
             return
 
         inode_old = event.inode_old if event.inode_old != 0 else ""
@@ -709,11 +713,13 @@ class IOTracer:
             size: Size of the event data
         """
         event = self.b["cache_events"].event(data)
-        timestamp = self._event_walltime(event)
         pid = event.pid
+        if pid == self._self_pid:
+            return
+        timestamp = self._event_walltime(event)
         comm = event.comm.decode('utf-8', errors='replace')
 
-        if self._skip_event(comm, pid):
+        if self._should_filter_process(comm):
             return
         
         event_types = {
@@ -756,12 +762,14 @@ class IOTracer:
         """
         event = self.b["bl_events"].event(data)
 
-        timestamp = self._event_walltime(event)
         pid = event.pid
+        if pid == self._self_pid:
+            return
+        timestamp = self._event_walltime(event)
         tid = event.tid
         comm = event.comm.decode('utf-8', errors='replace')
 
-        if self._skip_event(comm, pid):
+        if self._should_filter_process(comm):
             return
             
         sector = event.sector
@@ -816,13 +824,14 @@ class IOTracer:
             size: Size of the event data
         """
         event = self.b["pagefault_events"].event(data)
-        timestamp = self._event_walltime(event)
-
         pid = event.pid
+        if pid == self._self_pid:
+            return
+        timestamp = self._event_walltime(event)
         tid = event.tid
         comm = event.comm.decode('utf-8', errors='replace')
 
-        if self._skip_event(comm, pid):
+        if self._should_filter_process(comm):
             return
             
         address = hex(event.address) if event.address else ""

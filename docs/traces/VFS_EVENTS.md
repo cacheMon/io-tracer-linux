@@ -176,7 +176,7 @@ The path captured is relative to the mount namespace of the probed process. In c
 | 14 | cmdline | `string` | Full command line (`argv` joined by spaces) of the process that triggered the event; empty if unresolvable (see below) |
 | 15 | return_value | `s64` | Raw syscall return value for `READ`/`WRITE` (bytes moved if `>= 0`, negative `errno` on failure); empty for other operations |
 | 16 | errno | `string` | Error name (e.g. `EAGAIN`) when a `READ`/`WRITE` failed (`return_value < 0`); empty on success or for other operations |
-| 17 | bytes_completed (actual) | `u64` | **Actual** bytes read/written for `READ`/`WRITE` (`return_value` when `>= 0`); compare against column 6 (`Size`, requested) to detect short I/O. Empty on failure or for other operations |
+| 17 | bytes_completed (actual) | `u64` | **Actual** bytes read/written for `READ`/`WRITE` (`return_value` when `>= 0`); compare against column 6 (`Size (requested)`) to detect short I/O. Empty on failure or for other operations |
 | 18 | duration_ns | `u64` | Operation duration in nanoseconds (entry → return) for `READ`/`WRITE`; empty for other operations |
 | 19 | device | `string` | Backing device of the file as `major:minor` (from `super_block->s_dev`); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
 | 20 | ppid | `u32` | Parent process ID (`real_parent->tgid`); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
