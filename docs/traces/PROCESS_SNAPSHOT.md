@@ -23,6 +23,7 @@
 | 9 | CPU 2m | `float` | CPU utilization % averaged over last 2 minutes |
 | 10 | CPU 1h | `float` | CPU utilization % averaged over last 1 hour |
 | 11 | Status | `string` | Process status (see table below) |
+| 12 | mono_ns | `u64` | Snapshot time in `CLOCK_MONOTONIC` nanoseconds (`time.monotonic_ns()`, captured once per snapshot) — the common cross-stream correlation clock; add the manifest's `clock.mono_to_real_offset_ns` to recover wall-clock ns. |
 
 ## Process Status Values
 

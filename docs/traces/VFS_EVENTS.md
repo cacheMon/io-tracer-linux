@@ -182,6 +182,7 @@ The path captured is relative to the mount namespace of the probed process. In c
 | 20 | ppid | `u32` | Parent process ID (`real_parent->tgid`); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
 | 21 | container_id | `u64` | cgroup v2 id of the process (container identifier); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
 | 22 | fs_type | `string` | Source filesystem name derived from the superblock magic (e.g. `EXT2/3/4`, `XFS`, `BTRFS`, `OVERLAYFS`, `NFS`), letting physical-disk I/O be distinguished from network/overlay sources; populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
+| 23 | mono_ns | `u64` | Record time in `CLOCK_MONOTONIC` nanoseconds (kernel `bpf_ktime_get_ns()`) — the common clock for correlating across streams. Add the manifest's `clock.mono_to_real_offset_ns` to recover wall-clock ns. |
 
 > **Note on filesystem classification (`fs_type`) and sockets:** virtual/pseudo filesystems (procfs, sysfs, tmpfs, cgroupfs, debugfs, …) and sockets/pipes are filtered out at the eBPF layer by `is_regular_file()`, so they never appear as fs-trace rows. Their *absence* is the signal that an access was virtual/socket I/O rather than physical filesystem I/O. The `fs_type` column then names the concrete backing filesystem of the events that do appear, so physical-disk filesystems (`EXT2/3/4`, `XFS`, `BTRFS`, …) can be told apart from network (`NFS`, `CIFS`) and container-overlay (`OVERLAYFS`) sources.
 
