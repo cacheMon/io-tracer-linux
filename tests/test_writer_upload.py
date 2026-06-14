@@ -11,7 +11,6 @@ Run via either:
     pytest tests/
 """
 
-import gzip
 import os
 import sys
 import tempfile
@@ -28,6 +27,23 @@ if "requests" not in sys.modules:
         import requests  # noqa: F401
     except ModuleNotFoundError:
         sys.modules["requests"] = types.ModuleType("requests")
+
+# Compression uses Zstandard. Round-trip assertions are skipped when the
+# optional dependency isn't installed (CI installs it explicitly).
+try:
+    import zstandard
+    HAS_ZSTD = True
+except ModuleNotFoundError:
+    HAS_ZSTD = False
+
+
+def _zstd_read_text(path):
+    """Decompress a .zst file to text for round-trip assertions."""
+    import zstandard
+    dctx = zstandard.ZstdDecompressor()
+    with open(path, "rb") as f, dctx.stream_reader(f) as reader:
+        return reader.read().decode()
+
 
 from src.tracer.WriterManager import WriteManager
 
@@ -78,22 +94,23 @@ class PerFileUploadTests(unittest.TestCase):
             f.write(text)
         return path
 
-    def test_compress_log_uploads_individual_gz(self):
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
+    def test_compress_log_uploads_individual_zst(self):
         src = self._make_log("fs", "fs_x.csv", "a,b,c\n1,2,3\n")
         self.wm.compress_log(src)
 
         # Exactly one upload, the compressed file — no tar bundle.
         self.assertEqual(len(self.upload.uploaded), 1)
         uploaded = self.upload.uploaded[0]
-        self.assertTrue(uploaded.endswith(".csv.gz"))
+        self.assertTrue(uploaded.endswith(".csv.zst"))
         self.assertFalse(uploaded.endswith(".tar"))
         self.assertTrue(os.path.exists(uploaded))
         # Source .csv is removed once compressed.
         self.assertFalse(os.path.exists(src))
-        # Content round-trips through gzip.
-        with gzip.open(uploaded, "rt") as f:
-            self.assertEqual(f.read(), "a,b,c\n1,2,3\n")
+        # Content round-trips through Zstandard.
+        self.assertEqual(_zstd_read_text(uploaded), "a,b,c\n1,2,3\n")
 
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
     def test_upload_preserves_subdirectory(self):
         # The backend file_type is derived from the parent directory, so each
         # stream must stay under its own subdir (fs, ds, cache, ...).
@@ -105,6 +122,7 @@ class PerFileUploadTests(unittest.TestCase):
         parents = {os.path.basename(os.path.dirname(p)) for p in self.upload.uploaded}
         self.assertEqual(parents, {"fs", "ds", "cache", "process"})
 
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
     def test_no_upload_when_automatic_disabled(self):
         self.wm.automatic_upload = False
         src = self._make_log("fs", "fs_x.csv", "row\n")
@@ -117,7 +135,6 @@ class PerFileUploadTests(unittest.TestCase):
         self.assertGreaterEqual(self.wm.block_max_events, 80000)
         self.assertGreaterEqual(self.wm.cache_max_events, 100000)
         self.assertGreaterEqual(self.wm.pagefault_max_events, 80000)
-        self.assertGreaterEqual(self.wm.io_uring_max_events, 80000)
         # Dynamic minimums must stay consistent (min <= max) after enlargement.
         for name, (lo, hi) in self.wm.dynamic_limits.items():
             self.assertGreaterEqual(lo, 80000, name)
@@ -150,6 +167,7 @@ class StaleLogRotationTests(unittest.TestCase):
             f.write(text)
         return path
 
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
     def test_size_triggers_rotation(self):
         self.wm.max_file_bytes = 50
         self.wm.max_file_age = 10**9  # disable age trigger
@@ -159,12 +177,13 @@ class StaleLogRotationTests(unittest.TestCase):
 
         self.assertEqual(len(self.upload.uploaded), 1)
         uploaded = self.upload.uploaded[0]
-        self.assertTrue(uploaded.endswith(".csv.gz"))
+        self.assertTrue(uploaded.endswith(".csv.zst"))
         self.assertEqual(os.path.basename(os.path.dirname(uploaded)), "fs")
         # Rotated to a fresh file; the old .csv is gone (compressed away).
         self.assertNotEqual(self.wm.output_vfs_file, path)
         self.assertFalse(os.path.exists(path))
 
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
     def test_age_triggers_rotation(self):
         self.wm.max_file_bytes = 10**12  # disable size trigger
         self._write_current("output_block_file", "row\n")
@@ -189,6 +208,7 @@ class StaleLogRotationTests(unittest.TestCase):
         self.wm._maybe_rotate_stale_logs()
         self.assertEqual(self.upload.uploaded, [])
 
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
     def test_rotate_flushes_buffered_rows(self):
         self.wm.vfs_buffer.append("a,b,c")
         self.wm.vfs_buffer.append("d,e,f")
@@ -196,8 +216,7 @@ class StaleLogRotationTests(unittest.TestCase):
         self.wm._rotate_stream("vfs")
 
         self.assertEqual(len(self.upload.uploaded), 1)
-        with gzip.open(self.upload.uploaded[0], "rt") as f:
-            content = f.read()
+        content = _zstd_read_text(self.upload.uploaded[0])
         self.assertIn("a,b,c", content)
         self.assertIn("d,e,f", content)
         self.assertEqual(len(self.wm.vfs_buffer), 0)

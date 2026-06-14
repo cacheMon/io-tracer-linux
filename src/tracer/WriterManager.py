@@ -5,7 +5,7 @@ This module provides the WriteManager class which handles:
 - Creating output directory structure
 - Buffering trace events for different subsystems
 - Writing events to CSV files
-- Compressing output files with gzip
+- Compressing output files with Zstandard (.zst)
 - Optionally uploading files to cloud storage
 
 The manager uses adaptive buffering to handle high event rates and
@@ -29,10 +29,12 @@ from datetime import datetime
 import tarfile
 
 from .ObjectStorageManager import ObjectStorageManager
-from ..utility.utils import logger, create_tar_gz, capture_machine_id, compress_log
+from ..utility.utils import (
+    logger, capture_machine_id,
+    compress_file_zstd, require_zstandard, ZSTD_LEVEL,
+)
 import threading
 from collections import deque
-import gzip
 import shutil
 import time
 
@@ -83,7 +85,6 @@ class WriteManager:
         self.output_process_file = f"{self.output_dir}/process/process_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_fs_snapshot_file = f"{self.output_dir}/filesystem_snapshot/filesystem_snapshot_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_pagefault_file = f"{self.output_dir}/pagefault/pagefault_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-        self.output_io_uring_file = f"{self.output_dir}/io_uring/io_uring_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
 
         # Create output directories
         os.makedirs(f"{self.output_dir}/system_spec", exist_ok=True)
@@ -93,7 +94,6 @@ class WriteManager:
         os.makedirs(f"{self.output_dir}/process", exist_ok=True)
         os.makedirs(f"{self.output_dir}/filesystem_snapshot", exist_ok=True)
         os.makedirs(f"{self.output_dir}/pagefault", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/io_uring", exist_ok=True)
 
         self.upload_manager = upload_manager
         self.automatic_upload = automatic_upload
@@ -105,7 +105,6 @@ class WriteManager:
         self.process_buffer = deque()
         self.fs_snap_buffer = deque()
         self.pagefault_buffer = deque()
-        self.io_uring_buffer = deque()
         
         # Event rate tracking
         self.event_timestamps = {
@@ -115,7 +114,6 @@ class WriteManager:
             'fs_state': deque(maxlen=1000),
             'proc_state': deque(maxlen=1000),
             'pagefault': deque(maxlen=1000),
-            'io_uring': deque(maxlen=1000),
         }
         
         # Dynamic thresholds (min, max). Raised roughly 10x from the original
@@ -130,7 +128,6 @@ class WriteManager:
             'fs_state': (80000, 200000),
             'proc_state': (80000, 100000),
             'pagefault': (80000, 400000),
-            'io_uring': (80000, 400000),
         }
         
         # Start adaptive sizing thread
@@ -152,7 +149,6 @@ class WriteManager:
         self.process_max_events = 80000  # Large enough to fit entire hourly snapshot
         self.fs_snap_max_events = 80000
         self.pagefault_max_events = 80000
-        self.io_uring_max_events = 80000
 
         # Per-stream locks. Buffer flushes are triggered both from the
         # perf-callback (polling) thread via append_*_log -> flush_*_only and
@@ -166,7 +162,6 @@ class WriteManager:
             'process':   threading.Lock(),
             'fs_snap':   threading.Lock(),
             'pagefault': threading.Lock(),
-            'io_uring':  threading.Lock(),
         }
 
         # File handles for each output
@@ -176,7 +171,6 @@ class WriteManager:
         self._process_handle = None
         self._pagefault_handle = None
         self._fs_snap_handle = None
-        self._io_uring_handle = None
 
         # Registry of the continuous event streams that support generic
         # rotation. Snapshots (process, fs_snap) are intentionally excluded:
@@ -188,7 +182,6 @@ class WriteManager:
             'block':     {'subdir': 'ds',        'prefix': 'ds',        'buf': 'block_buffer',     'handle': '_block_handle',     'file': 'output_block_file',     'log': 'Block'},
             'cache':     {'subdir': 'cache',     'prefix': 'cache',     'buf': 'cache_buffer',     'handle': '_cache_handle',     'file': 'output_cache_file',     'log': 'Cache'},
             'pagefault': {'subdir': 'pagefault', 'prefix': 'pagefault', 'buf': 'pagefault_buffer', 'handle': '_pagefault_handle', 'file': 'output_pagefault_file', 'log': 'PageFault'},
-            'io_uring':  {'subdir': 'io_uring',  'prefix': 'io_uring',  'buf': 'io_uring_buffer',  'handle': '_io_uring_handle',  'file': 'output_io_uring_file',  'log': 'IO_Uring'},
         }
 
         # Time/size based rotation so a slow stream's log doesn't wait until
@@ -247,7 +240,7 @@ class WriteManager:
         while True:
             time.sleep(10)  
             
-            for event_type in ['vfs', 'block', 'cache', 'fs_state','proc_state', 'pagefault', 'io_uring']:
+            for event_type in ['vfs', 'block', 'cache', 'fs_state','proc_state', 'pagefault']:
                 rate = self._calculate_event_rate(event_type)
                 min_limit, max_limit = self.dynamic_limits[event_type]
                 
@@ -272,8 +265,6 @@ class WriteManager:
                     self.process_max_events = new_limit
                 elif event_type == 'pagefault':
                     self.pagefault_max_events = new_limit
-                elif event_type == 'io_uring':
-                    self.io_uring_max_events = new_limit
 
     def _periodic_flush(self):
         """
@@ -330,9 +321,6 @@ class WriteManager:
             buffer_info.append(f"Cache:{len(self.cache_buffer)}")
         if len(self.pagefault_buffer) > 0:
             buffer_info.append(f"PgFault:{len(self.pagefault_buffer)}")
-        if len(self.io_uring_buffer) > 0:
-            buffer_info.append(f"IO_Uring:{len(self.io_uring_buffer)}")
-        
         if buffer_info:
             status_parts.append(f"Buffers: {', '.join(buffer_info)}")
         
@@ -390,10 +378,6 @@ class WriteManager:
     def should_flush_pagefault(self) -> bool:
         """Check if pagefault buffer should be flushed."""
         return (len(self.pagefault_buffer) >= self.pagefault_max_events)
-
-    def should_flush_io_uring(self) -> bool:
-        """Check if io_uring buffer should be flushed."""
-        return (len(self.io_uring_buffer) >= self.io_uring_max_events)
 
     def append_fs_snap_log(self, log_output: str):
         """
@@ -497,16 +481,6 @@ class WriteManager:
         else:
             logger("error", "Invalid pagefault log output format. Expected a string.")
 
-    def append_io_uring_log(self, log_output: str):
-        """Add an io_uring event log entry."""
-        if isinstance(log_output, str):
-            self.io_uring_buffer.append(log_output)
-            self.event_timestamps['io_uring'].append(time.time())
-            if self.should_flush_io_uring():
-                self.flush_io_uring_only()
-        else:
-            logger("error", "Invalid io_uring log output format. Expected a string.")
-
     def direct_write(self, output_path: str, spec_str: str):
         """
         Write a system specification file directly.
@@ -529,7 +503,7 @@ class WriteManager:
         Flush filesystem snapshot buffer to a multi-part file.
 
         Writes buffer to filesystem_snapshot_part####_TIMESTAMP_DEVICEID.csv,
-        compresses it with gzip, and increments the part counter.
+        compresses it with Zstandard, and increments the part counter.
         """
         with self._stream_locks['fs_snap']:
             if not self.fs_snap_buffer:
@@ -561,15 +535,13 @@ class WriteManager:
             self._fs_snap_handle.close()
             self._fs_snap_handle = None
 
-            # Compress with gzip
+            # Compress with Zstandard
             if os.path.exists(part_filepath):
                 # Don't log or count each part - we'll log when snapshot is complete
-                with open(part_filepath, "rb") as f_in:
-                    with gzip.open(part_filepath + ".gz", "wb") as f_out:
-                        shutil.copyfileobj(f_in, f_out)
+                compress_file_zstd(part_filepath, part_filepath + ".zst")
 
                 os.remove(part_filepath)
-                compressed_file = part_filepath + ".gz"
+                compressed_file = part_filepath + ".zst"
 
                 # Store for later upload (after snapshot completion and final part rename)
                 if self.automatic_upload:
@@ -621,7 +593,7 @@ class WriteManager:
         old_filename = (
             f"filesystem_snapshot_part{last_part_str}_"
             f"{self.fs_snapshot_timestamp}_"
-            f"{self.fs_snapshot_device_id}.csv.gz"
+            f"{self.fs_snapshot_device_id}.csv.zst"
         )
         old_filepath = f"{self.output_dir}/filesystem_snapshot/{old_filename}"
         
@@ -629,7 +601,7 @@ class WriteManager:
         new_filename = (
             f"filesystem_snapshot_part{last_part_str}_"
             f"{self.fs_snapshot_timestamp}_"
-            f"{self.fs_snapshot_device_id}_complete_parts{total_parts}.csv.gz"
+            f"{self.fs_snapshot_device_id}_complete_parts{total_parts}.csv.zst"
         )
         new_filepath = f"{self.output_dir}/filesystem_snapshot/{new_filename}"
         
@@ -707,10 +679,6 @@ class WriteManager:
     def flush_pagefault_only(self):
         """Flush pagefault buffer to file (rotate + compress + upload)."""
         self._rotate_stream('pagefault')
-
-    def flush_io_uring_only(self):
-        """Flush io_uring buffer to file (rotate + compress + upload)."""
-        self._rotate_stream('io_uring')
 
     def _rotate_stream(self, key: str):
         """Rotate one continuous stream's current log and queue it for upload.
@@ -827,7 +795,6 @@ class WriteManager:
             self.fs_snap_buffer.clear()
         
         self.compress_log(self.output_pagefault_file)
-        self.compress_log(self.output_io_uring_file)
         self.compress_dir(self.output_dir)
 
 
@@ -840,7 +807,6 @@ class WriteManager:
         self.process_buffer.clear()
         self.fs_snap_buffer.clear()
         self.pagefault_buffer.clear()
-        self.io_uring_buffer.clear()
 
     def _write_buffer_to_file(self, buffer, file_handle, buffer_name: str):
         """
@@ -915,13 +881,6 @@ class WriteManager:
                         self._pagefault_handle = open(self.output_pagefault_file, 'a', buffering=8192)
                     self._write_buffer_to_file(self.pagefault_buffer, self._pagefault_handle, "PageFault")
 
-        def write_io_uring():
-            with self._stream_locks['io_uring']:
-                if self.io_uring_buffer:
-                    if self._io_uring_handle is None:
-                        self._io_uring_handle = open(self.output_io_uring_file, 'a', buffering=8192)
-                    self._write_buffer_to_file(self.io_uring_buffer, self._io_uring_handle, "IO_Uring")
-
         threads = []
         
         # Start parallel write threads for each buffer
@@ -955,11 +914,6 @@ class WriteManager:
             threads.append(t7)
             t7.start()
 
-        if self.io_uring_buffer:
-            t13 = threading.Thread(target=write_io_uring)
-            threads.append(t13)
-            t13.start()
-
         # Wait for all threads to complete
         for thread in threads:
             thread.join()
@@ -968,22 +922,20 @@ class WriteManager:
 
     def compress_log(self, input_file: str):
         """
-        Compress a log file with gzip and optionally upload.
-        
+        Compress a log file with Zstandard and optionally upload.
+
         Args:
             input_file: Path to the file to compress
         """
         try:
             src = input_file
-            dst = input_file + ".gz"
-            
+            dst = input_file + ".zst"
+
             # Check if file exists (may already be compressed for multi-part files)
             if not os.path.exists(src):
                 return
-            
-            with open(src, "rb") as f_in:
-                with gzip.open(dst, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out) # type: ignore
+
+            compress_file_zstd(src, dst)
 
             if self.automatic_upload:
                 self.created_files += 1
@@ -997,17 +949,21 @@ class WriteManager:
             
     def compress_dir(self, input_dir: str):
         """
-        Compress a directory to tar.gz and optionally upload.
-        
+        Compress a directory to tar.zst and optionally upload.
+
         Args:
             input_dir: Path to the directory to compress
         """
         try:
+            zstandard = require_zstandard()
             src = input_dir
-            dst = input_dir.rstrip("/").rstrip("\\") + ".tar.gz"
+            dst = input_dir.rstrip("/").rstrip("\\") + ".tar.zst"
 
-            with tarfile.open(dst, "w:gz") as tar:
-                tar.add(src, arcname=os.path.basename(src))
+            cctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL)
+            with open(dst, "wb") as f_out:
+                with cctx.stream_writer(f_out) as compressor:
+                    with tarfile.open(mode="w|", fileobj=compressor) as tar:
+                        tar.add(src, arcname=os.path.basename(src))
 
             if self.automatic_upload:
                 self.created_files += 1
@@ -1032,7 +988,6 @@ class WriteManager:
             (self._process_handle, "Process State"),
             (self._fs_snap_handle, "Filesystem Snapshot"),
             (self._pagefault_handle, "PageFault"),
-            (self._io_uring_handle, "IO_Uring"),
         ]
         
         for handle, name in handles:
@@ -1050,4 +1005,3 @@ class WriteManager:
         self._process_handle = None
         self._fs_snap_handle = None
         self._pagefault_handle = None
-        self._io_uring_handle = None

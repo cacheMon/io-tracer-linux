@@ -1,0 +1,4 @@
+# Runtime dependencies for the io-tracer userspace tooling.
+# Note: bcc (python3-bpfcc) is installed via the system package manager, not pip.
+requests>=2.25
+zstandard>=0.21
