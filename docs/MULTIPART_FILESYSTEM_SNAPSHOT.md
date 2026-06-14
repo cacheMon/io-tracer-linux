@@ -11,7 +11,7 @@ The filesystem snapshot feature now supports splitting large filesystem scans in
 Each part of a filesystem snapshot follows this naming pattern:
 
 ```
-filesystem_snapshot_part####_TIMESTAMP_DEVICEID.csv.gz
+filesystem_snapshot_part####_TIMESTAMP_DEVICEID.csv.zst
 ```
 
 Where:
@@ -24,7 +24,7 @@ Where:
 The final part is renamed to indicate completion:
 
 ```
-filesystem_snapshot_part####_TIMESTAMP_DEVICEID_complete_partsN.csv.gz
+filesystem_snapshot_part####_TIMESTAMP_DEVICEID_complete_partsN.csv.zst
 ```
 
 The `_complete_partsN` suffix indicates:
@@ -36,14 +36,14 @@ The `_complete_partsN` suffix indicates:
 A 3-part filesystem snapshot might produce these files:
 
 ```
-filesystem_snapshot_part0001_20260214_120000_ABC123DEF456.csv.gz
-filesystem_snapshot_part0002_20260214_120000_ABC123DEF456.csv.gz
-filesystem_snapshot_part0003_20260214_120000_ABC123DEF456_complete_parts3.csv.gz
+filesystem_snapshot_part0001_20260214_120000_ABC123DEF456.csv.zst
+filesystem_snapshot_part0002_20260214_120000_ABC123DEF456.csv.zst
+filesystem_snapshot_part0003_20260214_120000_ABC123DEF456_complete_parts3.csv.zst
 ```
 
 ## Compression
 
-Files are compressed using **gzip** for reliable and efficient compression.
+Files are compressed using **Zstandard** (`.zst`) for reliable and efficient compression.
 
 ## Implementation Details
 
@@ -60,7 +60,7 @@ Files are compressed using **gzip** for reliable and efficient compression.
    - `mark_fs_snapshot_complete()`: Rename final part with completion marker
 
 3. **Modified Methods**:
-   - `flush_fssnap_only()`: Now writes to part-based files with gzip compression
+   - `flush_fssnap_only()`: Now writes to part-based files with Zstandard compression
 
 ### FilesystemSnapper Changes
 
@@ -68,13 +68,13 @@ The `filesystem_snapshot()` method now calls `mark_fs_snapshot_complete()` after
 
 ### Utils Changes
 
-Uses the existing `compress_log()` function that:
-- Compresses files using gzip
+Uses the existing `compress_file_zstd()` helper that:
+- Compresses files using Zstandard
 - Removes the original uncompressed file after compression
 
 ## Buffer Flushing
 
-The filesystem snapshot buffer is flushed when it reaches the threshold (`fs_snap_max_events`, default 8000 entries). Each flush creates a new part file. This prevents memory overflow during large filesystem scans.
+The filesystem snapshot buffer is flushed when it reaches the threshold (`fs_snap_max_events`, default 80000 entries). Each flush creates a new part file. This prevents memory overflow during large filesystem scans.
 
 ## Memory Optimization
 
@@ -178,4 +178,4 @@ else:
 
 This feature requires:
 - All parts must have consistent timestamp and device ID
-- gzip is available by default in Python's standard library
+- Zstandard support via the `zstandard` package (see `requirements.txt`)

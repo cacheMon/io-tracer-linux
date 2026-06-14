@@ -53,7 +53,7 @@ sudo apt install python3-pytest
 
 ## Usage
 ```
-usage: sudo iotrc [-h] [-v] [-a] [--dev] [--computer-id] [--reward]
+usage: sudo iotrc [-h] [-v] [-a] [--computer-id] [--reward] [--no-upload] {dev} ...
 
 Trace IO syscalls
 
@@ -61,9 +61,13 @@ options:
   -h, --help       show this help message and exit
   -v, --verbose    Print verbose output
   -a, --anonimize  Enable anonymization of process and file names
-  --dev            Developer mode with extra logs and checks
   --computer-id    Print this machine ID and exit
   --reward         Show your reward code (unlocked after uploading traces)
+  --no-upload      Disable automatic upload of traces (for testing)
+
+subcommands:
+  {dev}            Run in developer mode with extra logs and checks
+                   (supports --trace-bucket NAME to override the upload bucket)
 ```
 
 ## Trace Types
