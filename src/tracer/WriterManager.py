@@ -221,12 +221,17 @@ class WriteManager:
         'process': 'process', 'fs_snap': 'filesystem_snapshot',
     }
 
-    def _open_log_file(self, path: str, wm_key: str):
+    def _open_log_file(self, path: str, wm_key: str, write_header: bool = True):
         """Open a stream's CSV for appending, writing the schema header row first
-        when the file is new/empty so every (rotated) file is self-describing."""
+        when the file is new/empty so every (rotated) file is self-describing.
+
+        ``write_header`` may be set False for the 2nd+ parts of a multi-part
+        stream whose parts are meant to be concatenated back into one CSV: a
+        header in every part would otherwise land as a bogus data row mid-table.
+        """
         is_new = (not os.path.exists(path)) or os.path.getsize(path) == 0
         handle = open(path, 'a', buffering=8192)
-        if is_new:
+        if is_new and write_header:
             handle.write(schema.header_line(self._SCHEMA_KEY[wm_key]) + "\n")
         return handle
 
@@ -541,11 +546,16 @@ class WriteManager:
             )
             part_filepath = f"{self.output_dir}/filesystem_snapshot/{part_filename}"
 
-            # Open file handle for this part if needed
+            # Open file handle for this part if needed. Only the first part
+            # carries the schema header; the documented reader concatenates all
+            # parts in order, so headers on parts 2+ would corrupt the table.
             if self._fs_snap_handle is None or self.output_fs_snapshot_file != part_filepath:
                 if self._fs_snap_handle is not None:
                     self._fs_snap_handle.close()
-                self._fs_snap_handle = self._open_log_file(part_filepath, 'fs_snap')
+                self._fs_snap_handle = self._open_log_file(
+                    part_filepath, 'fs_snap',
+                    write_header=(self.fs_snapshot_part_number == 1),
+                )
                 self.output_fs_snapshot_file = part_filepath
 
             # Write buffer to file
@@ -815,7 +825,16 @@ class WriteManager:
             self.fs_snap_buffer.clear()
         
         self.compress_log(self.output_pagefault_file)
-        self.compress_dir(self.output_dir)
+
+        # In automatic_upload mode every compressed log has already been queued
+        # for individual upload (preserving its subdirectory) and the background
+        # worker is concurrently deleting those .zst files as it uploads them.
+        # Tarring the whole directory here would (a) upload every file a second
+        # time inside the bundle and (b) race the worker's deletions while
+        # tarfile walks the tree. Only bundle into a single tar.zst for the
+        # local (non-upload) case.
+        if not self.automatic_upload:
+            self.compress_dir(self.output_dir)
 
 
     def clear_events(self):

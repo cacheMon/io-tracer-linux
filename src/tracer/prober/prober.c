@@ -501,6 +501,7 @@ struct io_uring_event_data {
   /* Completion fields (COMPLETE event) */
   s32 result;                   /**< Operation result (bytes or -errno) */
   u8 is_error;                  /**< 1 if result < 0 */
+  u8 result_valid;              /**< 1 if result was captured (unset on 6.0+ kprobe) */
   s32 cqe_errno;                /**< Errno if error (positive value) */
   
   /* Latency tracking */
@@ -2610,6 +2611,11 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
     u64 *miss = block_stats.lookup(&stat_miss);
     if (miss)
       *miss += 1;
+    // Drop any insert timestamp for this key too — without the issue ctx we
+    // can't emit an event, and leaving it behind lets a later request that
+    // reuses the same (dev,sector) key read a stale insert_ts and report a
+    // wildly inflated queue latency.
+    block_insert_times.delete(&key);
     return 0;
   }
 
@@ -4079,6 +4085,7 @@ int trace_io_uring_complete(struct pt_regs *ctx, void *req, s32 result) {
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 0, 0)
   e.result = result;
+  e.result_valid = 1;
 
   /* Check if result indicates error */
   if (result < 0) {
@@ -4259,8 +4266,9 @@ TRACEPOINT_PROBE(io_uring, io_uring_complete) {
   e.req_ptr = (u64)args->req;
   e.user_data = args->user_data;
   e.result = args->res;
+  e.result_valid = 1;
   e.complete_ts_ns = ts;
-  
+
   if (e.result < 0) {
     e.is_error = 1;
     e.cqe_errno = -e.result;

@@ -957,14 +957,20 @@ class IOTracer:
         if not op_name or not getattr(e, "inode", 0):
             return
 
-        ret = e.result
-        return_value = str(ret)
+        # On kernel >= 6.0 the completion result is not available to the kprobe
+        # (io_req_complete_post no longer passes it as an argument), so the C
+        # side leaves result unset and flags it via result_valid. Emit empty
+        # return_value/bytes_completed in that case rather than a misleading 0.
+        return_value = ""
         errno_val = ""
         bytes_completed = ""
-        if ret < 0:
-            errno_val = self.flag_mapper.format_errno(-ret)
-        else:
-            bytes_completed = str(ret)
+        if getattr(e, "result_valid", 0):
+            ret = e.result
+            return_value = str(ret)
+            if ret < 0:
+                errno_val = self.flag_mapper.format_errno(-ret)
+            else:
+                bytes_completed = str(ret)
         duration_ns = str(e.latency_ns) if e.latency_ns else ""
 
         offset_val = e.offset if e.offset else ""
