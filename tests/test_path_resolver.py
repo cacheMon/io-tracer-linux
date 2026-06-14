@@ -112,6 +112,20 @@ class ResolveRelativeTests(unittest.TestCase):
                 "x.txt",
             )
 
+    def test_deleted_base_dir_falls_back(self):
+        # /proc/<pid>/cwd of an unlinked dir reads as "/path (deleted)"; joining
+        # onto it would fabricate a path that never existed.
+        r = PathResolver()
+        with mock.patch("src.tracer.PathResolver.os.readlink",
+                        return_value="/tmp/gone (deleted)"):
+            self.assertEqual(
+                r.resolve_relative(pid=99, dirfd=PathResolver.AT_FDCWD,
+                                   relpath="x.txt", inode=5),
+                "x.txt",
+            )
+        # And it must not poison the inode cache with a bogus path.
+        self.assertNotIn(5, r.inode_to_path)
+
 
 if __name__ == "__main__":
     unittest.main()

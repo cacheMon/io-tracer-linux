@@ -781,6 +781,8 @@ static bool is_regular_file(struct file *file) {
   case XENFS_SUPER_MAGIC:
   case RPCAUTH_GSSMAGIC:
   case TRACEFS_MAGIC:
+  case 0x63677270:  /* CGROUP2_SUPER_MAGIC — cgroup v2 unified hierarchy */
+  case 0xCAFE4A11:  /* BPF_FS_MAGIC — bpffs */
   case 0x19800202:
     is_virtual = true;
     break;
@@ -827,6 +829,8 @@ static bool is_regular_file_from_path(const struct path *path) {
   case XENFS_SUPER_MAGIC:
   case RPCAUTH_GSSMAGIC:
   case TRACEFS_MAGIC:
+  case 0x63677270:  /* CGROUP2_SUPER_MAGIC — cgroup v2 unified hierarchy */
+  case 0xCAFE4A11:  /* BPF_FS_MAGIC — bpffs */
   case 0x19800202:
     return false;
   default:

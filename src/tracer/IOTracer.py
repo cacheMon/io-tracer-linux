@@ -197,35 +197,34 @@ class IOTracer:
             print("Your device are incompatible with this version of IO Tracer. Please notify us at io-tracer@googlegroups.com")
             sys.exit(1)
 
-    # Pseudo-filesystem superblock magics whose I/O is kernel/diagnostic noise
-    # (procfs, sysfs, cgroup v1/v2, debugfs, tracefs, bpf) rather than real
-    # storage traffic. Events backed by these filesystems are dropped.
-    _PSEUDO_FS_MAGICS = frozenset({
-        0x9FA0,      # PROCFS
-        0x62656572,  # SYSFS
-        0x27E0EB,    # CGROUP (v1)
-        0x63677270,  # CGROUP2
-        0x64626720,  # DEBUGFS
-        0x74726163,  # TRACEFS
-        0xCAFE4A11,  # BPF
-    })
-
     def _should_filter_process(self, comm: str) -> bool:
         """Helper to filter out I/O unrelated system processes."""
         prefixes = ("swapper/", "ksoftirqd/", "irq/", "migration/", "stopper/")
         return comm.startswith(prefixes)
 
+    def _ns_to_walltime(self, ts_ns):
+        """Convert a kernel ``bpf_ktime_get_ns()`` (CLOCK_MONOTONIC) value to a
+        wall-clock ``datetime``.
+
+        Returns the userspace receive time when ``ts_ns`` is missing/zero, or if
+        the value is out of ``datetime``'s representable range — a garbage
+        timestamp must never raise out of a perf-buffer callback.
+        """
+        if not ts_ns:
+            return datetime.today()
+        try:
+            return datetime.fromtimestamp((ts_ns + self._mono_to_real_offset_ns) / 1e9)
+        except (OverflowError, OSError, ValueError):
+            return datetime.today()
+
     def _event_walltime(self, event):
-        """Convert a kernel event's bpf_ktime_get_ns() timestamp to wall-clock.
+        """Wall-clock time for a perf event, from its kernel ``ts`` field.
 
         Using the kernel's per-event monotonic time (rather than the userspace
         receive time) yields correctly ordered timestamps across the per-CPU
         perf buffers. Falls back to receive time when the event carries no ts.
         """
-        ts_ns = getattr(event, "ts", 0)
-        if not ts_ns:
-            return datetime.today()
-        return datetime.fromtimestamp((ts_ns + self._mono_to_real_offset_ns) / 1e9)
+        return self._ns_to_walltime(getattr(event, "ts", 0))
 
     def _print_event(self, cpu, data, size):        
         """
@@ -264,11 +263,6 @@ class IOTracer:
             comm = "[decode_error]"
 
         if self._should_filter_process(comm):
-            return
-
-        # Drop I/O backed by pseudo-filesystems (procfs/sysfs/cgroup/...), which
-        # is kernel/diagnostic noise rather than real storage traffic.
-        if getattr(event, "fs_magic", 0) in self._PSEUDO_FS_MAGICS:
             return
 
         inode_val = event.inode if event.inode != 0 else ""
@@ -327,6 +321,13 @@ class IOTracer:
                 cached = self.path_resolver.inode_to_path.get(event.inode)
                 if cached:
                     filename = cached
+
+        # Invariant: an OPEN filename is absolute or a clean basename, never an
+        # unanchored relative path. If it is still relative here (inode==0 skipped
+        # resolution above, or every resolver raced a closed fd/cwd), reduce it to
+        # its basename. Anonymous mode already hashed the path at decode time.
+        if op_name == 'OPEN' and not self.anonymous and filename and not filename.startswith('/'):
+            filename = os.path.basename(filename) or filename
 
         if raw_address:
             if op_name == "MMAP":
@@ -881,7 +882,10 @@ class IOTracer:
         if e.event_type != 2:
             return
 
-        ts = datetime.today()
+        # Use the kernel event time (io_uring's struct names it timestamp_ns) so
+        # these mirrored rows share the same clock as the syscall-origin fs rows
+        # they interleave with in the fs trace.
+        ts = self._ns_to_walltime(getattr(e, "timestamp_ns", 0))
         comm = e.comm.decode("utf-8", errors="replace").strip("\x00")
 
         if self._should_filter_process(comm):

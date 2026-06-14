@@ -222,6 +222,11 @@ class PathResolver:
         except OSError:
             return relpath
 
+        # The kernel appends " (deleted)" when the base directory has been
+        # unlinked; joining onto that yields a path that never existed, so bail.
+        if base.endswith(" (deleted)"):
+            return relpath
+
         resolved = os.path.normpath(os.path.join(base, relpath))
         if inode:
             self.inode_to_path[inode] = resolved

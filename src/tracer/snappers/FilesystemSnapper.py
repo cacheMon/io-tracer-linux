@@ -77,8 +77,9 @@ class FilesystemSnapper:
         Returns:
             bool: True if snapshot completed naturally, False if interrupted
         """
-        # Capture snapshot timestamp once for all files in this snapshot
-        snapshot_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Capture snapshot timestamp once for all files in this snapshot.
+        # Millisecond resolution to match the process snapshot stream.
+        snapshot_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         count = 0
         def scan_dir(path: str, depth: int = 0):
             """Inner function for recursive directory scanning."""
