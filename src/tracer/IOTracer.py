@@ -397,12 +397,14 @@ class IOTracer:
             if getattr(event, "fs_magic", 0) else ""
         )
 
+        # Aligned schema (v3): shared cross-OS prefix first, Linux-only extras
+        # after, lowercase canonical operation name.
         output = format_csv_row(
-            timestamp, op_name, event.pid, comm, filename, size_val, inode_val,
-            flags_val, offset_val, tid_val, mmap_prot_val, mmap_flags_val,
-            address_val, cmdline,
-            return_value, errno_val, bytes_completed, duration_ns,
-            dev_val, ppid_val, container_id, fs_type_val,
+            timestamp, op_name.lower(), event.pid, tid_val, comm, filename,
+            size_val, offset_val, bytes_completed, inode_val, dev_val, flags_val,
+            duration_ns, return_value, errno_val,
+            mmap_prot_val, mmap_flags_val, address_val, cmdline,
+            ppid_val, container_id, fs_type_val,
             getattr(event, "ts", 0)
         )
         self.writer.append_fs_log(output)
@@ -706,17 +708,17 @@ class IOTracer:
         flags_val = self.flag_mapper.format_vfs_flags(op_name, event.flags)
         cmdline = self._read_cmdline_cached(event.pid)
 
-        # Emit the same 22-column schema as _print_event so the shared fs log
+        # Emit the same aligned fs schema as _print_event so the shared fs log
         # stays a well-formed CSV. Dual-path ops (RENAME/LINK/SYMLINK) do not
-        # carry offset/tid/mmap/address or the READ/WRITE/OPEN completion and
-        # provenance fields, so those columns are empty.
+        # carry size/offset/tid/mmap/address or the READ/WRITE/OPEN completion
+        # and provenance fields, so those columns are empty.
         output = format_csv_row(
-            timestamp, op_name, event.pid, comm, dual_filename, 0, inode_val,
-            flags_val, "", "", "", "",   # offset, tid, mmap_prot, mmap_flags
-            "", cmdline,                 # address, cmdline
-            "", "", "", "",              # return_value, errno, bytes_completed, duration_ns
-            "", "", "", "",              # device, ppid, container_id, fs_type
-            getattr(event, "ts", 0)      # mono_ns
+            timestamp, op_name.lower(), event.pid, "", comm, dual_filename,
+            "", "", "", inode_val, "", flags_val,   # size,offset,bytes_completed,inode,device,flags
+            "", "", "",                              # duration_ns, return_value, errno
+            "", "", "", cmdline,                     # mmap_prot, mmap_flags, address, cmdline
+            "", "", "",                              # ppid, container_id, fs_type
+            getattr(event, "ts", 0)                  # mono_ns
         )
         self.writer.append_fs_log(output)
 
@@ -794,6 +796,11 @@ class IOTracer:
         sector = event.sector
         ops_str = event.op.decode('utf-8', errors='replace')
         ops_str = self.flag_mapper.format_block_ops(ops_str)
+        # Aligned schema (v3): the base op goes in ``operation`` and the rwbs
+        # sub-flags (sync|meta|ahead|...) move to the dedicated ``flags`` column.
+        _op_parts = ops_str.split("|")
+        op_base = _op_parts[0]
+        op_flags = "|".join(_op_parts[1:])
         latency_ns = event.latency_ns
         latency_ms = latency_ns / 1_000_000.0
         cpu_id = event.cpu_id
@@ -823,7 +830,7 @@ class IOTracer:
         # Monotonic per-request id (disambiguates repeated I/O to the same sector)
         req_id = event.req_id if hasattr(event, 'req_id') else ""
 
-        output = format_csv_row(timestamp, pid, comm, sector, ops_str, bio_size, latency_ms, tid, cpu_id, ppid, dev_str, queue_time_ms, cmd_flags_str, op_code_str, req_id, getattr(event, "ts", 0))
+        output = format_csv_row(timestamp, op_base, pid, tid, comm, sector, bio_size, latency_ms, dev_str, op_flags, cpu_id, ppid, queue_time_ms, cmd_flags_str, op_code_str, req_id, getattr(event, "ts", 0))
 
 
         if sector == 0 and bio_size == 0:
@@ -977,10 +984,11 @@ class IOTracer:
         cmdline = self._read_cmdline_cached(e.pid)
 
         output = format_csv_row(
-            ts, op_name, e.pid, comm, filename, size_val, e.inode,
-            flags_val, offset_val, tid_val, "", "", "", cmdline,
-            return_value, errno_val, bytes_completed, duration_ns,
-            dev_val, "", "", fs_type_val,
+            ts, op_name.lower(), e.pid, tid_val, comm, filename,
+            size_val, offset_val, bytes_completed, e.inode, dev_val, flags_val,
+            duration_ns, return_value, errno_val,
+            "", "", "", cmdline,            # mmap_prot, mmap_flags, address, cmdline
+            "", "", fs_type_val,            # ppid, container_id, fs_type
             getattr(e, "timestamp_ns", 0)   # mono_ns
         )
         self.writer.append_fs_log(output)

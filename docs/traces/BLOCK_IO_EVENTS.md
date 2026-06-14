@@ -4,6 +4,14 @@
 
 **Kernel Probes:** Attached via block layer instrumentation in the eBPF program.
 
+> **Schema v3 (cross-OS aligned).** The on-disk column order is the aligned
+> layout in [TRACE_FORMAT.md](../TRACE_FORMAT.md#2-block-device-traces)
+> (shared prefix `timestamp,operation,pid,tid,command,sector,size,latency_ms,device,flags`
+> then Linux extras). The `operation` column now holds the **base op only**
+> (`read`, `write`, `flush`, `discard`, …); the rwbs sub-flags (`sync`, `meta`,
+> `ahead`, …) that used to be pipe-appended to it now live in the dedicated
+> `flags` column.
+
 ## Data Captured
 
 | # | Field | Type | Description |
