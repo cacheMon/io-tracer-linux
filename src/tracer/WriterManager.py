@@ -610,68 +610,73 @@ class WriteManager:
         Renames the last part file to include '_complete_partsN' suffix
         indicating this is the final part and the total number of parts.
         """
-        if not self.fs_snapshot_session_active:
-            return
-        
-        total_parts = self.fs_snapshot_part_number - 1  # -1 because we increment after each flush
-        
-        if total_parts < 1:
-            # No parts were written
-            self.fs_snapshot_session_active = False
-            return
-        
-        # Find the last part file. It is normally compressed (.csv.zst), but
-        # when zstandard is unavailable it is left uncompressed (.csv); detect
-        # whichever actually exists so the completion rename stays correct.
-        last_part_str = f"{total_parts:04d}"
-        snapshot_dir = f"{self.output_dir}/filesystem_snapshot"
-        base_name = (
-            f"filesystem_snapshot_part{last_part_str}_"
-            f"{self.fs_snapshot_timestamp}_"
-            f"{self.fs_snapshot_device_id}"
-        )
-        suffix = ".csv.zst"
-        if (not os.path.exists(f"{snapshot_dir}/{base_name}{suffix}")
-                and os.path.exists(f"{snapshot_dir}/{base_name}.csv")):
-            suffix = ".csv"
-        old_filepath = f"{snapshot_dir}/{base_name}{suffix}"
+        # Hold the fs_snap stream lock for the whole operation: the parallel
+        # writer/flush threads compress and write parts under the same lock, so
+        # renaming the last part here without it could race with an in-flight
+        # write or compression.
+        with self._stream_locks['fs_snap']:
+            if not self.fs_snapshot_session_active:
+                return
 
-        # Construct new filename with completion marker
-        new_filepath = (
-            f"{snapshot_dir}/{base_name}_complete_parts{total_parts}{suffix}"
-        )
-        
-        # Rename the file (only if it still exists locally)
-        try:
-            if os.path.exists(old_filepath):
-                os.rename(old_filepath, new_filepath)
-                logger("info", f"Filesystem snapshot complete: {total_parts} parts written")
-                
-                # Update the pending upload list with the new filename
-                if self.automatic_upload and old_filepath in self.fs_snapshot_parts_pending_upload:
-                    self.fs_snapshot_parts_pending_upload.remove(old_filepath)
-                    self.fs_snapshot_parts_pending_upload.append(new_filepath)
-            else:
-                # File doesn't exist (may have been already processed)
-                logger("info", f"Filesystem snapshot complete: {total_parts} parts written")
-                
-            # Upload all parts now that snapshot is complete
-            if self.automatic_upload:
-                num_parts = len(self.fs_snapshot_parts_pending_upload)
-                if num_parts > 0:
-                    # Count each part individually to match upload counter
-                    self.created_files += num_parts
-                    logger('info', f"Files Created: {str(self.created_files)} (filesystem snapshot with {num_parts} parts)", True)
-                for part_file in self.fs_snapshot_parts_pending_upload:
-                    if os.path.exists(part_file):
-                        self.upload_manager.append_object(part_file)
-                self.fs_snapshot_parts_pending_upload.clear()
-                
-        except Exception as e:
-            logger("error", f"Failed to process final snapshot part: {e}")
-        
-        # Reset session
-        self.fs_snapshot_session_active = False
+            total_parts = self.fs_snapshot_part_number - 1  # -1 because we increment after each flush
+
+            if total_parts < 1:
+                # No parts were written
+                self.fs_snapshot_session_active = False
+                return
+
+            # Find the last part file. It is normally compressed (.csv.zst), but
+            # when zstandard is unavailable it is left uncompressed (.csv); detect
+            # whichever actually exists so the completion rename stays correct.
+            last_part_str = f"{total_parts:04d}"
+            snapshot_dir = f"{self.output_dir}/filesystem_snapshot"
+            base_name = (
+                f"filesystem_snapshot_part{last_part_str}_"
+                f"{self.fs_snapshot_timestamp}_"
+                f"{self.fs_snapshot_device_id}"
+            )
+            suffix = ".csv.zst"
+            if (not os.path.exists(f"{snapshot_dir}/{base_name}{suffix}")
+                    and os.path.exists(f"{snapshot_dir}/{base_name}.csv")):
+                suffix = ".csv"
+            old_filepath = f"{snapshot_dir}/{base_name}{suffix}"
+
+            # Construct new filename with completion marker
+            new_filepath = (
+                f"{snapshot_dir}/{base_name}_complete_parts{total_parts}{suffix}"
+            )
+
+            # Rename the file (only if it still exists locally)
+            try:
+                if os.path.exists(old_filepath):
+                    os.rename(old_filepath, new_filepath)
+                    logger("info", f"Filesystem snapshot complete: {total_parts} parts written")
+
+                    # Update the pending upload list with the new filename
+                    if self.automatic_upload and old_filepath in self.fs_snapshot_parts_pending_upload:
+                        self.fs_snapshot_parts_pending_upload.remove(old_filepath)
+                        self.fs_snapshot_parts_pending_upload.append(new_filepath)
+                else:
+                    # File doesn't exist (may have been already processed)
+                    logger("info", f"Filesystem snapshot complete: {total_parts} parts written")
+
+                # Upload all parts now that snapshot is complete
+                if self.automatic_upload:
+                    num_parts = len(self.fs_snapshot_parts_pending_upload)
+                    if num_parts > 0:
+                        # Count each part individually to match upload counter
+                        self.created_files += num_parts
+                        logger('info', f"Files Created: {str(self.created_files)} (filesystem snapshot with {num_parts} parts)", True)
+                    for part_file in self.fs_snapshot_parts_pending_upload:
+                        if os.path.exists(part_file):
+                            self.upload_manager.append_object(part_file)
+                    self.fs_snapshot_parts_pending_upload.clear()
+
+            except Exception as e:
+                logger("error", f"Failed to process final snapshot part: {e}")
+
+            # Reset session
+            self.fs_snapshot_session_active = False
 
     def start_process_snapshot_session(self):
         """Mark the beginning of a process snapshot session."""

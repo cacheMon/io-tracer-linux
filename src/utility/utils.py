@@ -198,8 +198,10 @@ ZSTD_LEVEL = 3
 
 # Set once we've reported a missing ``zstandard`` install, so the
 # uncompressed fallback is announced a single time rather than once per file
-# across a whole trace run.
+# across a whole trace run. Guarded by a lock because the writer's parallel
+# stream threads can reach this concurrently.
 _zstandard_missing_warned = False
+_zstandard_warn_lock = threading.Lock()
 
 
 def require_zstandard():
@@ -231,16 +233,20 @@ def zstandard_available():
     """
     global _zstandard_missing_warned
     try:
+        # Catch ImportError (not just ModuleNotFoundError) so a zstandard that
+        # is installed but fails to load — e.g. a broken C-extension or missing
+        # shared library — also falls back gracefully instead of crashing.
         import zstandard
-    except ModuleNotFoundError:
-        if not _zstandard_missing_warned:
-            _zstandard_missing_warned = True
-            logger(
-                "warning",
-                "The 'zstandard' library is not installed; trace files will be "
-                "kept uncompressed. Install it with 'pip install zstandard' "
-                "(or 'pip install -r requirements.txt') to enable compression.",
-            )
+    except ImportError:
+        with _zstandard_warn_lock:
+            if not _zstandard_missing_warned:
+                _zstandard_missing_warned = True
+                logger(
+                    "warning",
+                    "The 'zstandard' library is not installed; trace files will be "
+                    "kept uncompressed. Install it with 'pip install zstandard' "
+                    "(or 'pip install -r requirements.txt') to enable compression.",
+                )
         return None
     return zstandard
 
