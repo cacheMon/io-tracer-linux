@@ -34,10 +34,17 @@ Each subdirectory contains CSV files that are automatically compressed to `.csv.
 ### CSV Header
 
 ```csv
-timestamp,operation,pid,command,filename,size,inode,flags,offset,tid,mmap_prot,mmap_flags,address,cmdline,return_value,errno,bytes_completed,duration_ns,device,ppid,container_id,fs_type
+timestamp,operation,pid,tid,command,filename,size,offset,bytes_completed,inode,device,flags,duration_ns,return_value,errno,mmap_prot,mmap_flags,address,cmdline,ppid,container_id,fs_type,mono_ns
 ```
 
-`return_value`, `errno`, `bytes_completed`, and `duration_ns` are populated for `READ`/`WRITE`; `device`, `ppid`, `container_id`, and `fs_type` are populated for `READ`/`WRITE`/`OPEN`. All are empty for operations that do not carry them.
+**Schema v3 — cross-OS aligned.** Columns 1–12 (`timestamp` … `flags`) are the
+**shared prefix** emitted identically by the Windows tracer's `filesystem/`
+stream, so a single parser reads the comparable fields from either OS. The
+remaining columns are Linux-only extras. `operation` is now a **lowercase**
+canonical name (`read`, `write`, `open`, `close`, `fsync`, …). `size_requested`
+was renamed to `size`.
+
+`return_value`, `errno`, `bytes_completed`, and `duration_ns` are populated for `read`/`write`; `device`, `ppid`, `container_id`, and `fs_type` are populated for `read`/`write`/`open`. All are empty for operations that do not carry them.
 
 For operations captured and examples, see [VFS_EVENTS.md](traces/VFS_EVENTS.md).
 
@@ -52,8 +59,14 @@ For operations captured and examples, see [VFS_EVENTS.md](traces/VFS_EVENTS.md).
 ### CSV Header
 
 ```csv
-timestamp,pid,command,sector,operation,size,latency_ms,tid,cpu_id,ppid,dev,queue_time_ms,cmd_flags,op_code
+timestamp,operation,pid,tid,command,sector,size,latency_ms,device,flags,cpu_id,ppid,queue_latency_ms,command_flags,operation_code,request_id,mono_ns
 ```
+
+**Schema v3 — cross-OS aligned.** Columns 1–10 (`timestamp` … `flags`) are the
+**shared prefix** emitted identically by the Windows tracer's `ds/` stream. The
+`operation` column now holds the **base op only** (`read`, `write`, `flush`,
+`discard`, …); the rwbs sub-flags (`sync`, `meta`, `ahead`, …) that used to be
+appended to it (e.g. `write|sync`) now live in the dedicated `flags` column.
 
 For operations captured and examples, see [BLOCK_IO_EVENTS.md](traces/BLOCK_IO_EVENTS.md).
 

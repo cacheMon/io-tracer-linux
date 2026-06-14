@@ -18,6 +18,7 @@ adapt rather than assume a fixed layout.
 |---------|--------|
 | 1 | Headerless CSVs, no manifest, per-stream clocks. |
 | 2 | **CSV header row** on every file + this manifest + a common `mono_ns` (CLOCK_MONOTONIC) column appended to every stream. |
+| 3 | **Cross-OS aligned** `fs`/`ds` layout: a fixed shared column prefix (identical names/order to the Windows tracer), **lowercase** canonical operation names, `size_requested` renamed to `size`, and a dedicated block `flags` column (rwbs sub-flags split out of `operation`). |
 
 As of **schema_version 2**:
 

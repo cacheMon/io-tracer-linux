@@ -2,6 +2,12 @@
 
 **Description:** Captures file system operations at the VFS layer, intercepting all file access operations regardless of the underlying filesystem.
 
+> **Schema v3 (cross-OS aligned).** The on-disk column order is the aligned
+> layout in [TRACE_FORMAT.md](../TRACE_FORMAT.md#1-vfs-virtual-file-system-traces)
+> (shared prefix `timestamp,operation,pid,tid,command,filename,size,offset,bytes_completed,inode,device,flags`
+> then Linux extras). The `operation` value written to the CSV is the
+> **lowercase** form of the names in the table below (e.g. `READ` → `read`).
+
 **Kernel Probes Attached:**
 - `do_sys_openat2` (entry) — Captures the user-provided filename string before kernel resolution
 - `do_sys_openat2` (return) — Captures the allocated file descriptor after a successful open

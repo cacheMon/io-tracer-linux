@@ -17,7 +17,12 @@ it from ``manifest.json`` and adapt.
 
 # v1: original headerless CSVs, no manifest, per-stream clocks.
 # v2: CSV headers + manifest.json + a common ``mono_ns`` column on every stream.
-SCHEMA_VERSION = 2
+# v3: cross-OS aligned layout for ``fs`` and ``ds`` — a fixed shared column
+#     prefix (identical names/order to the Windows tracer) followed by the
+#     Linux-only extras, lowercase canonical operation names, ``size_requested``
+#     renamed to ``size``, and a dedicated block ``flags`` column (rwbs sub-flags
+#     split out of ``operation``).
+SCHEMA_VERSION = 3
 
 
 def _col(name, ctype, unit="", desc=""):
@@ -52,25 +57,27 @@ STREAMS = {
         "mirrored rows).",
         "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
         [
+            # --- shared cross-OS prefix (columns 1-12; identical on Windows) --- #
             _col("timestamp", "datetime", "", "Event wall-clock time (YYYY-MM-DD HH:MM:SS.ffffff)."),
-            _col("operation", "string", "", "VFS operation type (READ, WRITE, OPEN, ...)."),
+            _col("operation", "string", "", "Lowercase canonical op (read, write, open, close, fsync, ...)."),
             _col("pid", "u32"),
+            _col("tid", "u32"),
             _col("command", "string", "", "Process name (<=16 chars)."),
             _col("filename", "string", "", "File path; 'old -> new' for dual-path ops."),
-            _col("size_requested", "u64", "bytes", "Requested I/O size (count arg); 0 for non-I/O ops."),
-            _col("inode", "u64"),
-            _col("flags", "string", "", "Operation-specific flags; empty when none."),
+            _col("size", "u64", "bytes", "Requested I/O size (count arg); empty for non-I/O ops."),
             _col("offset", "u64", "bytes", "File offset for positioned I/O; empty if 0."),
-            _col("tid", "u32"),
+            _col("bytes_completed", "u64", "bytes", "Actual bytes moved by READ/WRITE; empty otherwise."),
+            _col("inode", "u64", "", "File inode; empty if 0 (Windows: always empty)."),
+            _col("device", "string", "", "Backing device major:minor for READ/WRITE/OPEN (Windows: empty)."),
+            _col("flags", "string", "", "Operation-specific flags; empty when none."),
+            # --- Linux-only extras (columns 13+) --- #
+            _col("duration_ns", "u64", "nanoseconds", "READ/WRITE entry->return duration; empty otherwise."),
+            _col("return_value", "s64", "", "Raw READ/WRITE return (bytes or -errno); empty otherwise."),
+            _col("errno", "string", "", "Error name when READ/WRITE failed; empty otherwise."),
             _col("mmap_prot", "string", "", "MMAP PROT_* flags; empty for non-MMAP."),
             _col("mmap_flags", "string", "", "MMAP MAP_* flags; empty for non-MMAP."),
             _col("address", "string", "", "Mapping address (hex) for MMAP/MUNMAP/MREMAP."),
             _col("cmdline", "string", "", "Full argv of the triggering process."),
-            _col("return_value", "s64", "", "Raw READ/WRITE return (bytes or -errno); empty otherwise."),
-            _col("errno", "string", "", "Error name when READ/WRITE failed; empty otherwise."),
-            _col("bytes_completed", "u64", "bytes", "Actual bytes moved by READ/WRITE; empty otherwise."),
-            _col("duration_ns", "u64", "nanoseconds", "READ/WRITE entry->return duration; empty otherwise."),
-            _col("device", "string", "", "Backing device major:minor for READ/WRITE/OPEN."),
             _col("ppid", "u32"),
             _col("container_id", "u64", "", "cgroup v2 id (container identifier)."),
             _col("fs_type", "string", "", "Source filesystem name from superblock magic."),
@@ -81,17 +88,20 @@ STREAMS = {
         "Block-device (disk) I/O completion events.",
         "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
         [
+            # --- shared cross-OS prefix (columns 1-10; identical on Windows) --- #
             _col("timestamp", "datetime", "", "Completion wall-clock time."),
+            _col("operation", "string", "", "Base block op (read, write, flush, discard, ...)."),
             _col("pid", "u32", "", "Submitting process ID."),
+            _col("tid", "u32"),
             _col("command", "string"),
-            _col("sector", "u64", "", "Starting sector (LBA)."),
-            _col("operation", "string", "", "Block op type (read, write, discard, ...)."),
+            _col("sector", "u64", "", "Starting sector (LBA, 512-byte units)."),
             _col("size", "u64", "bytes", "I/O size."),
             _col("latency_ms", "float", "milliseconds", "Device latency (issue->completion)."),
-            _col("tid", "u32"),
+            _col("device", "string", "", "Device major:minor (Windows: disk index)."),
+            _col("flags", "string", "", "rwbs sub-flags (sync|meta|ahead|...); empty when none."),
+            # --- Linux-only extras (columns 11+) --- #
             _col("cpu_id", "u32", "", "CPU that processed completion."),
             _col("ppid", "u32"),
-            _col("device", "string", "", "Device major:minor."),
             _col("queue_latency_ms", "float", "milliseconds", "Scheduler latency (insert->issue)."),
             _col("command_flags", "string", "", "REQ_* flags; empty on kernel >=5.17."),
             _col("operation_code", "string", "", "Raw REQ_OP_* name; empty on kernel >=5.17."),

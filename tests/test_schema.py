@@ -17,17 +17,34 @@ from src.tracer import schema
 # the number of fields each callback passes to format_csv_row.
 EXPECTED_COLUMN_COUNTS = {
     "fs": 23,                  # 22 documented + mono_ns
-    "ds": 16,                  # 15 documented + mono_ns
+    "ds": 17,                  # 16 documented (incl. aligned flags col) + mono_ns
     "cache": 11,               # 10 + mono_ns
     "pagefault": 11,           # 10 + mono_ns
     "process": 12,             # 11 + mono_ns
     "filesystem_snapshot": 7,  # 6 + mono_ns
 }
 
+# Cross-OS aligned shared column prefix (schema v3). These leading columns must
+# match the Windows tracer's fs/ds streams exactly and in the same order.
+ALIGNED_FS_PREFIX = [
+    "timestamp", "operation", "pid", "tid", "command", "filename",
+    "size", "offset", "bytes_completed", "inode", "device", "flags",
+]
+ALIGNED_DS_PREFIX = [
+    "timestamp", "operation", "pid", "tid", "command", "sector",
+    "size", "latency_ms", "device", "flags",
+]
+
 
 class SchemaShapeTests(unittest.TestCase):
-    def test_schema_version_is_2(self):
-        self.assertEqual(schema.SCHEMA_VERSION, 2)
+    def test_schema_version_is_3(self):
+        self.assertEqual(schema.SCHEMA_VERSION, 3)
+
+    def test_fs_ds_aligned_prefix(self):
+        self.assertEqual(schema.column_names("fs")[:len(ALIGNED_FS_PREFIX)],
+                         ALIGNED_FS_PREFIX)
+        self.assertEqual(schema.column_names("ds")[:len(ALIGNED_DS_PREFIX)],
+                         ALIGNED_DS_PREFIX)
 
     def test_all_streams_present(self):
         self.assertEqual(set(schema.STREAMS), set(EXPECTED_COLUMN_COUNTS))
@@ -69,7 +86,7 @@ class ManifestTests(unittest.TestCase):
         block = schema.schema_for_manifest()
         # Round-trips through JSON without error.
         restored = json.loads(json.dumps(block))
-        self.assertEqual(restored["schema_version"], 2)
+        self.assertEqual(restored["schema_version"], 3)
         self.assertEqual(set(restored["streams"]), set(EXPECTED_COLUMN_COUNTS))
 
     def test_manifest_columns_carry_type_and_unit(self):
