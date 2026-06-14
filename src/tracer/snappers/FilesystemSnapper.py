@@ -20,7 +20,6 @@ from ...utility.utils import format_csv_row, logger, compress_log, hash_rel_path
 from ..WriterManager import WriteManager
 from pathlib import Path
 from datetime import datetime
-import gzip
 import shutil
 import os
 import time

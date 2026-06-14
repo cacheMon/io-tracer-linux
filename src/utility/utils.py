@@ -28,8 +28,6 @@ import os
 import time
 import datetime
 import tarfile
-import gzip
-import shutil
 import hashlib
 import socket
 import struct
@@ -194,34 +192,58 @@ def logger(error_scale: str, string: str, timestamp: bool = False):
         logo += f" [{formatted_time}]" 
     print(logo + " " + string)
 
-def create_tar_gz(output_filename: str, files_to_archive: list[str]):
+# Zstandard compression level. 3 is the library default — a good
+# speed/ratio tradeoff for streaming large trace logs.
+ZSTD_LEVEL = 3
+
+
+def compress_file_zstd(src: str, dst: str, level: int = ZSTD_LEVEL):
     """
-    Create a gzipped tar archive from a list of files.
-    
+    Stream-compress a file to Zstandard.
+
     Args:
-        output_filename: Name of the output .tar.gz file
-        files_to_archive: List of file paths to include
+        src: Path to the source file
+        dst: Path to write the compressed (.zst) output
+        level: Zstandard compression level
+
+    zstandard is imported lazily so environments that never compress (and the
+    pure-Python unit tests) don't require the dependency at import time.
     """
-    with tarfile.open(output_filename, "w:gz") as tar:
-        for file_path in files_to_archive:
-            tar.add(file_path, arcname=os.path.basename(file_path))
-    logger("info", f"Created tar.gz archive: {output_filename}")
+    import zstandard
+    cctx = zstandard.ZstdCompressor(level=level)
+    with open(src, "rb") as f_in, open(dst, "wb") as f_out:
+        cctx.copy_stream(f_in, f_out)
+
+
+def create_tar_zst(output_filename: str, files_to_archive: list[str], level: int = ZSTD_LEVEL):
+    """
+    Create a Zstandard-compressed tar archive from a list of files.
+
+    Args:
+        output_filename: Name of the output .tar.zst file
+        files_to_archive: List of file paths to include
+        level: Zstandard compression level
+    """
+    import zstandard
+    cctx = zstandard.ZstdCompressor(level=level)
+    with open(output_filename, "wb") as f_out:
+        with cctx.stream_writer(f_out) as compressor:
+            with tarfile.open(mode="w|", fileobj=compressor) as tar:
+                for file_path in files_to_archive:
+                    tar.add(file_path, arcname=os.path.basename(file_path))
+    logger("info", f"Created tar.zst archive: {output_filename}")
+
 
 def compress_log(input_file: str):
     """
-    Compress a log file using gzip.
-    
+    Compress a log file using Zstandard.
+
     Args:
         input_file: Path to the file to compress
-        
-    Creates input_file.gz and removes the original.
-    """
-    src = input_file
-    dst = input_file + ".gz"
-    with open(src, "rb") as f_in:
-        with gzip.open(dst, "wb") as f_out:
-            shutil.copyfileobj(f_in, f_out) # type: ignore
 
+    Creates input_file.zst and removes the original.
+    """
+    compress_file_zstd(input_file, input_file + ".zst")
     os.remove(input_file)
 
 def capture_machine_id() -> str:

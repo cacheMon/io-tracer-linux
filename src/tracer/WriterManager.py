@@ -5,7 +5,7 @@ This module provides the WriteManager class which handles:
 - Creating output directory structure
 - Buffering trace events for different subsystems
 - Writing events to CSV files
-- Compressing output files with gzip
+- Compressing output files with Zstandard (.zst)
 - Optionally uploading files to cloud storage
 
 The manager uses adaptive buffering to handle high event rates and
@@ -29,10 +29,12 @@ from datetime import datetime
 import tarfile
 
 from .ObjectStorageManager import ObjectStorageManager
-from ..utility.utils import logger, create_tar_gz, capture_machine_id, compress_log
+from ..utility.utils import (
+    logger, create_tar_zst, capture_machine_id, compress_log,
+    compress_file_zstd, ZSTD_LEVEL,
+)
 import threading
 from collections import deque
-import gzip
 import shutil
 import time
 
@@ -501,7 +503,7 @@ class WriteManager:
         Flush filesystem snapshot buffer to a multi-part file.
 
         Writes buffer to filesystem_snapshot_part####_TIMESTAMP_DEVICEID.csv,
-        compresses it with gzip, and increments the part counter.
+        compresses it with Zstandard, and increments the part counter.
         """
         with self._stream_locks['fs_snap']:
             if not self.fs_snap_buffer:
@@ -533,15 +535,13 @@ class WriteManager:
             self._fs_snap_handle.close()
             self._fs_snap_handle = None
 
-            # Compress with gzip
+            # Compress with Zstandard
             if os.path.exists(part_filepath):
                 # Don't log or count each part - we'll log when snapshot is complete
-                with open(part_filepath, "rb") as f_in:
-                    with gzip.open(part_filepath + ".gz", "wb") as f_out:
-                        shutil.copyfileobj(f_in, f_out)
+                compress_file_zstd(part_filepath, part_filepath + ".zst")
 
                 os.remove(part_filepath)
-                compressed_file = part_filepath + ".gz"
+                compressed_file = part_filepath + ".zst"
 
                 # Store for later upload (after snapshot completion and final part rename)
                 if self.automatic_upload:
@@ -593,7 +593,7 @@ class WriteManager:
         old_filename = (
             f"filesystem_snapshot_part{last_part_str}_"
             f"{self.fs_snapshot_timestamp}_"
-            f"{self.fs_snapshot_device_id}.csv.gz"
+            f"{self.fs_snapshot_device_id}.csv.zst"
         )
         old_filepath = f"{self.output_dir}/filesystem_snapshot/{old_filename}"
         
@@ -601,7 +601,7 @@ class WriteManager:
         new_filename = (
             f"filesystem_snapshot_part{last_part_str}_"
             f"{self.fs_snapshot_timestamp}_"
-            f"{self.fs_snapshot_device_id}_complete_parts{total_parts}.csv.gz"
+            f"{self.fs_snapshot_device_id}_complete_parts{total_parts}.csv.zst"
         )
         new_filepath = f"{self.output_dir}/filesystem_snapshot/{new_filename}"
         
@@ -922,22 +922,20 @@ class WriteManager:
 
     def compress_log(self, input_file: str):
         """
-        Compress a log file with gzip and optionally upload.
-        
+        Compress a log file with Zstandard and optionally upload.
+
         Args:
             input_file: Path to the file to compress
         """
         try:
             src = input_file
-            dst = input_file + ".gz"
-            
+            dst = input_file + ".zst"
+
             # Check if file exists (may already be compressed for multi-part files)
             if not os.path.exists(src):
                 return
-            
-            with open(src, "rb") as f_in:
-                with gzip.open(dst, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out) # type: ignore
+
+            compress_file_zstd(src, dst)
 
             if self.automatic_upload:
                 self.created_files += 1
@@ -951,17 +949,21 @@ class WriteManager:
             
     def compress_dir(self, input_dir: str):
         """
-        Compress a directory to tar.gz and optionally upload.
-        
+        Compress a directory to tar.zst and optionally upload.
+
         Args:
             input_dir: Path to the directory to compress
         """
         try:
+            import zstandard
             src = input_dir
-            dst = input_dir.rstrip("/").rstrip("\\") + ".tar.gz"
+            dst = input_dir.rstrip("/").rstrip("\\") + ".tar.zst"
 
-            with tarfile.open(dst, "w:gz") as tar:
-                tar.add(src, arcname=os.path.basename(src))
+            cctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL)
+            with open(dst, "wb") as f_out:
+                with cctx.stream_writer(f_out) as compressor:
+                    with tarfile.open(mode="w|", fileobj=compressor) as tar:
+                        tar.add(src, arcname=os.path.basename(src))
 
             if self.automatic_upload:
                 self.created_files += 1

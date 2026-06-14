@@ -13,7 +13,7 @@ with automatic upload using a background thread and queue system.
 Example:
     manager = ObjectStorageManager(version="vRelease")
     manager.test_connection()  # Check if server is reachable
-    manager.put_object("/path/to/trace.tar.gz")  # Upload a file
+    manager.put_object("/path/to/trace.tar.zst")  # Upload a file
 """
 
 import mimetypes
