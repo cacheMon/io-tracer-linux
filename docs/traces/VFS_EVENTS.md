@@ -22,7 +22,7 @@
 - `vfs_fallocate` — File space pre-allocation operations
 - `do_sendfile` / `__do_sendfile` — Efficient file-to-file transfer operations
 
-> **io_uring-origin rows:** `READ`/`WRITE` operations issued via io_uring bypass `vfs_read`/`vfs_write` (they call `->read_iter`/`->write_iter` directly), so they are mirrored into this trace from the io_uring instrumentation rather than captured by a VFS probe. They use the same schema; their `flags` column carries io_uring SQE flags (`FIXED_FILE|ASYNC|…`) instead of `O_*` flags, and `ppid`/`container_id` are empty. See [IO_URING_EVENTS.md](IO_URING_EVENTS.md#mirroring-into-the-fsvfs-trace). Each such row also has a full-detail counterpart in the io_uring CSV.
+> **io_uring-origin rows:** `READ`/`WRITE` operations issued via io_uring bypass `vfs_read`/`vfs_write` (they call `->read_iter`/`->write_iter` directly), so they are mirrored into this trace from the io_uring instrumentation rather than captured by a VFS probe. They use the same schema; their `flags` column carries io_uring SQE flags (`FIXED_FILE|ASYNC|…`) instead of `O_*` flags, and `ppid`/`container_id` are empty. See [IO_URING_EVENTS.md](IO_URING_EVENTS.md#mirroring-into-the-fsvfs-trace). There is no separate io_uring output stream; the fs mirror is the only place these rows appear.
 
 ## Filename Resolution
 
@@ -456,4 +456,4 @@ In some cases, the filename field may be empty. This occurs when the kernel data
 - Check the inode field — if it's non-zero, the file exists but the path couldn't be resolved
 - Correlate with the operation type and process command to determine if the empty filename is expected
 
-**Output File:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/fs/fs_*.csv.gz`
+**Output File:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/fs/fs_*.csv.zst`

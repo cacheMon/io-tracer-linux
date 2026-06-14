@@ -2,7 +2,7 @@
 
 **Description:** Captures hardware and software specifications for trace context.
 
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/system_spec/`
+**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/system_spec/`
 
 **Collection Method:**
 - Queries system information once at trace start

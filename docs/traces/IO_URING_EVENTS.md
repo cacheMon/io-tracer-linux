@@ -2,6 +2,13 @@
 
 **Description:** Captures io_uring asynchronous I/O operations including syscall entry, SQE submissions, completions with latency, and async worker executions.
 
+> **No dedicated output stream.** The standalone `io_uring/` trace stream has been
+> removed. io_uring file READ/WRITE I/O is surfaced **only** by mirroring it into
+> the `fs/` (VFS) trace (see [Mirroring into the fs/VFS trace](#mirroring-into-the-fsvfs-trace)).
+> The probes and fields documented below are still attached/captured in the BPF
+> program, but the non-mirrored fields (ring pointers, worker info, queue depths,
+> etc.) are not currently written to any output file.
+
 **Kernel Probes Attached:**
 - `__io_uring_enter` / `__sys_io_uring_enter` — io_uring_enter syscall
 - `io_prep_rw` (or per-op `io_prep_read{,v,_fixed}` / `io_prep_write{,v,_fixed}`) — SQE field capture
@@ -24,6 +31,10 @@ If the prep symbol is unavailable on a given kernel, the SUBMIT probe falls back
 > **Note:** This captures SQE fields for the read/write opcode families (the bulk of filesystem I/O). Other opcodes (e.g. `OPENAT`, `STATX`) are not prepped through `io_prep_rw`, so their `opcode`/`fd`/`len`/`offset` columns may be empty.
 
 ## Data Captured
+
+The table below lists the fields the BPF program collects internally for each
+io_uring event. Only READ/WRITE events are emitted (mirrored into the `fs/` trace);
+the remaining fields are not written to a standalone CSV.
 
 | # | Field | Type | Description |
 |---|-------|------|-------------|
@@ -162,13 +173,13 @@ latency_ns = complete_ts_ns - submit_ts_ns
 
 ## Mirroring into the fs/VFS trace
 
-io_uring read/write operations call `->read_iter`/`->write_iter` directly and **never pass through `vfs_read`/`vfs_write`**, so they are invisible to the VFS probes. To make async I/O visible alongside syscall I/O, each completed io_uring read/write is also emitted into the main **fs/VFS trace** (`fs/fs_*.csv`) using the standard VFS 22-column schema:
+io_uring read/write operations call `->read_iter`/`->write_iter` directly and **never pass through `vfs_read`/`vfs_write`**, so they are invisible to the VFS probes. To make async I/O visible alongside syscall I/O, each completed io_uring read/write is also emitted into the main **fs/VFS trace** (`fs/fs_*.csv.zst`) using the standard VFS schema:
 
 - **Mirrored opcodes:** `READV`, `READ_FIXED`, `READ` → `READ`; `WRITEV`, `WRITE_FIXED`, `WRITE` → `WRITE`.
 - **Trigger:** COMPLETE events only (so `bytes_completed`/`duration_ns` are known), and only when a backing inode was resolved.
 - **Columns:** filename/inode/device/fs_type come from the prep-time file capture; `size` is the SQE length, `bytes_completed`/`errno` from the CQE result, `duration_ns` from the submit→complete latency. The generic `flags` column carries the decoded **SQE flags** (`FIXED_FILE|ASYNC|IO_LINK…`) in place of the open-file `O_*` flags, which are not available on the io_uring path.
 
-`fsync` is intentionally **not** mirrored: io_uring `FSYNC` calls `vfs_fsync` internally and is therefore already captured by the VFS fsync probe — mirroring it would double-count. The full async-specific detail (req_ptr, user_data, worker, queue depths) always remains in the dedicated io_uring CSV.
+`fsync` is intentionally **not** mirrored: io_uring `FSYNC` calls `vfs_fsync` internally and is therefore already captured by the VFS fsync probe — mirroring it would double-count. The full async-specific detail (req_ptr, user_data, worker, queue depths) is captured internally but, with the dedicated io_uring stream removed, is not currently written to any output file.
 
 ## Analysis Use Cases
 
@@ -204,4 +215,4 @@ The io_uring tracepoint probes (`io_uring:io_uring_submit_sqe`, `io_uring:io_uri
 
 2. If the format includes `req`, `opcode`, `user_data`, and `flags` fields, change `#if 0` to `#if 1` around line 4218 in `prober.c`.
 
-**Output File:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/io_uring/io_uring_*.csv`
+**Output File:** none — io_uring READ/WRITE I/O is mirrored into the fs/VFS trace at `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/fs/fs_*.csv.zst`. There is no standalone `io_uring/` stream.

@@ -38,26 +38,26 @@ Files on virtual/pseudo filesystems are automatically excluded by skipping diffe
 
 ## Anonymous Mode
 
-When `--anonymous` is enabled, file paths are hashed using a deterministic hash function (12-character hash). Directory structure is preserved but individual path components are replaced with hashes. File extensions are kept for analysis purposes.
+When anonymization is enabled (`-a`/`--anonimize`), file paths are hashed using a deterministic hash function (12-character hash). Directory structure is preserved but individual path components are replaced with hashes. File extensions are kept for analysis purposes.
 
-**Output File:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/filesystem_snapshot/filesystem_snapshot_part####_TIMESTAMP_DEVICEID*.csv.gz`
+**Output File:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/filesystem_snapshot/filesystem_snapshot_part####_TIMESTAMP_DEVICEID*.csv.zst`
 
 ## Multi-Part Files
 
 To optimize memory usage during large filesystem scans, snapshots are automatically split into multiple compressed parts:
 
-**File Naming:** `filesystem_snapshot_part####_TIMESTAMP_DEVICEID.csv.gz`
+**File Naming:** `filesystem_snapshot_part####_TIMESTAMP_DEVICEID.csv.zst`
 
 - Part numbers are zero-padded (e.g., `part0001`, `part0002`, ...)
-- Each part is compressed with gzip immediately after writing
+- Each part is compressed with Zstandard immediately after writing
 - TIMESTAMP format: `YYYYMMDD_HHMMSS`
 - DEVICEID: Uppercase machine identifier
 
 **Completion Marker:** The final part is renamed to indicate completion:
 
-- Format: `filesystem_snapshot_part####_TIMESTAMP_DEVICEID_complete_partsN.csv.gz`
+- Format: `filesystem_snapshot_part####_TIMESTAMP_DEVICEID_complete_partsN.csv.zst`
 - The `_complete_partsN` suffix indicates this is the last part, where N is the total number of parts
-- Example: `filesystem_snapshot_part0003_20260214_120000_ABC123_complete_parts3.csv.gz` means 3 parts total and this is the final one
+- Example: `filesystem_snapshot_part0003_20260214_120000_ABC123_complete_parts3.csv.zst` means 3 parts total and this is the final one
 
 **Reading Multi-Part Snapshots:**
 1. Locate all parts with matching TIMESTAMP and DEVICEID

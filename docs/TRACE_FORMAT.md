@@ -2,17 +2,21 @@
 
 This document describes the CSV output format for all trace types produced by io-tracer-linux.
 
+The on-disk schema is defined once, in [`src/tracer/schema.py`](../src/tracer/schema.py),
+which is the single source of truth. The CSV header rows written by `WriteManager`
+and the per-session `manifest.json` are both derived from it, so the column lists
+below mirror that module. Bump `SCHEMA_VERSION` there whenever columns change.
+
 ## Output Structure
 
 Traces are uploaded to object storage with the following prefix structure:
 
 ```
-linux_trace_v3_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
+linux_trace_v4_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── fs/                    # VFS (Virtual File System) traces
 ├── ds/                    # Block device traces
 ├── cache/                 # Page cache events
 ├── pagefault/             # Memory-mapped page fault events
-├── io_uring/              # io_uring async I/O events
 ├── process/               # Process state snapshots
 ├── filesystem_snapshot/   # Filesystem metadata snapshots
 └── system_spec/           # System specification files
@@ -21,20 +25,39 @@ linux_trace_v3_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 - `{MACHINE_ID}`: Uppercase machine identifier
 - `{YYYYMMDD_HHMMSS_mmm}`: Timestamp with millisecond precision
 
-Each subdirectory contains CSV files that are automatically compressed to `.csv.gz` format.
+A self-describing `manifest.json` is also produced for each session (see below).
+
+Each subdirectory contains CSV files that are automatically compressed to `.csv.zst`
+(Zstandard) format. Every CSV begins with a header row, and every stream carries a
+trailing `mono_ns` column (`CLOCK_MONOTONIC` nanoseconds) — the common clock for
+correlating records across streams.
+
+> **io_uring:** there is no separate `io_uring/` output stream. io_uring read/write
+> I/O bypasses the VFS probes, so it is mirrored into the `fs/` (VFS) trace instead.
+> See [IO_URING_EVENTS.md](traces/IO_URING_EVENTS.md).
+
+### manifest.json
+
+A `manifest.json` is written once per session at the session-directory root. It embeds
+`schema_version`, the full column list (name, type, unit, description) for every stream,
+and runtime diagnostics (per-stream row counts, the `CLOCK_MONOTONIC`→`CLOCK_REALTIME`
+offset used to derive wall-clock timestamps, etc.). It is delivered inside the session's
+compressed archive (a `.tar.zst` of the session directory) rather than as a standalone
+object under the prefix. Consumers should read the schema from `manifest.json` rather
+than hard-coding column positions.
 
 ---
 
 ## 1. VFS (Virtual File System) Traces
 
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/fs/fs_*.csv.gz`
+**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/fs/fs_*.csv.zst`
 
-**Description:** Captures all file system operations at the VFS layer, including reads, writes, opens, closes, and metadata operations.
+**Description:** Captures all file system operations at the VFS layer, including reads, writes, opens, closes, and metadata operations. Also receives io_uring READ/WRITE rows mirrored from the io_uring instrumentation.
 
 ### CSV Header
 
 ```csv
-timestamp,operation,pid,command,filename,size,inode,flags,offset,tid,mmap_prot,mmap_flags,address,cmdline,return_value,errno,bytes_completed,duration_ns,device,ppid,container_id,fs_type
+timestamp,operation,pid,command,filename,size_requested,inode,flags,offset,tid,mmap_prot,mmap_flags,address,cmdline,return_value,errno,bytes_completed,duration_ns,device,ppid,container_id,fs_type,mono_ns
 ```
 
 `return_value`, `errno`, `bytes_completed`, and `duration_ns` are populated for `READ`/`WRITE`; `device`, `ppid`, `container_id`, and `fs_type` are populated for `READ`/`WRITE`/`OPEN`. All are empty for operations that do not carry them.
@@ -45,30 +68,30 @@ For operations captured and examples, see [VFS_EVENTS.md](traces/VFS_EVENTS.md).
 
 ## 2. Block Device Traces
 
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/ds/ds_*.csv.gz`
+**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/ds/ds_*.csv.zst`
 
 **Description:** Captures block layer I/O operations with latency measurements from issue to completion.
 
 ### CSV Header
 
 ```csv
-timestamp,pid,command,sector,operation,size,latency_ms,tid,cpu_id,ppid,dev,queue_time_ms,cmd_flags,op_code
+timestamp,pid,command,sector,operation,size,latency_ms,tid,cpu_id,ppid,device,queue_latency_ms,command_flags,operation_code,request_id,mono_ns
 ```
 
-For operations captured and examples, see [BLOCK_IO_EVENTS.md](traces/BLOCK_IO_EVENTS.md).
+`command_flags` and `operation_code` are empty on kernel ≥ 5.17. For operations captured and examples, see [BLOCK_IO_EVENTS.md](traces/BLOCK_IO_EVENTS.md).
 
 ---
 
 ## 3. Cache Events
 
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/cache/cache_*.csv.gz`
+**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/cache/cache_*.csv.zst`
 
 **Description:** Captures page cache operations including hits, misses, dirty pages, writeback, and evictions.
 
 ### CSV Header
 
 ```csv
-timestamp,pid,command,event_type,inode,index,size,cpu_id,dev_id,count
+timestamp,pid,command,event_type,inode,page_index,size_pages,cpu_id,device_id,count,mono_ns
 ```
 
 For event types and examples, see [PAGE_CACHE_EVENTS.md](traces/PAGE_CACHE_EVENTS.md).
@@ -77,65 +100,55 @@ For event types and examples, see [PAGE_CACHE_EVENTS.md](traces/PAGE_CACHE_EVENT
 
 ## 4. Page Fault Events
 
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/pagefault/pagefault_*.csv.gz`
+**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/pagefault/pagefault_*.csv.zst`
 
 **Description:** Captures file-backed page faults from memory-mapped I/O operations. Tracks which memory accesses trigger disk reads (major faults) vs cache hits (minor faults).
 
 ### CSV Header
 
 ```csv
-timestamp,pid,tid,command,fault_type,severity,inode,offset,address,dev_id
+timestamp,pid,tid,command,fault_type,severity,inode,offset_pages,address,device_id,mono_ns
 ```
 
 For fault types and examples, see [PAGE_FAULT_EVENTS.md](traces/PAGE_FAULT_EVENTS.md).
 
 ---
 
-## 5. io_uring Events
+## 5. Process Snapshots
 
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/io_uring/io_uring_*.csv.gz`
-
-**Description:** Captures io_uring async I/O events for high-performance applications.
-
-For CSV format and examples, see [IO_URING_EVENTS.md](traces/IO_URING_EVENTS.md).
-
----
-
-## 6. Process Snapshots
-
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/process/process_*.csv.gz`
+**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/process/process_*.csv.zst`
 
 **Description:** Periodic snapshots of all running processes (captured every 5 minutes by default).
 
 ### CSV Header
 
 ```csv
-timestamp,pid,name,cmdline,virtual_mem_kb,rss_kb,create_time,cpu_5s,cpu_2m,cpu_1h,status
+timestamp,pid,name,cmdline,vms_kb,rss_kb,creation_time,cpu_5s,cpu_2m,cpu_1h,status,mono_ns
 ```
 
 For field details and examples, see [PROCESS_SNAPSHOT.md](traces/PROCESS_SNAPSHOT.md).
 
 ---
 
-## 7. Filesystem Snapshots
+## 6. Filesystem Snapshots
 
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/filesystem_snapshot/filesystem_snapshot_*.csv.gz`
+**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/filesystem_snapshot/filesystem_snapshot_*.csv.zst`
 
-**Description:** Periodic directory tree snapshots showing file metadata (captured hourly by default).
+**Description:** Periodic directory tree snapshots showing file metadata (captured hourly by default). Large scans are split into multiple parts — see [MULTIPART_FILESYSTEM_SNAPSHOT.md](MULTIPART_FILESYSTEM_SNAPSHOT.md).
 
 ### CSV Header
 
 ```csv
-snapshot_timestamp,path,size,ctime,mtime,atime
+snapshot_timestamp,file_path,size,creation_time,modification_time,access_time,mono_ns
 ```
 
 For field details and examples, see [FILESYSTEM_SNAPSHOT.md](traces/FILESYSTEM_SNAPSHOT.md).
 
 ---
 
-## 8. System Specification Files
+## 7. System Specification Files
 
-**Location:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/system_spec/`
+**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/system_spec/`
 
 These are JSON files capturing system hardware and configuration at trace start:
 
@@ -152,9 +165,9 @@ For field details, see [SYSTEM_SNAPSHOT.md](traces/SYSTEM_SNAPSHOT.md).
 ## Data Types and Conventions
 
 ### Timestamps
-- Format: `YYYY-MM-DD HH:MM:SS.ffffff` (microsecond precision)
-- Timezone: Local system time
-- Source: `datetime.datetime.today()` (Python) or `bpf_ktime_get_ns()` (eBPF)
+- `timestamp` column format: `YYYY-MM-DD HH:MM:SS.ffffff` (microsecond precision)
+- Timezone: Local system time (`CLOCK_REALTIME`, derived from the kernel's `CLOCK_MONOTONIC` for perf-event streams)
+- `mono_ns` column: raw `CLOCK_MONOTONIC` nanoseconds — `bpf_ktime_get_ns()` for perf-event streams, `time.monotonic_ns()` for userspace snapshots. This is the common cross-stream correlation clock.
 
 ### File Paths
 - Always absolute paths when available
@@ -172,7 +185,7 @@ For field details, see [SYSTEM_SNAPSHOT.md](traces/SYSTEM_SNAPSHOT.md).
 - All sizes in bytes unless specified
 - Sector count: 512-byte sectors (multiply by 512 for bytes)
 - Page size: 4096 bytes (4 KiB)
-- Cache index × 4096 = byte offset
+- Cache `page_index` × 4096 = byte offset
 
 ### Special Values
 - `0` - Not applicable or unavailable
@@ -184,19 +197,20 @@ For field details, see [SYSTEM_SNAPSHOT.md](traces/SYSTEM_SNAPSHOT.md).
 ## Compression and File Rotation
 
 ### Compression
-- All CSV files are automatically compressed with gzip
+- All CSV files are automatically compressed with Zstandard
 - Original `.csv` files are deleted after compression
-- Final archives: `.csv.gz` format
+- Final archives: `.csv.zst` format
 
 ### File Rotation
-Files are rotated and compressed when buffers reach thresholds:
-- **VFS traces:** Every 1000 events
-- **Block traces:** Every 1000 events  
-- **Cache traces:** Every 10000 events (before sampling)
-- **Network traces:** Every 1000 events
-- **Snapshots:** Each snapshot creates a new file
+Continuous streams (VFS, block, cache, page fault) are rotated and compressed when any
+of the following is reached (see `WriteManager` in `src/tracer/WriterManager.py`):
+- **Event count:** ~80,000–100,000 buffered events (adaptively raised under load)
+- **File age:** 20 minutes since the current file was opened
+- **File size:** 100 MB uncompressed on disk
 
-File naming: `{type}_{YYYYMMDD_HHMMSS_mmm}.csv.gz`
+Snapshots (process, filesystem) are written as whole units rather than rotated mid-session.
+
+File naming: `{type}_{YYYYMMDD_HHMMSS_mmm}_{seq}.csv.zst`
 
 ---
 
@@ -205,41 +219,42 @@ File naming: `{type}_{YYYYMMDD_HHMMSS_mmm}.csv.gz`
 ### Command Line
 ```bash
 # View compressed file
-zcat fs_*.csv.gz | less
+zstd -dc fs_*.csv.zst | less
 
 # Parse with csvkit
-zcat fs_*.csv.gz | csvstat
+zstd -dc fs_*.csv.zst | csvstat
 
 # Count events
-zcat fs_*.csv.gz | wc -l
+zstd -dc fs_*.csv.zst | wc -l
 
 # Filter specific operation
-zcat fs_*.csv.gz | grep ",WRITE,"
+zstd -dc fs_*.csv.zst | grep ",WRITE,"
 ```
 
 ### Python
 ```python
-import gzip
 import csv
+import io
+import zstandard
 
-with gzip.open('fs_20240115_103045_123.csv.gz', 'rt') as f:
-    reader = csv.reader(f)
+with open('fs_20240115_103045_123_0001.csv.zst', 'rb') as fh:
+    text = io.TextIOWrapper(zstandard.ZstdDecompressor().stream_reader(fh), encoding='utf-8')
+    reader = csv.DictReader(text)  # first row is the schema header
     for row in reader:
-        timestamp, operation, pid, command, filename, size, inode, flags, latency = row
-        print(f"{timestamp}: {operation} on {filename} by {command} ({pid})")
+        print(f"{row['timestamp']}: {row['operation']} on {row['filename']} by {row['command']} ({row['pid']})")
 ```
 
 ### Pandas
 ```python
-import pandas as pd
 import glob
+import pandas as pd
 
-# Single file
-df = pd.read_csv('fs_20240115_103045_123.csv.gz', compression='gzip')
+# pandas reads .zst natively when the `zstandard` package is installed
+df = pd.read_csv('fs_20240115_103045_123_0001.csv.zst')
 
 # Multiple files in a directory
-files = glob.glob('*.csv.gz')
-df = pd.concat([pd.read_csv(f, compression='gzip') for f in files])
+files = glob.glob('*.csv.zst')
+df = pd.concat([pd.read_csv(f) for f in files])
 ```
 
 ---
@@ -251,31 +266,17 @@ Expected event rates (highly workload-dependent):
 - **VFS:** 1-100K events/sec
 - **Block:** 100-10K events/sec
 - **Cache:** 10K-1M events/sec (before sampling)
-- **Network:** 100-100K events/sec
-
-### Sampling
-Cache events support sampling to reduce overhead:
-```bash
-python3 iotrc.py --cache-sample-rate 10
-```
 
 ### Lost Events
-If kernel buffers overflow, events may be lost. Monitor logs for:
-```
-[WARN] Lost N events in kernel buffer
-```
-
-Increase buffer size to reduce losses:
-```bash
-python3 iotrc.py --page-cnt 128  # Default: 64
-```
+If kernel buffers overflow, events may be lost. Monitor logs for warnings about lost
+events in the kernel buffer.
 
 ---
 
 ## Version Information
 
 This documentation applies to:
-- **io-tracer-linux** version 1.0+
+- **Trace schema:** version 2 (`SCHEMA_VERSION` in `src/tracer/schema.py`)
 - **Kernel:** Linux 5.4+
 - **BCC:** 0.18.0+
 
