@@ -229,5 +229,57 @@ class StaleLogRotationTests(unittest.TestCase):
         self.assertNotIn("fs_snap", self.wm._streams)
 
 
+class MultiPartSnapshotHeaderTests(unittest.TestCase):
+    """Multi-part filesystem snapshots are concatenated back into one CSV, so
+    only the first part may carry the schema header — a header on parts 2+ would
+    land mid-table as a bogus data row."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.output_dir = os.path.join(self.tmp, "trace")
+        self.upload = FakeUploadManager()
+        self.wm = SilentWriteManager(
+            output_dir=self.output_dir,
+            upload_manager=self.upload,
+            automatic_upload=False,
+        )
+
+    def tearDown(self):
+        import shutil
+        try:
+            self.wm.close_handles()
+        except Exception:
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
+    def test_only_first_part_has_header(self):
+        import glob
+        from src.tracer import schema
+
+        header = schema.header_line("filesystem_snapshot")
+
+        # Part 1
+        self.wm.fs_snap_buffer.append("rowA,1")
+        self.wm.flush_fssnap_only()
+        # Part 2
+        self.wm.fs_snap_buffer.append("rowB,2")
+        self.wm.flush_fssnap_only()
+
+        parts = sorted(
+            glob.glob(os.path.join(self.output_dir, "filesystem_snapshot", "*.zst"))
+        )
+        self.assertEqual(len(parts), 2)
+
+        first = _zstd_read_text(parts[0]).splitlines()
+        second = _zstd_read_text(parts[1]).splitlines()
+
+        self.assertEqual(first[0], header)
+        self.assertIn("rowA,1", first)
+        # Part 2 must NOT repeat the header; concatenation would corrupt the CSV.
+        self.assertNotIn(header, second)
+        self.assertEqual(second[0], "rowB,2")
+
+
 if __name__ == "__main__":
     unittest.main()
