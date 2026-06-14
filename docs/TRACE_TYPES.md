@@ -15,9 +15,9 @@ IO Tracer uses eBPF/BPF technology to intercept kernel functions and collect var
 
 | # | Snapshot Type | Description | Output |
 |---|--------------|-------------|--------|
-| 1 | [Filesystem Snapshot](traces/FILESYSTEM_SNAPSHOT.md) | Filesystem state (paths, sizes, timestamps) | `filesystem_snap.csv.gz` |
-| 2 | [Process Snapshot](traces/PROCESS_SNAPSHOT.md) | Running process information | `process_snap.csv` |
-| 3 | [System Snapshot](traces/SYSTEM_SNAPSHOT.md) | Hardware and software specifications | `device_spec.txt` |
+| 1 | [Filesystem Snapshot](traces/FILESYSTEM_SNAPSHOT.md) | Filesystem state (paths, sizes, timestamps) | `filesystem_snapshot/*.csv.zst` |
+| 2 | [Process Snapshot](traces/PROCESS_SNAPSHOT.md) | Running process information | `process/*.csv.zst` |
+| 3 | [System Snapshot](traces/SYSTEM_SNAPSHOT.md) | Hardware and software specifications | `system_spec/*.json` |
 
 ## Architecture Overview
 
@@ -52,13 +52,13 @@ IO Tracer uses eBPF/BPF technology to intercept kernel functions and collect var
 │           │                                                    │
 │  ┌────────▼────────┐                                           │
 │  │  WriterManager  │    Output:                               │
-│  │                  │    • fs/*.csv (VFS events)              │  │
-│  │                  │    • ds/*.csv (block events)            │  │
-│  │                  │    • cache/*.csv (cache events)         │  │
-│  │                  │    • pagefault/*.csv (page faults)      │  │
-│  │                  │    • filesystem_snapshot/*.csv.gz       │  │
-│  │                  │    • process/*.csv                      │  │
-│  │                  │    • system_spec/*                      │  │
+│  │                  │    • fs/*.csv.zst (VFS events)          │  │
+│  │                  │    • ds/*.csv.zst (block events)        │  │
+│  │                  │    • cache/*.csv.zst (cache events)     │  │
+│  │                  │    • pagefault/*.csv.zst (page faults)  │  │
+│  │                  │    • filesystem_snapshot/*.csv.zst      │  │
+│  │                  │    • process/*.csv.zst                  │  │
+│  │                  │    • system_spec/*.json                 │  │
 │  └──────────────────┘                                           │
 └─────────────────────────────────────────────────────────────────┘
 ```

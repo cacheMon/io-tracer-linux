@@ -35,4 +35,4 @@
 | `MAJOR` | Page not in memory — requires disk I/O to load the page |
 | `MINOR` | Page already in page cache — no disk I/O needed (soft fault) |
 
-**Output File:** `linux_trace_v3_test/{MACHINE_ID}/{TIMESTAMP}/pagefault/pagefault_*.csv`
+**Output File:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/pagefault/pagefault_*.csv.zst`

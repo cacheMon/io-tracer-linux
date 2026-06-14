@@ -139,7 +139,7 @@ class WriteManager:
         self.adaptive_thread = threading.Thread(target=self._adaptive_sizing, daemon=True)
         self.adaptive_thread.start()
         
-        # Start periodic flush thread (every 20 minutes)
+        # Start periodic flush thread (every 5 minutes)
         self._periodic_flush_active = True
         self._last_flush_time = time.time()
         self.periodic_flush_thread = threading.Thread(target=self._periodic_flush, daemon=True)
@@ -724,7 +724,7 @@ class WriteManager:
                 self.current_datetime = datetime.now()
                 self._write_buffer_to_file(buf, handle, s['log'])
 
-            # Close before compressing so we never gzip/delete an open file.
+            # Close before compressing so we never compress/delete an open file.
             if handle is not None:
                 handle.close()
                 setattr(self, s['handle'], None)
@@ -746,7 +746,7 @@ class WriteManager:
             setattr(self, s['handle'], self._open_log_file(new_file, key))
             self._stream_opened[key] = time.monotonic()
             self._reset_flush_timer()
-        # Compress outside the lock: gzip + disk I/O is slow and must not block
+        # Compress outside the lock: compression + disk I/O is slow and must not block
         # the perf-callback flush or the periodic writer for this stream.
         if rotated is not None:
             self.compress_log(rotated)
