@@ -30,8 +30,8 @@ import tarfile
 
 from .ObjectStorageManager import ObjectStorageManager
 from ..utility.utils import (
-    logger, create_tar_zst, capture_machine_id, compress_log,
-    compress_file_zstd, ZSTD_LEVEL,
+    logger, capture_machine_id,
+    compress_file_zstd, require_zstandard, ZSTD_LEVEL,
 )
 import threading
 from collections import deque
@@ -955,7 +955,7 @@ class WriteManager:
             input_dir: Path to the directory to compress
         """
         try:
-            import zstandard
+            zstandard = require_zstandard()
             src = input_dir
             dst = input_dir.rstrip("/").rstrip("\\") + ".tar.zst"
 

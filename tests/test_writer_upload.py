@@ -39,9 +39,10 @@ except ModuleNotFoundError:
 
 def _zstd_read_text(path):
     """Decompress a .zst file to text for round-trip assertions."""
+    import zstandard
     dctx = zstandard.ZstdDecompressor()
-    with open(path, "rb") as f:
-        return dctx.stream_reader(f).read().decode()
+    with open(path, "rb") as f, dctx.stream_reader(f) as reader:
+        return reader.read().decode()
 
 
 from src.tracer.WriterManager import WriteManager

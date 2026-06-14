@@ -27,7 +27,6 @@ from pathlib import Path
 import os
 import time
 import datetime
-import tarfile
 import hashlib
 import socket
 import struct
@@ -197,6 +196,24 @@ def logger(error_scale: str, string: str, timestamp: bool = False):
 ZSTD_LEVEL = 3
 
 
+def require_zstandard():
+    """
+    Import and return the optional ``zstandard`` module.
+
+    Imported lazily so environments that never compress (and the pure-Python
+    unit tests) don't need the dependency at import time. Raises a clear,
+    actionable error if it is missing.
+    """
+    try:
+        import zstandard
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "The 'zstandard' library is required for Zstandard compression but "
+            "is not installed. Install it with 'pip install zstandard'."
+        ) from e
+    return zstandard
+
+
 def compress_file_zstd(src: str, dst: str, level: int = ZSTD_LEVEL):
     """
     Stream-compress a file to Zstandard.
@@ -205,33 +222,11 @@ def compress_file_zstd(src: str, dst: str, level: int = ZSTD_LEVEL):
         src: Path to the source file
         dst: Path to write the compressed (.zst) output
         level: Zstandard compression level
-
-    zstandard is imported lazily so environments that never compress (and the
-    pure-Python unit tests) don't require the dependency at import time.
     """
-    import zstandard
+    zstandard = require_zstandard()
     cctx = zstandard.ZstdCompressor(level=level)
     with open(src, "rb") as f_in, open(dst, "wb") as f_out:
         cctx.copy_stream(f_in, f_out)
-
-
-def create_tar_zst(output_filename: str, files_to_archive: list[str], level: int = ZSTD_LEVEL):
-    """
-    Create a Zstandard-compressed tar archive from a list of files.
-
-    Args:
-        output_filename: Name of the output .tar.zst file
-        files_to_archive: List of file paths to include
-        level: Zstandard compression level
-    """
-    import zstandard
-    cctx = zstandard.ZstdCompressor(level=level)
-    with open(output_filename, "wb") as f_out:
-        with cctx.stream_writer(f_out) as compressor:
-            with tarfile.open(mode="w|", fileobj=compressor) as tar:
-                for file_path in files_to_archive:
-                    tar.add(file_path, arcname=os.path.basename(file_path))
-    logger("info", f"Created tar.zst archive: {output_filename}")
 
 
 def compress_log(input_file: str):
