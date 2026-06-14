@@ -27,6 +27,7 @@
 | 8 | CPU ID | `u32` | CPU where event occurred |
 | 9 | Device ID | `u32` | Device ID from the file's superblock |
 | 10 | Count | `u32` | Number of pages affected by the operation (1 for single-page, N for bulk) |
+| 11 | mono_ns | `u64` | Record time in `CLOCK_MONOTONIC` nanoseconds (kernel `bpf_ktime_get_ns()`) — the common cross-stream correlation clock; add the manifest's `clock.mono_to_real_offset_ns` to recover wall-clock ns. |
 
 ## Event Types
 

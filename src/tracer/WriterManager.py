@@ -29,6 +29,7 @@ from datetime import datetime
 import tarfile
 
 from .ObjectStorageManager import ObjectStorageManager
+from . import schema
 from ..utility.utils import (
     logger, capture_machine_id,
     compress_file_zstd, require_zstandard, ZSTD_LEVEL,
@@ -76,6 +77,10 @@ class WriteManager:
         self.current_datetime = datetime.now()
 
         self.created_files = 0
+        # Total rows written to disk per stream (keyed by buffer label), for the
+        # session manifest — lets a consumer spot a stream whose probes attached
+        # but produced no events.
+        self.rows_written = {}
         self.last_status_log_time = time.time()
         self.status_log_interval = 60  # Log status every 60 seconds
         self.output_dir = output_dir
@@ -209,6 +214,21 @@ class WriteManager:
 
         # Process snapshot session tracking
         self.process_snapshot_session_active = False
+
+    # WriteManager stream key -> schema.STREAMS key.
+    _SCHEMA_KEY = {
+        'vfs': 'fs', 'block': 'ds', 'cache': 'cache', 'pagefault': 'pagefault',
+        'process': 'process', 'fs_snap': 'filesystem_snapshot',
+    }
+
+    def _open_log_file(self, path: str, wm_key: str):
+        """Open a stream's CSV for appending, writing the schema header row first
+        when the file is new/empty so every (rotated) file is self-describing."""
+        is_new = (not os.path.exists(path)) or os.path.getsize(path) == 0
+        handle = open(path, 'a', buffering=8192)
+        if is_new:
+            handle.write(schema.header_line(self._SCHEMA_KEY[wm_key]) + "\n")
+        return handle
 
     def _calculate_event_rate(self, event_type: str) -> float:
         """
@@ -391,7 +411,7 @@ class WriteManager:
         """
         if isinstance(log_output, str):
             if self._fs_snap_handle is None:
-                self._fs_snap_handle = open(self.output_fs_snapshot_file, 'a', buffering=8192)
+                self._fs_snap_handle = self._open_log_file(self.output_fs_snapshot_file, 'fs_snap')
             self.fs_snap_buffer.append(log_output)
             self.event_timestamps['fs_state'].append(time.time())
         else:
@@ -525,7 +545,7 @@ class WriteManager:
             if self._fs_snap_handle is None or self.output_fs_snapshot_file != part_filepath:
                 if self._fs_snap_handle is not None:
                     self._fs_snap_handle.close()
-                self._fs_snap_handle = open(part_filepath, 'a', buffering=8192)
+                self._fs_snap_handle = self._open_log_file(part_filepath, 'fs_snap')
                 self.output_fs_snapshot_file = part_filepath
 
             # Write buffer to file
@@ -648,14 +668,14 @@ class WriteManager:
         with self._stream_locks['process']:
             if self.process_buffer:
                 if self._process_handle is None:
-                    self._process_handle = open(self.output_process_file, 'a', buffering=8192)
+                    self._process_handle = self._open_log_file(self.output_process_file, 'process')
                 self.current_datetime = datetime.now()
 
                 self._write_buffer_to_file(self.process_buffer, self._process_handle, "Process State")
                 self._process_handle.close()
                 rotated = self.output_process_file
                 self.output_process_file = f"{self.output_dir}/process/process_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-                self._process_handle = open(self.output_process_file, 'a', buffering=8192)
+                self._process_handle = self._open_log_file(self.output_process_file, 'process')
                 self._reset_flush_timer()
 
                 # Mark process snapshot as complete
@@ -699,7 +719,7 @@ class WriteManager:
             # Land any buffered rows in the current file first.
             if buf:
                 if handle is None:
-                    handle = open(cur_file, 'a', buffering=8192)
+                    handle = self._open_log_file(cur_file, key)
                     setattr(self, s['handle'], handle)
                 self.current_datetime = datetime.now()
                 self._write_buffer_to_file(buf, handle, s['log'])
@@ -712,7 +732,7 @@ class WriteManager:
             # Skip rotating an empty file (avoids zero-byte uploads); just keep
             # appending to it.
             if not os.path.exists(cur_file) or os.path.getsize(cur_file) == 0:
-                setattr(self, s['handle'], open(cur_file, 'a', buffering=8192))
+                setattr(self, s['handle'], self._open_log_file(cur_file, key))
                 return
 
             rotated = cur_file
@@ -723,7 +743,7 @@ class WriteManager:
                 f"{self._stream_seq[key]:04d}.csv"
             )
             setattr(self, s['file'], new_file)
-            setattr(self, s['handle'], open(new_file, 'a', buffering=8192))
+            setattr(self, s['handle'], self._open_log_file(new_file, key))
             self._stream_opened[key] = time.monotonic()
             self._reset_flush_timer()
         # Compress outside the lock: gzip + disk I/O is slow and must not block
@@ -822,12 +842,15 @@ class WriteManager:
             
         try:
             string_buffer = io.StringIO()
-            
+
+            n = 0
             while buffer:
                 event = buffer.popleft()
                 string_buffer.write(event)
                 string_buffer.write('\n')
-            
+                n += 1
+            self.rows_written[buffer_name] = self.rows_written.get(buffer_name, 0) + n
+
             complete_data = string_buffer.getvalue()
             file_handle.write(complete_data)
             file_handle.flush()
@@ -843,42 +866,42 @@ class WriteManager:
             with self._stream_locks['vfs']:
                 if self.vfs_buffer:
                     if self._vfs_handle is None:
-                        self._vfs_handle = open(self.output_vfs_file, 'a', buffering=8192)
+                        self._vfs_handle = self._open_log_file(self.output_vfs_file, 'vfs')
                     self._write_buffer_to_file(self.vfs_buffer, self._vfs_handle, "VFS")
 
         def write_block():
             with self._stream_locks['block']:
                 if self.block_buffer:
                     if self._block_handle is None:
-                        self._block_handle = open(self.output_block_file, 'a', buffering=8192)
+                        self._block_handle = self._open_log_file(self.output_block_file, 'block')
                     self._write_buffer_to_file(self.block_buffer, self._block_handle, "Block")
 
         def write_cache():
             with self._stream_locks['cache']:
                 if self.cache_buffer:
                     if self._cache_handle is None:
-                        self._cache_handle = open(self.output_cache_file, 'a', buffering=8192)
+                        self._cache_handle = self._open_log_file(self.output_cache_file, 'cache')
                     self._write_buffer_to_file(self.cache_buffer, self._cache_handle, "Cache")
 
         def write_process():
             with self._stream_locks['process']:
                 if self.process_buffer:
                     if self._process_handle is None:
-                        self._process_handle = open(self.output_process_file, 'a', buffering=8192)
+                        self._process_handle = self._open_log_file(self.output_process_file, 'process')
                     self._write_buffer_to_file(self.process_buffer, self._process_handle, "Process State")
 
         def write_fssnap():
             with self._stream_locks['fs_snap']:
                 if self.fs_snap_buffer:
                     if self._fs_snap_handle is None:
-                        self._fs_snap_handle = open(self.output_fs_snapshot_file, 'a', buffering=8192)
+                        self._fs_snap_handle = self._open_log_file(self.output_fs_snapshot_file, 'fs_snap')
                     self._write_buffer_to_file(self.fs_snap_buffer, self._fs_snap_handle, "Filesystem Snapshot")
 
         def write_pagefault():
             with self._stream_locks['pagefault']:
                 if self.pagefault_buffer:
                     if self._pagefault_handle is None:
-                        self._pagefault_handle = open(self.output_pagefault_file, 'a', buffering=8192)
+                        self._pagefault_handle = self._open_log_file(self.output_pagefault_file, 'pagefault')
                     self._write_buffer_to_file(self.pagefault_buffer, self._pagefault_handle, "PageFault")
 
         threads = []

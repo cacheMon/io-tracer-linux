@@ -77,8 +77,11 @@ class FilesystemSnapper:
         Returns:
             bool: True if snapshot completed naturally, False if interrupted
         """
-        # Capture snapshot timestamp once for all files in this snapshot
-        snapshot_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Capture snapshot timestamp once for all files in this snapshot.
+        # Millisecond resolution to match the process snapshot stream.
+        snapshot_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        # Common cross-stream clock, captured once for the whole snapshot.
+        snapshot_mono_ns = time.monotonic_ns()
         count = 0
         def scan_dir(path: str, depth: int = 0):
             """Inner function for recursive directory scanning."""
@@ -115,7 +118,7 @@ class FilesystemSnapper:
                                     hashed_rel = hash_rel_path(rel, keep_ext=True, length=12)
                                     hashed_path = os.path.join(os.sep, str(hashed_rel))
                                     hashed_path = hash_filename_in_path(Path(hashed_path))
-                                    out = format_csv_row(snapshot_timestamp, hashed_path, size, ctime, mtime, atime)
+                                    out = format_csv_row(snapshot_timestamp, hashed_path, size, ctime, mtime, atime, snapshot_mono_ns)
                                     self.wm.append_fs_snap_log(out)
                                     count += 1  
                                 else:
@@ -125,7 +128,7 @@ class FilesystemSnapper:
                                     ctime = datetime.fromtimestamp(getattr(est, "st_birthtime", est.st_mtime))
                                     mtime = datetime.fromtimestamp(est.st_mtime)
                                     atime = datetime.fromtimestamp(est.st_atime)
-                                    out = format_csv_row(snapshot_timestamp, hashed_path_str, size, ctime, mtime, atime)
+                                    out = format_csv_row(snapshot_timestamp, hashed_path_str, size, ctime, mtime, atime, snapshot_mono_ns)
                                     self.wm.append_fs_snap_log(out)
                                     count += 1     
                             elif entry.is_dir(follow_symlinks=False):

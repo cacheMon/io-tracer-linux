@@ -21,6 +21,7 @@
 | 4 | Creation Time | `datetime` | File creation time (`st_birthtime`); falls back to `st_mtime` if unavailable |
 | 5 | Modification Time | `datetime` | Last data modification time (`st_mtime`) |
 | 6 | Access Time | `datetime` | Last access time (`st_atime`) |
+| 7 | mono_ns | `u64` | Snapshot time in `CLOCK_MONOTONIC` nanoseconds (`time.monotonic_ns()`, captured once per snapshot) — the common cross-stream correlation clock; add the manifest's `clock.mono_to_real_offset_ns` to recover wall-clock ns. |
 
 ## Excluded Filesystems
 

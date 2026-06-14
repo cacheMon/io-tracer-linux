@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,6 +65,66 @@ class CleanupOldCacheTests(unittest.TestCase):
         r.inode_to_path[1] = "/a"
         r.cleanup_old_cache()
         self.assertEqual(r.inode_to_path, {1: "/a"})
+
+
+class ResolveRelativeTests(unittest.TestCase):
+    def test_absolute_path_returned_unchanged(self):
+        r = PathResolver()
+        # Absolute paths need no resolution and must not touch /proc.
+        with mock.patch("src.tracer.PathResolver.os.readlink") as rl:
+            self.assertEqual(
+                r.resolve_relative(pid=1, dirfd=PathResolver.AT_FDCWD, relpath="/etc/passwd"),
+                "/etc/passwd",
+            )
+            rl.assert_not_called()
+
+    def test_missing_pid_or_relpath_returns_relpath(self):
+        r = PathResolver()
+        self.assertEqual(r.resolve_relative(pid=0, dirfd=-100, relpath="a.txt"), "a.txt")
+        self.assertEqual(r.resolve_relative(pid=5, dirfd=-100, relpath=""), "")
+
+    def test_cwd_relative_joined_and_normalised(self):
+        r = PathResolver()
+        with mock.patch("src.tracer.PathResolver.os.readlink", return_value="/home/user/proj"):
+            out = r.resolve_relative(pid=99, dirfd=PathResolver.AT_FDCWD,
+                                     relpath="../data/x.bin", inode=7)
+        self.assertEqual(out, "/home/user/data/x.bin")
+        # Successful resolution populates the inode cache.
+        self.assertEqual(r.inode_to_path[7], "/home/user/data/x.bin")
+
+    def test_dirfd_relative_uses_fd_link(self):
+        r = PathResolver()
+        with mock.patch("src.tracer.PathResolver.os.readlink", return_value="/var/log") as rl:
+            out = r.resolve_relative(pid=99, dirfd=5, relpath="app/run.log")
+        self.assertEqual(out, "/var/log/app/run.log")
+        rl.assert_called_once_with("/proc/99/fd/5")
+
+    def test_pseudo_dir_base_falls_back(self):
+        r = PathResolver()
+        with mock.patch("src.tracer.PathResolver.os.readlink", return_value="pipe:[12345]"):
+            self.assertEqual(r.resolve_relative(pid=99, dirfd=5, relpath="x"), "x")
+
+    def test_oserror_falls_back_to_relpath(self):
+        r = PathResolver()
+        with mock.patch("src.tracer.PathResolver.os.readlink", side_effect=OSError):
+            self.assertEqual(
+                r.resolve_relative(pid=99, dirfd=PathResolver.AT_FDCWD, relpath="x.txt"),
+                "x.txt",
+            )
+
+    def test_deleted_base_dir_falls_back(self):
+        # /proc/<pid>/cwd of an unlinked dir reads as "/path (deleted)"; joining
+        # onto it would fabricate a path that never existed.
+        r = PathResolver()
+        with mock.patch("src.tracer.PathResolver.os.readlink",
+                        return_value="/tmp/gone (deleted)"):
+            self.assertEqual(
+                r.resolve_relative(pid=99, dirfd=PathResolver.AT_FDCWD,
+                                   relpath="x.txt", inode=5),
+                "x.txt",
+            )
+        # And it must not poison the inode cache with a bogus path.
+        self.assertNotIn(5, r.inode_to_path)
 
 
 if __name__ == "__main__":

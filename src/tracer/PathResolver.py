@@ -186,6 +186,52 @@ class PathResolver:
 
         return filename
 
+    # openat() dirfd sentinel: resolve relative to the process cwd.
+    AT_FDCWD = -100
+
+    def resolve_relative(self, pid: int, dirfd: int, relpath: str, inode: int = 0) -> str:
+        """Resolve a relative open path against its openat dirfd / process cwd.
+
+        Used as a fallback when fd-based resolution could not produce an
+        absolute path (e.g. the fd was already closed). The base directory is
+        read from ``/proc/<pid>/cwd`` (for ``AT_FDCWD``) or
+        ``/proc/<pid>/fd/<dirfd>`` (for a directory fd), then joined with the
+        captured relative path. Best effort — falls back to ``relpath`` if the
+        process/dir is gone.
+
+        Args:
+            pid:     Process that performed the open
+            dirfd:   openat dirfd (``AT_FDCWD`` for cwd-relative)
+            relpath: The relative path string captured by eBPF
+            inode:   Inode (optional) — populates the cache on success
+
+        Returns:
+            str: Absolute, normalised path, or ``relpath`` if resolution fails
+        """
+        if not pid or not relpath or relpath.startswith("/"):
+            return relpath
+
+        try:
+            if dirfd == self.AT_FDCWD:
+                base = os.readlink(f"/proc/{pid}/cwd")
+            else:
+                base = os.readlink(f"/proc/{pid}/fd/{dirfd}")
+                if (base.startswith("pipe:") or base.startswith("socket:") or
+                        base.startswith("anon_inode:")):
+                    return relpath
+        except OSError:
+            return relpath
+
+        # The kernel appends " (deleted)" when the base directory has been
+        # unlinked; joining onto that yields a path that never existed, so bail.
+        if base.endswith(" (deleted)"):
+            return relpath
+
+        resolved = os.path.normpath(os.path.join(base, relpath))
+        if inode:
+            self.inode_to_path[inode] = resolved
+        return resolved
+
     def resolve_path(self, inode: int, pid: int | None = None, filename: str | None = None) -> str:
         """
         Resolve the full path for an inode.

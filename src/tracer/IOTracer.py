@@ -19,6 +19,9 @@ Usage:
 import shutil
 import signal
 import os
+import ctypes
+import json
+import platform
 from bcc import BPF
 import time
 import sys
@@ -26,6 +29,7 @@ from bisect import bisect_right
 from pathlib import Path
 from datetime import datetime
 
+from . import schema
 from .ObjectStorageManager import ObjectStorageManager
 from ..utility.utils import capture_machine_id, format_csv_row, logger, hash_filename_in_path, simple_hash, run_with_spinner
 from .WriterManager import WriteManager
@@ -142,6 +146,23 @@ class IOTracer:
         self.mmap_regions       = {}
         self.cmdline_cache      = {}  # pid -> cmdline, populated on first successful read
 
+        # Wall-clock conversion for kernel event timestamps. bpf_ktime_get_ns()
+        # is CLOCK_MONOTONIC (ns since boot); adding this offset recovers
+        # wall-clock time. Using the kernel's per-event timestamp instead of the
+        # userspace receive time keeps rows correctly ordered in time across the
+        # per-CPU perf buffers (which deliver in batches, not global order).
+        # Integer-ns math avoids the float precision loss of subtracting two
+        # large second-valued floats.
+        self._mono_to_real_offset_ns = time.time_ns() - time.monotonic_ns()
+        # The tracer (and its in-process snapshot/upload threads) read /proc,
+        # write the trace files, and upload them — all of which is self-noise we
+        # don't want in the trace. Filter events from our own pid.
+        self._self_pid = os.getpid()
+        # Per-stream dropped-event tallies (kernel perf-buffer overruns), folded
+        # into the session manifest.
+        self._lost_counts = {}
+        self.version = version
+
         # Bounded-cache maintenance. The path resolver and cmdline caches are
         # only evicted on PROCESS_EXEC, so over a long-running trace they would
         # otherwise grow without bound. Maintenance runs from the perf-callback
@@ -188,6 +209,30 @@ class IOTracer:
         prefixes = ("swapper/", "ksoftirqd/", "irq/", "migration/", "stopper/")
         return comm.startswith(prefixes)
 
+    def _ns_to_walltime(self, ts_ns):
+        """Convert a kernel ``bpf_ktime_get_ns()`` (CLOCK_MONOTONIC) value to a
+        wall-clock ``datetime``.
+
+        Returns the userspace receive time when ``ts_ns`` is missing/zero, or if
+        the value is out of ``datetime``'s representable range — a garbage
+        timestamp must never raise out of a perf-buffer callback.
+        """
+        if not ts_ns:
+            return datetime.today()
+        try:
+            return datetime.fromtimestamp((ts_ns + self._mono_to_real_offset_ns) / 1e9)
+        except (OverflowError, OSError, ValueError):
+            return datetime.today()
+
+    def _event_walltime(self, event):
+        """Wall-clock time for a perf event, from its kernel ``ts`` field.
+
+        Using the kernel's per-event monotonic time (rather than the userspace
+        receive time) yields correctly ordered timestamps across the per-CPU
+        perf buffers. Falls back to receive time when the event carries no ts.
+        """
+        return self._ns_to_walltime(getattr(event, "ts", 0))
+
     def _print_event(self, cpu, data, size):        
         """
         Callback for processing file system VFS events from the perf buffer.
@@ -203,6 +248,9 @@ class IOTracer:
         self._tick_maintenance()
 
         event = self.b["events"].event(data)
+        # Drop the tracer's own I/O before any decode/timestamp work.
+        if event.pid == self._self_pid:
+            return
         op_name = self.flag_mapper.op_fs_types.get(event.op, "[unknown]")
 
         try:
@@ -214,16 +262,16 @@ class IOTracer:
         except UnicodeDecodeError:
             filename = ""
         
-        timestamp = datetime.today()
-        
+        timestamp = self._event_walltime(event)
+
         try:
             comm = event.comm.decode()
         except UnicodeDecodeError:
             comm = "[decode_error]"
-            
+
         if self._should_filter_process(comm):
             return
-            
+
         inode_val = event.inode if event.inode != 0 else ""
         
         size_val = event.size if event.size is not None else 0
@@ -268,10 +316,25 @@ class IOTracer:
                         filename = self.path_resolver.resolve_open_path(
                             pid=event.pid, inode=event.inode, filename=filename
                         )
+                    # Last resort: if still relative (fd already closed / process
+                    # gone), resolve the captured relative path against the
+                    # openat dirfd or process cwd.
+                    if filename and not filename.startswith('/'):
+                        dirfd = event.dirfd if hasattr(event, 'dirfd') else self.path_resolver.AT_FDCWD
+                        filename = self.path_resolver.resolve_relative(
+                            pid=event.pid, dirfd=dirfd, relpath=filename, inode=event.inode
+                        )
             else:
                 cached = self.path_resolver.inode_to_path.get(event.inode)
                 if cached:
                     filename = cached
+
+        # Invariant: an OPEN filename is absolute or a clean basename, never an
+        # unanchored relative path. If it is still relative here (inode==0 skipped
+        # resolution above, or every resolver raced a closed fd/cwd), reduce it to
+        # its basename. Anonymous mode already hashed the path at decode time.
+        if op_name == 'OPEN' and not self.anonymous and filename and not filename.startswith('/'):
+            filename = os.path.basename(filename) or filename
 
         if raw_address:
             if op_name == "MMAP":
@@ -339,7 +402,8 @@ class IOTracer:
             flags_val, offset_val, tid_val, mmap_prot_val, mmap_flags_val,
             address_val, cmdline,
             return_value, errno_val, bytes_completed, duration_ns,
-            dev_val, ppid_val, container_id, fs_type_val
+            dev_val, ppid_val, container_id, fs_type_val,
+            getattr(event, "ts", 0)
         )
         self.writer.append_fs_log(output)
 
@@ -605,6 +669,9 @@ class IOTracer:
         self._tick_maintenance()
 
         event = self.b["events_dual"].event(data)
+        # Drop the tracer's own I/O before any decode/timestamp work.
+        if event.pid == self._self_pid:
+            return
         op_name = self.flag_mapper.op_fs_types.get(event.op, "[unknown]")
         
         try:
@@ -617,16 +684,16 @@ class IOTracer:
             filename_old = ""
             filename_new = ""
         
-        timestamp = datetime.today()
-        
+        timestamp = self._event_walltime(event)
+
         try:
             comm = event.comm.decode()
         except UnicodeDecodeError:
             comm = "[decode_error]"
-            
+
         if self._should_filter_process(comm):
             return
-            
+
         inode_old = event.inode_old if event.inode_old != 0 else ""
         inode_new = event.inode_new if event.inode_new != 0 else ""
         
@@ -648,11 +715,12 @@ class IOTracer:
             flags_val, "", "", "", "",   # offset, tid, mmap_prot, mmap_flags
             "", cmdline,                 # address, cmdline
             "", "", "", "",              # return_value, errno, bytes_completed, duration_ns
-            "", "", "", ""               # device, ppid, container_id, fs_type
+            "", "", "", "",              # device, ppid, container_id, fs_type
+            getattr(event, "ts", 0)      # mono_ns
         )
         self.writer.append_fs_log(output)
-    
-    def _print_event_cache(self, cpu, data, size):       
+
+    def _print_event_cache(self, cpu, data, size):
         """
         Callback for processing page cache events from the perf buffer.
         
@@ -664,10 +732,12 @@ class IOTracer:
             size: Size of the event data
         """
         event = self.b["cache_events"].event(data)
-        timestamp = datetime.today()
         pid = event.pid
+        if pid == self._self_pid:
+            return
+        timestamp = self._event_walltime(event)
         comm = event.comm.decode('utf-8', errors='replace')
-        
+
         if self._should_filter_process(comm):
             return
         
@@ -693,7 +763,7 @@ class IOTracer:
         dev_id = event.dev_id if hasattr(event, 'dev_id') else ""
         count = event.count if hasattr(event, 'count') else ""
 
-        output = format_csv_row(timestamp, pid, comm, event_name, inode, index, size, cpu_id, dev_id, count)
+        output = format_csv_row(timestamp, pid, comm, event_name, inode, index, size, cpu_id, dev_id, count, getattr(event, "ts", 0))
 
         self.writer.append_cache_log(output)
 
@@ -710,12 +780,14 @@ class IOTracer:
             size: Size of the event data
         """
         event = self.b["bl_events"].event(data)
-        
-        timestamp = datetime.today()
+
         pid = event.pid
+        if pid == self._self_pid:
+            return
+        timestamp = self._event_walltime(event)
         tid = event.tid
         comm = event.comm.decode('utf-8', errors='replace')
-        
+
         if self._should_filter_process(comm):
             return
             
@@ -747,8 +819,11 @@ class IOTracer:
         # Note: op_code is 0 on kernel 5.17+ where cmd_flags is unavailable - don't decode it
         op_code = event.op_code if hasattr(event, 'op_code') else 0
         op_code_str = self.flag_mapper.decode_block_op_code(op_code) if (op_code is not None and op_code != 0) else ""
-        
-        output = format_csv_row(timestamp, pid, comm, sector, ops_str, bio_size, latency_ms, tid, cpu_id, ppid, dev_str, queue_time_ms, cmd_flags_str, op_code_str)
+
+        # Monotonic per-request id (disambiguates repeated I/O to the same sector)
+        req_id = event.req_id if hasattr(event, 'req_id') else ""
+
+        output = format_csv_row(timestamp, pid, comm, sector, ops_str, bio_size, latency_ms, tid, cpu_id, ppid, dev_str, queue_time_ms, cmd_flags_str, op_code_str, req_id, getattr(event, "ts", 0))
 
 
         if sector == 0 and bio_size == 0:
@@ -771,12 +846,13 @@ class IOTracer:
             size: Size of the event data
         """
         event = self.b["pagefault_events"].event(data)
-        timestamp = datetime.today()
-        
         pid = event.pid
+        if pid == self._self_pid:
+            return
+        timestamp = self._event_walltime(event)
         tid = event.tid
         comm = event.comm.decode('utf-8', errors='replace')
-        
+
         if self._should_filter_process(comm):
             return
             
@@ -787,7 +863,7 @@ class IOTracer:
         major = "MAJOR" if event.major else "MINOR"
         dev_id = event.dev_id if hasattr(event, 'dev_id') and event.dev_id != 0 else ""
         
-        output = format_csv_row(timestamp, pid, tid, comm, fault_type, major, inode, offset, address, dev_id)
+        output = format_csv_row(timestamp, pid, tid, comm, fault_type, major, inode, offset, address, dev_id, getattr(event, "ts", 0))
         self.writer.append_pagefault_log(output)
 
     def _print_event_io_uring(self, cpu, data, size):
@@ -815,7 +891,10 @@ class IOTracer:
         if e.event_type != 2:
             return
 
-        ts = datetime.today()
+        # Use the kernel event time (io_uring's struct names it timestamp_ns) so
+        # these mirrored rows share the same clock as the syscall-origin fs rows
+        # they interleave with in the fs trace.
+        ts = self._ns_to_walltime(getattr(e, "timestamp_ns", 0))
         comm = e.comm.decode("utf-8", errors="replace").strip("\x00")
 
         if self._should_filter_process(comm):
@@ -901,7 +980,8 @@ class IOTracer:
             ts, op_name, e.pid, comm, filename, size_val, e.inode,
             flags_val, offset_val, tid_val, "", "", "", cmdline,
             return_value, errno_val, bytes_completed, duration_ns,
-            dev_val, "", "", fs_type_val
+            dev_val, "", "", fs_type_val,
+            getattr(e, "timestamp_ns", 0)   # mono_ns
         )
         self.writer.append_fs_log(output)
 
@@ -917,16 +997,101 @@ class IOTracer:
 
         run_with_spinner("Flushing trace data", _flush)
 
-    def _lost_cb(self, lost):
+    def _block_stats(self):
+        """Read the per-CPU ``block_stats`` map → {issued, completed, missed}.
+
+        Returns an empty dict if the map is unavailable or all-zero. ``missed``
+        counts completions with no tracked issue ctx (LRU-evicted or pre-trace).
         """
-        Callback for handling lost events in the perf buffer.
-        
-        Args:
-            lost: Number of events that were lost
+        try:
+            stats = self.b["block_stats"]
+            out = {
+                "issued":    int(sum(stats[ctypes.c_int(0)])),
+                "completed": int(sum(stats[ctypes.c_int(1)])),
+                "missed":    int(sum(stats[ctypes.c_int(2)])),
+            }
+        except Exception:
+            return {}
+        return out if any(out.values()) else {}
+
+    def _log_block_diagnostics(self):
+        """Log a summary of block-tracing health from ``block_stats``.
+
+        A high miss rate means the issue map was evicted under load (completions
+        dropped) — the likely explanation if block events appear to stop before
+        the end of a long trace.
         """
-        if lost > 0:
-            if self.verbose:
-                logger("warning", f"Lost {lost} events in kernel buffer")
+        s = self._block_stats()
+        if not s:
+            return
+        total_completions = s["completed"] + s["missed"]
+        miss_pct = (s["missed"] / total_completions * 100) if total_completions else 0.0
+        logger("info",
+               f"Block diagnostics: {s['issued']} issued, {s['completed']} completed, "
+               f"{s['missed']} completions without a tracked issue "
+               f"({miss_pct:.1f}% of completions). A high miss rate indicates the "
+               f"issue map was evicted under load (dropped completions).")
+
+    def _attached_probes(self):
+        """Sorted list of kernel functions the tracer has probes attached to."""
+        try:
+            events = ([e for e, _ in self.probe_tracker.kprobes] +
+                      [e for e, _ in self.probe_tracker.kretprobes])
+            return sorted(set(events))
+        except Exception:
+            return []
+
+    def _write_manifest(self, started_at, stopped_at=None):
+        """Write the per-session ``manifest.json`` (schema + clock + versions +
+        session window + diagnostics). Written once when tracing starts and
+        rewritten at shutdown with the stop time and final diagnostics.
+        """
+        manifest = schema.schema_for_manifest()
+        duration = (stopped_at - started_at).total_seconds() if stopped_at else None
+        manifest.update({
+            "tracer": {"version": self.version},
+            "machine_id": capture_machine_id(),
+            "host": {
+                "platform": platform.platform(),
+                "kernel": platform.release(),
+                "python": platform.python_version(),
+            },
+            "clock": {
+                "wall_clock": "CLOCK_REALTIME",
+                "mono_clock": "CLOCK_MONOTONIC",
+                "mono_to_real_offset_ns": self._mono_to_real_offset_ns,
+                "note": ("mono_ns is the common cross-stream correlation clock "
+                         "(CLOCK_MONOTONIC ns). Add mono_to_real_offset_ns to it "
+                         "to recover wall-clock nanoseconds."),
+            },
+            "session": {
+                "started_at": started_at.isoformat(),
+                "stopped_at": stopped_at.isoformat() if stopped_at else None,
+                "duration_seconds": duration,
+            },
+            "diagnostics": {
+                "attached_probes": self._attached_probes(),
+                "lost_events": dict(self._lost_counts),
+                "rows_written": dict(self.writer.rows_written),
+                "block": self._block_stats(),
+            },
+        })
+        try:
+            path = os.path.join(self.writer.output_dir, "manifest.json")
+            with open(path, "w") as f:
+                json.dump(manifest, f, indent=2)
+        except OSError as e:
+            logger("warning", f"Could not write manifest.json: {e}")
+
+    def _make_lost_cb(self, label):
+        """Build a per-buffer lost-event callback that tallies drops by stream
+        label (for the session manifest) and warns when verbose."""
+        def _cb(lost):
+            if lost > 0:
+                self._lost_counts[label] = self._lost_counts.get(label, 0) + lost
+                if self.verbose:
+                    logger("warning", f"Lost {lost} {label} events in kernel buffer")
+        return _cb
 
     def trace(self):
         """
@@ -962,27 +1127,27 @@ class IOTracer:
 
         # Open perf buffers for each event type
         self.b["events"].open_perf_buffer(
-            self._print_event, 
-            page_cnt=self.page_cnt, 
-            lost_cb=self._lost_cb
+            self._print_event,
+            page_cnt=self.page_cnt,
+            lost_cb=self._make_lost_cb("fs")
         )
 
         self.b["events_dual"].open_perf_buffer(
             self._print_event_dual,
             page_cnt=self.page_cnt,
-            lost_cb=self._lost_cb
+            lost_cb=self._make_lost_cb("fs")
         )
 
         self.b["bl_events"].open_perf_buffer(
-            self._print_event_block, 
-            page_cnt=self.page_cnt, 
-            lost_cb=self._lost_cb
+            self._print_event_block,
+            page_cnt=self.page_cnt,
+            lost_cb=self._make_lost_cb("ds")
         )
 
         # self.b["cache_events"].open_perf_buffer(
-        #     self._print_event_cache, 
-        #     page_cnt=self.page_cnt, 
-        #     lost_cb=self._lost_cb
+        #     self._print_event_cache,
+        #     page_cnt=self.page_cnt,
+        #     lost_cb=self._make_lost_cb("cache")
         # )
 
         # Page fault events for mmap I/O tracking
@@ -990,7 +1155,7 @@ class IOTracer:
         #     self.b["pagefault_events"].open_perf_buffer(
         #         self._print_event_pagefault,
         #         page_cnt=self.page_cnt,
-        #         lost_cb=self._lost_cb
+        #         lost_cb=self._make_lost_cb("pagefault")
         #     )
         # except KeyError:
         #     if self.verbose:
@@ -1001,13 +1166,18 @@ class IOTracer:
             self.b["io_uring_events"].open_perf_buffer(
                 self._print_event_io_uring,
                 page_cnt=self.page_cnt,
-                lost_cb=self._lost_cb
+                lost_cb=self._make_lost_cb("fs")
             )
         except KeyError:
             if self.verbose:
                 logger("warning", "io_uring_events buffer not available")
 
         start = time.time()
+        # Write the session manifest up front so a self-describing schema exists
+        # even if the run is killed; it is rewritten at shutdown with the stop
+        # time and final diagnostics.
+        self._session_started_at = datetime.now()
+        self._write_manifest(self._session_started_at)
         if self.duration is not None:
             duration_target = self.duration
             end_time = start + duration_target
@@ -1059,7 +1229,16 @@ class IOTracer:
             if self.verbose:
                 actual_duration = time.time() - start
                 logger("info", f"Trace completed after {actual_duration:.2f} seconds")
-            
+
+            self._log_block_diagnostics()
+            # Finalise the manifest with stop time + final diagnostics. Guarded
+            # so a manifest failure never blocks shutdown/flush.
+            try:
+                self._write_manifest(getattr(self, "_session_started_at", datetime.now()),
+                                     datetime.now())
+            except Exception as e:
+                logger("warning", f"Could not finalise manifest.json: {e}")
+
             print()
             logger("info", "Trace stopped")
 

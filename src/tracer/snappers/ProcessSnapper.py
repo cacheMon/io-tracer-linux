@@ -83,7 +83,10 @@ class ProcessSnapper:
         # Mark snapshot session as active
         self.wm.start_process_snapshot_session()
         
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Millisecond resolution so snapshot rows can be ordered within a second.
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        # Common cross-stream clock, captured once for the whole snapshot.
+        snapshot_mono_ns = time.monotonic_ns()
         for proc in psutil.process_iter(['pid', 'name', 'memory_info','cmdline','create_time','status']):
             # Check if stop was requested during iteration
             if not self.running:
@@ -107,7 +110,7 @@ class ProcessSnapper:
                 cpu_2m = self.sampler.cpu_percent_for_interval(pid, create_time, 120.0) or 0.0
                 cpu_1h = self.sampler.cpu_percent_for_interval(pid, create_time, 3600.0) or 0.0
 
-                out = format_csv_row(ts, pid, name, cmdline, virtual_mem, working_set_size, datetime.fromtimestamp(create_time), cpu_5s, cpu_2m, cpu_1h, status)
+                out = format_csv_row(ts, pid, name, cmdline, virtual_mem, working_set_size, datetime.fromtimestamp(create_time), cpu_5s, cpu_2m, cpu_1h, status, snapshot_mono_ns)
                 
                 self.wm.append_process_log(out)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:

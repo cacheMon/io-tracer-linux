@@ -160,12 +160,12 @@ The path captured is relative to the mount namespace of the probed process. In c
 
 | # | Field | Type | Description |
 |---|-------|------|-------------|
-| 1 | Timestamp | `datetime` | Event timestamp (`YYYY-MM-DD HH:MM:SS.ffffff`) |
+| 1 | Timestamp | `datetime` | Event timestamp (`YYYY-MM-DD HH:MM:SS.ffffff`), derived from the kernel's per-event `bpf_ktime_get_ns()` (CLOCK_MONOTONIC) converted to wall-clock. This is the time the event actually occurred, so rows are correctly ordered when sorted by this column even though the per-CPU perf buffers deliver them in batches. |
 | 2 | Operation | `string` | VFS operation type (see table below) |
 | 3 | PID | `u32` | Process ID |
 | 4 | Command | `string` | Process name (max 16 characters) |
-| 5 | Filename | `string` | File path; for dual-path operations (`RENAME`, `LINK`, `SYMLINK`) formatted as `old_path -> new_path` |
-| 6 | Size | `u64` | I/O size in bytes (`0` for non-I/O operations) |
+| 5 | Filename | `string` | File path; for dual-path operations (`RENAME`, `LINK`, `SYMLINK`) formatted as `old_path -> new_path`. For `OPEN`, the path is resolved to absolute via `/proc/<pid>/fd`; if that races (fd already closed) and the captured path was relative, it is resolved against the openat `dirfd` / process cwd as a fallback |
+| 6 | Size (requested) | `u64` | **Requested** I/O size in bytes — the `count` argument to `read`/`write` (or operation size for others); `0` for non-I/O operations. The **actual** bytes transferred are in column 17 (`bytes_completed`), which can be smaller (short read/write). |
 | 7 | Inode | `u64` | File inode number; empty if `0` |
 | 8 | Flags | `string` | Operation-specific flags for non-MMAP operations (see tables below); empty when the operation has no defined flag value to render |
 | 9 | Offset | `u64` | File offset for positioned I/O; empty if `0` |
@@ -176,12 +176,13 @@ The path captured is relative to the mount namespace of the probed process. In c
 | 14 | cmdline | `string` | Full command line (`argv` joined by spaces) of the process that triggered the event; empty if unresolvable (see below) |
 | 15 | return_value | `s64` | Raw syscall return value for `READ`/`WRITE` (bytes moved if `>= 0`, negative `errno` on failure); empty for other operations |
 | 16 | errno | `string` | Error name (e.g. `EAGAIN`) when a `READ`/`WRITE` failed (`return_value < 0`); empty on success or for other operations |
-| 17 | bytes_completed | `u64` | Bytes actually read/written for `READ`/`WRITE` (`return_value` when `>= 0`); empty on failure or for other operations |
+| 17 | bytes_completed (actual) | `u64` | **Actual** bytes read/written for `READ`/`WRITE` (`return_value` when `>= 0`); compare against column 6 (`Size (requested)`) to detect short I/O. Empty on failure or for other operations |
 | 18 | duration_ns | `u64` | Operation duration in nanoseconds (entry → return) for `READ`/`WRITE`; empty for other operations |
 | 19 | device | `string` | Backing device of the file as `major:minor` (from `super_block->s_dev`); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
 | 20 | ppid | `u32` | Parent process ID (`real_parent->tgid`); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
 | 21 | container_id | `u64` | cgroup v2 id of the process (container identifier); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
 | 22 | fs_type | `string` | Source filesystem name derived from the superblock magic (e.g. `EXT2/3/4`, `XFS`, `BTRFS`, `OVERLAYFS`, `NFS`), letting physical-disk I/O be distinguished from network/overlay sources; populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
+| 23 | mono_ns | `u64` | Record time in `CLOCK_MONOTONIC` nanoseconds (kernel `bpf_ktime_get_ns()`) — the common clock for correlating across streams. Add the manifest's `clock.mono_to_real_offset_ns` to recover wall-clock ns. |
 
 > **Note on filesystem classification (`fs_type`) and sockets:** virtual/pseudo filesystems (procfs, sysfs, tmpfs, cgroupfs, debugfs, …) and sockets/pipes are filtered out at the eBPF layer by `is_regular_file()`, so they never appear as fs-trace rows. Their *absence* is the signal that an access was virtual/socket I/O rather than physical filesystem I/O. The `fs_type` column then names the concrete backing filesystem of the events that do appear, so physical-disk filesystems (`EXT2/3/4`, `XFS`, `BTRFS`, …) can be told apart from network (`NFS`, `CIFS`) and container-overlay (`OVERLAYFS`) sources.
 
