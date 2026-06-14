@@ -83,7 +83,6 @@ class WriteManager:
         self.output_process_file = f"{self.output_dir}/process/process_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_fs_snapshot_file = f"{self.output_dir}/filesystem_snapshot/filesystem_snapshot_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_pagefault_file = f"{self.output_dir}/pagefault/pagefault_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-        self.output_io_uring_file = f"{self.output_dir}/io_uring/io_uring_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
 
         # Create output directories
         os.makedirs(f"{self.output_dir}/system_spec", exist_ok=True)
@@ -93,7 +92,6 @@ class WriteManager:
         os.makedirs(f"{self.output_dir}/process", exist_ok=True)
         os.makedirs(f"{self.output_dir}/filesystem_snapshot", exist_ok=True)
         os.makedirs(f"{self.output_dir}/pagefault", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/io_uring", exist_ok=True)
 
         self.upload_manager = upload_manager
         self.automatic_upload = automatic_upload
@@ -105,7 +103,6 @@ class WriteManager:
         self.process_buffer = deque()
         self.fs_snap_buffer = deque()
         self.pagefault_buffer = deque()
-        self.io_uring_buffer = deque()
         
         # Event rate tracking
         self.event_timestamps = {
@@ -115,7 +112,6 @@ class WriteManager:
             'fs_state': deque(maxlen=1000),
             'proc_state': deque(maxlen=1000),
             'pagefault': deque(maxlen=1000),
-            'io_uring': deque(maxlen=1000),
         }
         
         # Dynamic thresholds (min, max). Raised roughly 10x from the original
@@ -130,7 +126,6 @@ class WriteManager:
             'fs_state': (80000, 200000),
             'proc_state': (80000, 100000),
             'pagefault': (80000, 400000),
-            'io_uring': (80000, 400000),
         }
         
         # Start adaptive sizing thread
@@ -152,7 +147,6 @@ class WriteManager:
         self.process_max_events = 80000  # Large enough to fit entire hourly snapshot
         self.fs_snap_max_events = 80000
         self.pagefault_max_events = 80000
-        self.io_uring_max_events = 80000
 
         # Per-stream locks. Buffer flushes are triggered both from the
         # perf-callback (polling) thread via append_*_log -> flush_*_only and
@@ -166,7 +160,6 @@ class WriteManager:
             'process':   threading.Lock(),
             'fs_snap':   threading.Lock(),
             'pagefault': threading.Lock(),
-            'io_uring':  threading.Lock(),
         }
 
         # File handles for each output
@@ -176,7 +169,6 @@ class WriteManager:
         self._process_handle = None
         self._pagefault_handle = None
         self._fs_snap_handle = None
-        self._io_uring_handle = None
 
         # Registry of the continuous event streams that support generic
         # rotation. Snapshots (process, fs_snap) are intentionally excluded:
@@ -188,7 +180,6 @@ class WriteManager:
             'block':     {'subdir': 'ds',        'prefix': 'ds',        'buf': 'block_buffer',     'handle': '_block_handle',     'file': 'output_block_file',     'log': 'Block'},
             'cache':     {'subdir': 'cache',     'prefix': 'cache',     'buf': 'cache_buffer',     'handle': '_cache_handle',     'file': 'output_cache_file',     'log': 'Cache'},
             'pagefault': {'subdir': 'pagefault', 'prefix': 'pagefault', 'buf': 'pagefault_buffer', 'handle': '_pagefault_handle', 'file': 'output_pagefault_file', 'log': 'PageFault'},
-            'io_uring':  {'subdir': 'io_uring',  'prefix': 'io_uring',  'buf': 'io_uring_buffer',  'handle': '_io_uring_handle',  'file': 'output_io_uring_file',  'log': 'IO_Uring'},
         }
 
         # Time/size based rotation so a slow stream's log doesn't wait until
@@ -247,7 +238,7 @@ class WriteManager:
         while True:
             time.sleep(10)  
             
-            for event_type in ['vfs', 'block', 'cache', 'fs_state','proc_state', 'pagefault', 'io_uring']:
+            for event_type in ['vfs', 'block', 'cache', 'fs_state','proc_state', 'pagefault']:
                 rate = self._calculate_event_rate(event_type)
                 min_limit, max_limit = self.dynamic_limits[event_type]
                 
@@ -272,8 +263,6 @@ class WriteManager:
                     self.process_max_events = new_limit
                 elif event_type == 'pagefault':
                     self.pagefault_max_events = new_limit
-                elif event_type == 'io_uring':
-                    self.io_uring_max_events = new_limit
 
     def _periodic_flush(self):
         """
@@ -330,9 +319,6 @@ class WriteManager:
             buffer_info.append(f"Cache:{len(self.cache_buffer)}")
         if len(self.pagefault_buffer) > 0:
             buffer_info.append(f"PgFault:{len(self.pagefault_buffer)}")
-        if len(self.io_uring_buffer) > 0:
-            buffer_info.append(f"IO_Uring:{len(self.io_uring_buffer)}")
-        
         if buffer_info:
             status_parts.append(f"Buffers: {', '.join(buffer_info)}")
         
@@ -390,10 +376,6 @@ class WriteManager:
     def should_flush_pagefault(self) -> bool:
         """Check if pagefault buffer should be flushed."""
         return (len(self.pagefault_buffer) >= self.pagefault_max_events)
-
-    def should_flush_io_uring(self) -> bool:
-        """Check if io_uring buffer should be flushed."""
-        return (len(self.io_uring_buffer) >= self.io_uring_max_events)
 
     def append_fs_snap_log(self, log_output: str):
         """
@@ -496,16 +478,6 @@ class WriteManager:
                 self.flush_pagefault_only()
         else:
             logger("error", "Invalid pagefault log output format. Expected a string.")
-
-    def append_io_uring_log(self, log_output: str):
-        """Add an io_uring event log entry."""
-        if isinstance(log_output, str):
-            self.io_uring_buffer.append(log_output)
-            self.event_timestamps['io_uring'].append(time.time())
-            if self.should_flush_io_uring():
-                self.flush_io_uring_only()
-        else:
-            logger("error", "Invalid io_uring log output format. Expected a string.")
 
     def direct_write(self, output_path: str, spec_str: str):
         """
@@ -708,10 +680,6 @@ class WriteManager:
         """Flush pagefault buffer to file (rotate + compress + upload)."""
         self._rotate_stream('pagefault')
 
-    def flush_io_uring_only(self):
-        """Flush io_uring buffer to file (rotate + compress + upload)."""
-        self._rotate_stream('io_uring')
-
     def _rotate_stream(self, key: str):
         """Rotate one continuous stream's current log and queue it for upload.
 
@@ -827,7 +795,6 @@ class WriteManager:
             self.fs_snap_buffer.clear()
         
         self.compress_log(self.output_pagefault_file)
-        self.compress_log(self.output_io_uring_file)
         self.compress_dir(self.output_dir)
 
 
@@ -840,7 +807,6 @@ class WriteManager:
         self.process_buffer.clear()
         self.fs_snap_buffer.clear()
         self.pagefault_buffer.clear()
-        self.io_uring_buffer.clear()
 
     def _write_buffer_to_file(self, buffer, file_handle, buffer_name: str):
         """
@@ -915,13 +881,6 @@ class WriteManager:
                         self._pagefault_handle = open(self.output_pagefault_file, 'a', buffering=8192)
                     self._write_buffer_to_file(self.pagefault_buffer, self._pagefault_handle, "PageFault")
 
-        def write_io_uring():
-            with self._stream_locks['io_uring']:
-                if self.io_uring_buffer:
-                    if self._io_uring_handle is None:
-                        self._io_uring_handle = open(self.output_io_uring_file, 'a', buffering=8192)
-                    self._write_buffer_to_file(self.io_uring_buffer, self._io_uring_handle, "IO_Uring")
-
         threads = []
         
         # Start parallel write threads for each buffer
@@ -954,11 +913,6 @@ class WriteManager:
             t7 = threading.Thread(target=write_pagefault)
             threads.append(t7)
             t7.start()
-
-        if self.io_uring_buffer:
-            t13 = threading.Thread(target=write_io_uring)
-            threads.append(t13)
-            t13.start()
 
         # Wait for all threads to complete
         for thread in threads:
@@ -1032,7 +986,6 @@ class WriteManager:
             (self._process_handle, "Process State"),
             (self._fs_snap_handle, "Filesystem Snapshot"),
             (self._pagefault_handle, "PageFault"),
-            (self._io_uring_handle, "IO_Uring"),
         ]
         
         for handle, name in handles:
@@ -1050,4 +1003,3 @@ class WriteManager:
         self._process_handle = None
         self._fs_snap_handle = None
         self._pagefault_handle = None
-        self._io_uring_handle = None

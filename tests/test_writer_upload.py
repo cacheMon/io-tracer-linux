@@ -117,7 +117,6 @@ class PerFileUploadTests(unittest.TestCase):
         self.assertGreaterEqual(self.wm.block_max_events, 80000)
         self.assertGreaterEqual(self.wm.cache_max_events, 100000)
         self.assertGreaterEqual(self.wm.pagefault_max_events, 80000)
-        self.assertGreaterEqual(self.wm.io_uring_max_events, 80000)
         # Dynamic minimums must stay consistent (min <= max) after enlargement.
         for name, (lo, hi) in self.wm.dynamic_limits.items():
             self.assertGreaterEqual(lo, 80000, name)
