@@ -123,17 +123,24 @@ install_bcc_arch() {
 
 install_python_deps_apt() {
     log_info "Installing Python dependencies..."
-    apt-get install -y python3-psutil python3-requests python3-zstandard
+    apt-get install -y python3-psutil python3-requests
+    # zstandard is optional: the tracer falls back to uncompressed traces when
+    # it is missing, so don't let an unavailable package abort the install.
+    apt-get install -y python3-zstandard || log_warning "python3-zstandard unavailable; traces will not be compressed"
 }
 
 install_python_deps_dnf() {
     log_info "Installing Python dependencies..."
-    dnf install -y python3-psutil python3-requests python3-zstandard
+    dnf install -y python3-psutil python3-requests
+    # Optional; see install_python_deps_apt.
+    dnf install -y python3-zstandard || log_warning "python3-zstandard unavailable; traces will not be compressed"
 }
 
 install_python_deps_pacman() {
     log_info "Installing Python dependencies..."
-    pacman -S --noconfirm python-psutil python-requests python-zstandard
+    pacman -S --noconfirm python-psutil python-requests
+    # Optional; see install_python_deps_apt.
+    pacman -S --noconfirm python-zstandard || log_warning "python-zstandard unavailable; traces will not be compressed"
 }
 
 install_git_if_needed() {
