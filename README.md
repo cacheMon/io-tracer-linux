@@ -39,26 +39,30 @@ pacman -S bcc bcc-tools python-bcc
 
 For more distros, visit the official [BCC's installation guide](https://github.com/iovisor/bcc/blob/master/INSTALL.md)
 
-3. Finally, install the remaining Python libraries!
-
-```bash
-# Ubuntu 
-sudo apt install python3-psutil
-sudo apt install python3-requests
-sudo apt install python3-pytest
-sudo apt install python3-zstandard
-
-
-# ... (adjust the package manager for other distros)
-```
-
-`zstandard` is used to compress trace logs (`.zst`). If it is missing the
-tracer still runs and keeps traces uncompressed, but installing it is
-recommended. You can also install all Python dependencies at once with:
+3. Finally, install the Python dependencies. The simplest way is to install
+them all at once from `requirements.txt`:
 
 ```bash
 pip install -r requirements.txt
 ```
+
+Or, if you prefer your distro's package manager:
+
+```bash
+# Ubuntu / Debian
+sudo apt install python3-psutil python3-requests python3-zstandard
+
+# Fedora
+sudo dnf install python3-psutil python3-requests python3-zstandard
+
+# Arch
+sudo pacman -S python-psutil python-requests python-zstandard
+```
+
+`zstandard` is used to compress trace logs (`.zst`). If it is missing the
+tracer still runs and keeps traces uncompressed, but installing it is
+recommended. To run the test suite you'll also need `pytest`
+(`pip install pytest`).
 
 ## Usage
 ```

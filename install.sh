@@ -123,17 +123,17 @@ install_bcc_arch() {
 
 install_python_deps_apt() {
     log_info "Installing Python dependencies..."
-    apt-get install -y python3-psutil python3-requests
+    apt-get install -y python3-psutil python3-requests python3-zstandard
 }
 
 install_python_deps_dnf() {
     log_info "Installing Python dependencies..."
-    dnf install -y python3-psutil python3-requests
+    dnf install -y python3-psutil python3-requests python3-zstandard
 }
 
 install_python_deps_pacman() {
     log_info "Installing Python dependencies..."
-    pacman -S --noconfirm python-psutil python-requests
+    pacman -S --noconfirm python-psutil python-requests python-zstandard
 }
 
 install_git_if_needed() {
