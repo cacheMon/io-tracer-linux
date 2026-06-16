@@ -728,11 +728,30 @@ BPF_ARRAY(block_req_id_gen, u64, 1);
 
 /* Block-tracing diagnostics counters (per-CPU, summed in userspace at exit):
  *   [0] requests issued, [1] requests completed (emitted),
- *   [2] completions with no matching issue ctx (LRU-evicted or pre-trace).
+ *   [2] completions with no matching issue ctx (LRU-evicted or pre-trace),
+ *   [3] completions dropped because the matched issue ctx was stale (implausible
+ *       device latency — see MAX_BLOCK_LATENCY_NS below).
  * A growing [2] relative to [1] indicates the issue map is being evicted under
  * load (i.e. completions are being dropped), which would explain block events
- * thinning out before the end of a long trace. */
-BPF_PERCPU_ARRAY(block_stats, u64, 3);
+ * thinning out before the end of a long trace. A growing [3] indicates (dev,
+ * sector) key reuse across a gap (a completion matched an unrelated, much older
+ * issue ctx). */
+BPF_PERCPU_ARRAY(block_stats, u64, 4);
+
+/* Plausibility ceilings for block latency. The (dev, sector) issue/insert maps
+ * are keyed by device+sector, which is NOT unique over time: a request that
+ * never reaches block_rq_complete (merged, requeued, or whose completion was
+ * missed) leaves a stale issue ctx in the LRU map, and a *later* request to the
+ * same (dev, sector) can then match it — yielding a latency of minutes-to-hours
+ * AND attributing the I/O to the wrong process (the stale ctx carries the old
+ * pid/tid/comm/ppid/req_id). Such matches are untrustworthy in their entirety,
+ * so completions whose device latency exceeds MAX_BLOCK_LATENCY_NS are dropped.
+ * Queue latency comes from a separate map and is only zeroed (rendered empty)
+ * rather than dropping the whole — otherwise-valid — completion.
+ * 60s is far above any real NVMe/SATA completion; raise if tracing media that
+ * can legitimately stall longer. */
+#define MAX_BLOCK_LATENCY_NS   (60ULL * 1000000000ULL)   /* 60 seconds */
+#define MAX_QUEUE_LATENCY_NS   (60ULL * 1000000000ULL)   /* 60 seconds */
 
 /* Configuration map - stores tracer PID to exclude self-tracing */
 BPF_HASH(tracer_config, u32, u32, 1);    /**< Key 0 = tracer PID to exclude */
@@ -796,6 +815,11 @@ BPF_HASH(rw_staging, u64, struct data_t, 10240);
 
 /* Staged mremap args from sys_mremap entry, consumed by the kretprobe. */
 BPF_HASH(mremap_staging, u64, struct mremap_args, 4096);
+
+/* Staged sendfile event from the do_sendfile entry probe, completed by its
+ * kretprobe which records the actual transferred byte count (the entry ``count``
+ * is only the requested ceiling, frequently SSIZE_MAX). */
+BPF_HASH(sendfile_staging, u64, struct data_t, 4096);
 
 /* ============================================================================
  * PERF OUTPUT BUFFERS
@@ -2636,14 +2660,42 @@ int trace_sendfile(struct pt_regs *ctx, int out_fd, int in_fd, loff_t *offset,
 
   struct data_t data = {};
   data.pid = pid;
+  data.tid = (u32)pid_tgid;
   data.ts = bpf_ktime_get_ns();
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
   data.op = OP_SENDFILE;
   data.inode = 0;
-  data.size = count;
+  data.size = 0;   /* set to actual transferred bytes at return; never the
+                      requested `count` ceiling (often SSIZE_MAX) */
   data.flags = 0;
 
-  events.perf_submit(ctx, &data, sizeof(data));
+  // Defer submission to the kretprobe, which records the real transferred byte
+  // count and the entry->return duration.
+  sendfile_staging.update(&pid_tgid, &data);
+  return 0;
+}
+
+/**
+ * @brief Trace sendfile() return — record actual bytes transferred and latency.
+ *
+ * The entry ``count`` is only the caller's requested ceiling (often SSIZE_MAX),
+ * so it is never used as ``size``; we record the syscall return (actual bytes
+ * moved, 0 on error/EOF) instead. We emit on ALL returns — like the vfs_read/
+ * vfs_write kretprobes — so failed and zero-byte sendfiles are captured and the
+ * userspace SENDFILE branch can format errno from the negative return_value.
+ */
+int trace_sendfile_ret(struct pt_regs *ctx) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  struct data_t *data = sendfile_staging.lookup(&pid_tgid);
+  if (!data) {
+    return 0;
+  }
+  long ret = PT_REGS_RC(ctx);
+  data->ret_val = (s64)ret;
+  data->latency_ns = bpf_ktime_get_ns() - data->ts;
+  data->size = (ret > 0) ? (u64)ret : 0;   /* actual bytes; 0 on error/EOF */
+  events.perf_submit(ctx, data, sizeof(*data));
+  sendfile_staging.delete(&pid_tgid);
   return 0;
 }
 
@@ -2772,11 +2824,31 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
   u64 end_ts = bpf_ktime_get_ns();
   u64 latency = end_ts - ictx->ts;
 
-  // Calculate queue time (time from insert to issue)
+  // Guard against (dev, sector) key reuse: if the device latency is implausibly
+  // large, this completion matched a stale issue ctx left behind by an earlier
+  // request that never completed. The latency AND the pid/comm/req_id carried by
+  // ictx are all untrustworthy, so drop the record entirely (counting it) rather
+  // than emit a multi-hour latency attributed to the wrong process.
+  if (latency > MAX_BLOCK_LATENCY_NS) {
+    u32 stat_stale = 3;
+    u64 *stale = block_stats.lookup(&stat_stale);
+    if (stale)
+      *stale += 1;
+    block_start_times.delete(&key);
+    block_insert_times.delete(&key);
+    return 0;
+  }
+
+  // Calculate queue time (time from insert to issue). The insert map shares the
+  // same non-unique (dev, sector) key, so an implausible value means the matched
+  // insert_ts is stale; zero it (rendered empty downstream) instead of dropping
+  // the otherwise-valid completion.
   u64 queue_time = 0;
   u64 *insert_ts = block_insert_times.lookup(&key);
   if (insert_ts && ictx->ts >= *insert_ts) {
     queue_time = ictx->ts - *insert_ts;
+    if (queue_time > MAX_QUEUE_LATENCY_NS)
+      queue_time = 0;
   }
 
   struct block_event event = {};

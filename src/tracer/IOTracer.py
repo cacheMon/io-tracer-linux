@@ -395,7 +395,7 @@ class IOTracer:
         errno_val = ""
         bytes_completed = ""
         duration_ns = ""
-        if op_name in ("READ", "WRITE"):
+        if op_name in ("READ", "WRITE", "SENDFILE"):
             ret = event.ret_val
             return_value = str(ret)
             if ret < 0:
@@ -1181,10 +1181,12 @@ class IOTracer:
         run_with_spinner("Flushing trace data", _flush)
 
     def _block_stats(self):
-        """Read the per-CPU ``block_stats`` map → {issued, completed, missed}.
+        """Read the per-CPU ``block_stats`` map → {issued, completed, missed, stale}.
 
         Returns an empty dict if the map is unavailable or all-zero. ``missed``
-        counts completions with no tracked issue ctx (LRU-evicted or pre-trace).
+        counts completions with no tracked issue ctx (LRU-evicted or pre-trace);
+        ``stale`` counts completions dropped because the matched issue ctx had an
+        implausible device latency ((dev, sector) key reused across a gap).
         """
         try:
             stats = self.b["block_stats"]
@@ -1192,6 +1194,7 @@ class IOTracer:
                 "issued":    int(sum(stats[ctypes.c_int(0)])),
                 "completed": int(sum(stats[ctypes.c_int(1)])),
                 "missed":    int(sum(stats[ctypes.c_int(2)])),
+                "stale":     int(sum(stats[ctypes.c_int(3)])),
             }
         except Exception:
             return {}
@@ -1207,12 +1210,14 @@ class IOTracer:
         s = self._block_stats()
         if not s:
             return
-        total_completions = s["completed"] + s["missed"]
+        stale = s.get("stale", 0)
+        total_completions = s["completed"] + s["missed"] + stale
         miss_pct = (s["missed"] / total_completions * 100) if total_completions else 0.0
         logger("info",
                f"Block diagnostics: {s['issued']} issued, {s['completed']} completed, "
                f"{s['missed']} completions without a tracked issue "
-               f"({miss_pct:.1f}% of completions). A high miss rate indicates the "
+               f"({miss_pct:.1f}% of completions), {stale} dropped as stale "
+               f"((dev,sector) key reuse). A high miss rate indicates the "
                f"issue map was evicted under load (dropped completions).")
 
     def _attached_probes(self):
