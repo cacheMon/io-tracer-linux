@@ -91,6 +91,21 @@ def main():
             b.attach_kretprobe(event=event, fn_name=fn)
         print(f"OK: attached {kind} {event} -> {fn}")
 
+    # Clean up the default program before compiling the network-enabled variant
+    # so the two BPF objects don't hold overlapping probes simultaneously.
+    b.cleanup()
+
+    # Opt-in network subset: compile + load with -DENABLE_NETWORK so the
+    # connection/epoll/sockopt/drop probes get verifier coverage too. Their
+    # TRACEPOINT_PROBE handlers auto-attach on load, so a successful BPF()
+    # construction validates both compile and attach.
+    net_cflags = build_cflags() + ["-DENABLE_NETWORK"]
+    print(f"cflags (network): {net_cflags}")
+    b_net = BPF(src_file=BPF_FILE.encode(), cflags=net_cflags)
+    print("OK: prober.c compiled with ENABLE_NETWORK (verifier passed, "
+          "network tracepoints auto-attached).")
+    b_net.cleanup()
+
     print("SUCCESS: BPF compile, load, and VFS probe attach all passed.")
     return 0
 

@@ -16,6 +16,10 @@ Subcommands:
 Options:
     -v, --verbose             Print verbose output
     -a, --anonimize           Enable anonymization of process and file names
+    --cache                   Enable page-cache event tracing (off by default;
+                              higher overhead)
+    --network                 Enable network event tracing — connection
+                              lifecycle, epoll, sockopt, drops (off by default)
     --computer-id             Print this machine ID and exit
     --reward                  Show your reward code (unlocked after uploading traces)
     --no-upload               Disable automatic upload of traces
@@ -74,6 +78,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Trace IO syscalls')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
     parser.add_argument('-a', '--anonimize', action='store_true', help='Enable anonymization of process and file names')
+    parser.add_argument('--cache', action='store_true', help='Enable page-cache event tracing (off by default; higher overhead)')
+    parser.add_argument('--network', action='store_true', help='Enable network event tracing: connection lifecycle, epoll, sockopt, drops (off by default)')
     parser.add_argument('--computer-id', action='store_true', help='Print this machine ID and exit')
     parser.add_argument('--reward', action='store_true', help='Show your reward code (unlocked after uploading traces)')
     parser.add_argument('--no-upload', action='store_true', help='Disable automatic upload of traces (for testing)')
@@ -82,6 +88,8 @@ if __name__ == "__main__":
     dev_parser = subparsers.add_parser('dev', help='Run in developer mode with extra logs and checks')
     dev_parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
     dev_parser.add_argument('-a', '--anonimize', action='store_true', help='Enable anonymization of process and file names')
+    dev_parser.add_argument('--cache', action='store_true', help='Enable page-cache event tracing (off by default; higher overhead)')
+    dev_parser.add_argument('--network', action='store_true', help='Enable network event tracing: connection lifecycle, epoll, sockopt, drops (off by default)')
     dev_parser.add_argument('--no-upload', action='store_true', help='Disable automatic upload of traces (for testing)')
     dev_parser.add_argument('--trace-bucket', type=str, default=None, help='Override upload bucket name (default: linux_trace_v4_test)')
 
@@ -106,6 +114,8 @@ if __name__ == "__main__":
     verbose = parse_args.verbose
     anonimize = parse_args.anonimize
     no_upload = parse_args.no_upload
+    trace_cache = parse_args.cache
+    trace_network = parse_args.network
     trace_bucket = parse_args.trace_bucket if developer_mode else None
 
     # Initialize and start the IO tracer
@@ -119,5 +129,7 @@ if __name__ == "__main__":
         developer_mode=developer_mode,
         version=app_version,
         trace_bucket=trace_bucket,
+        trace_cache=trace_cache,
+        trace_network=trace_network,
     )
     tracer.trace()
