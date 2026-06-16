@@ -15,10 +15,8 @@ Example:
     snapper.stop_snapper()  # Stop the snapper
 """
 
-import random
-from ...utility.utils import format_csv_row, logger, compress_log, hash_rel_path, hash_filename_in_path
+from ...utility.utils import format_csv_row, logger, compress_log, anonymize_path
 from ..WriterManager import WriteManager
-from pathlib import Path
 from datetime import datetime
 import shutil
 import os
@@ -86,8 +84,6 @@ class FilesystemSnapper:
         def scan_dir(path: str, depth: int = 0):
             """Inner function for recursive directory scanning."""
             nonlocal count
-            if random.random() < 0.3:
-                time.sleep(0.02)
             if self.interrupt or (max_depth is not None and depth > max_depth):
                 return
             try:
@@ -114,21 +110,19 @@ class FilesystemSnapper:
                                     mtime = datetime.fromtimestamp(est.st_mtime)
                                     atime = datetime.fromtimestamp(est.st_atime)
 
-                                    rel = Path(os.path.relpath(entry.path, start=self.root_path))
-                                    hashed_rel = hash_rel_path(rel, keep_ext=True, length=12)
-                                    hashed_path = os.path.join(os.sep, str(hashed_rel))
-                                    hashed_path = hash_filename_in_path(Path(hashed_path))
+                                    # Anonymize like the live fs stream: hash every
+                                    # path component (basename included), keep depth.
+                                    hashed_path = anonymize_path(entry.path, keep_ext=True, length=12)
                                     out = format_csv_row(snapshot_timestamp, hashed_path, size, ctime, mtime, atime, snapshot_mono_ns)
                                     self.wm.append_fs_snap_log(out)
                                     count += 1  
                                 else:
                                     est = entry.stat(follow_symlinks=False)
                                     size = est.st_size
-                                    hashed_path_str = hash_filename_in_path(Path(entry.path))
                                     ctime = datetime.fromtimestamp(getattr(est, "st_birthtime", est.st_mtime))
                                     mtime = datetime.fromtimestamp(est.st_mtime)
                                     atime = datetime.fromtimestamp(est.st_atime)
-                                    out = format_csv_row(snapshot_timestamp, hashed_path_str, size, ctime, mtime, atime, snapshot_mono_ns)
+                                    out = format_csv_row(snapshot_timestamp, entry.path, size, ctime, mtime, atime, snapshot_mono_ns)
                                     self.wm.append_fs_snap_log(out)
                                     count += 1     
                             elif entry.is_dir(follow_symlinks=False):

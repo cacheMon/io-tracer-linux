@@ -20,6 +20,7 @@ from src.utility.utils import (
     simple_hash,
     hash_component,
     hash_filename_in_path,
+    anonymize_path,
     inet4_from_event,
 )
 
@@ -65,6 +66,28 @@ class HashTests(unittest.TestCase):
         self.assertTrue(out.startswith("/home/user/"))
         self.assertTrue(out.endswith(".log"))
         self.assertNotIn("secret", out)
+
+    def test_anonymize_path_hashes_every_component(self):
+        out = anonymize_path("/home/alice/clientX/.ssh/id_rsa")
+        self.assertTrue(out.startswith("/"))
+        # No cleartext component survives — not even the first directory.
+        for leaked in ("home", "alice", "clientX", "id_rsa"):
+            self.assertNotIn(leaked, out)
+        # Directory depth (number of separators) is preserved.
+        self.assertEqual(out.count("/"), "/home/alice/clientX/.ssh/id_rsa".count("/"))
+
+    def test_anonymize_path_hashes_bare_basename(self):
+        # The bug this guards against: hash_rel_path left short paths in cleartext.
+        out = anonymize_path("id_rsa")
+        self.assertNotIn("id_rsa", out)
+        out2 = anonymize_path("proj/key.pem")
+        self.assertNotIn("proj", out2)
+        self.assertNotIn("key", out2)
+        self.assertTrue(out2.endswith(".pem"))
+
+    def test_anonymize_path_is_deterministic(self):
+        p = "/var/log/secret.log"
+        self.assertEqual(anonymize_path(p), anonymize_path(p))
 
 
 class InetTests(unittest.TestCase):

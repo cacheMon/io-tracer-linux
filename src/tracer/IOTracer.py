@@ -28,12 +28,11 @@ from bcc import BPF
 import time
 import sys
 from bisect import bisect_right
-from pathlib import Path
 from datetime import datetime
 
 from . import schema
 from .ObjectStorageManager import ObjectStorageManager
-from ..utility.utils import capture_machine_id, format_csv_row, logger, hash_filename_in_path, inet6_from_event, simple_hash, run_with_spinner
+from ..utility.utils import capture_machine_id, format_csv_row, logger, anonymize_path, inet6_from_event, simple_hash, run_with_spinner
 from .WriterManager import WriteManager
 from .FlagMapper import FlagMapper
 from .KernelProbeTracker import KernelProbeTracker
@@ -42,6 +41,16 @@ from .PathResolver import PathResolver
 from .snappers.FilesystemSnapper import FilesystemSnapper
 from .snappers.ProcessSnapper import ProcessSnapper
 from .snappers.SystemSnapper import SystemSnapper
+
+
+# VFS ops that never carry an I/O size; their `size` column is left empty per the
+# schema ("empty for non-I/O ops"). Every other op keeps its numeric size,
+# including a legitimate 0 (e.g. an EOF read or 0-byte write).
+_NON_IO_SIZE_OPS = frozenset({
+    "OPEN", "CLOSE", "GETATTR", "SETATTR", "CHDIR", "READDIR", "UNLINK",
+    "SYNC", "RENAME", "MKDIR", "RMDIR", "LINK", "SYMLINK",
+    "PROCESS_EXEC", "PROCESS_EXIT",
+})
 
 
 class IOTracer:
@@ -272,7 +281,7 @@ class IOTracer:
         try:
             filename = event.filename.decode()
             if self.anonymous:
-                filename = hash_filename_in_path(Path(filename))
+                filename = anonymize_path(filename)
             if op_name in ['MKDIR', 'RMDIR', 'CHDIR', 'READDIR'] and filename and not filename.endswith('/'):
                 filename += '/'
         except UnicodeDecodeError:
@@ -290,7 +299,11 @@ class IOTracer:
 
         inode_val = event.inode if event.inode != 0 else ""
         
-        size_val = event.size if event.size is not None else 0
+        # Empty only for non-I/O ops (schema: "empty for non-I/O ops"); I/O ops
+        # keep their numeric size INCLUDING a legitimate 0 (EOF read, 0-byte
+        # write, 0-range fsync). Gating on op type — not truthiness — avoids
+        # blanking real 0-byte I/O.
+        size_val = "" if op_name in _NON_IO_SIZE_OPS else event.size
         address_val = ""
         raw_address = event.address if hasattr(event, 'address') else 0
         if raw_address:
@@ -354,9 +367,9 @@ class IOTracer:
 
         if raw_address:
             if op_name == "MMAP":
-                self._track_mmap_region(event.pid, raw_address, size_val, filename)
+                self._track_mmap_region(event.pid, raw_address, event.size, filename)
             elif op_name == "MUNMAP":
-                resolved_filename = self._resolve_munmap_filename(event.pid, raw_address, size_val)
+                resolved_filename = self._resolve_munmap_filename(event.pid, raw_address, event.size)
                 if resolved_filename:
                     filename = resolved_filename
 
@@ -369,7 +382,7 @@ class IOTracer:
             old_addr_val = event.old_addr if hasattr(event, 'old_addr') else 0
             old_size_val = event.old_size if hasattr(event, 'old_size') else 0
             resolved_filename = self._handle_mremap(
-                event.pid, old_addr_val, old_size_val, raw_address, size_val
+                event.pid, old_addr_val, old_size_val, raw_address, event.size
             )
             if resolved_filename:
                 filename = resolved_filename
@@ -696,8 +709,8 @@ class IOTracer:
             filename_old = event.filename_old.decode()
             filename_new = event.filename_new.decode()
             if self.anonymous:
-                filename_old = hash_filename_in_path(Path(filename_old))
-                filename_new = hash_filename_in_path(Path(filename_new))
+                filename_old = anonymize_path(filename_old)
+                filename_new = anonymize_path(filename_new)
         except UnicodeDecodeError:
             filename_old = ""
             filename_new = ""
@@ -1091,7 +1104,7 @@ class IOTracer:
             if cached:
                 filename = cached
             if self.anonymous and filename:
-                filename = hash_filename_in_path(Path(filename))
+                filename = anonymize_path(filename)
 
         # Mirror completed file READ/WRITE into the main fs/VFS trace stream.
         self._mirror_io_uring_to_fs(e, comm, filename, ts, dev_val, fs_type_val)

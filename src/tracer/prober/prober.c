@@ -1632,9 +1632,11 @@ int trace_vfs_fsync_range(struct pt_regs *ctx, struct file *file, loff_t start,
   }
 
   if (end == LLONG_MAX) {
-    range_size = file_size - start;
+    // file_size stays 0 if file/f_inode was unreadable; guard against a
+    // negative (start > file_size) result that would wrap to a huge u64 size.
+    range_size = (file_size > start) ? file_size - start : 0;
   } else {
-    range_size = end - start;
+    range_size = (end > start) ? end - start : 0;
   }
 
   struct data_t data = {};
@@ -2044,8 +2046,13 @@ int trace_vfs_setattr(struct pt_regs *ctx) {
     return 0;
   }
 
-  /* notify_change: arg1 = mnt_idmap*, arg2 = dentry*, arg3 = iattr* */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+  /* >=5.12: notify_change(struct mnt_idmap/user_namespace *, dentry *, iattr *) */
   struct dentry *dentry = (struct dentry *)PT_REGS_PARM2(ctx);
+#else
+  /* <5.12: notify_change(struct dentry *, struct iattr *, ...) — dentry is PARM1 */
+  struct dentry *dentry = (struct dentry *)PT_REGS_PARM1(ctx);
+#endif
   if (!dentry) {
     return 0;
   }
@@ -4911,6 +4918,13 @@ TRACEPOINT_PROBE(syscalls, sys_enter_epoll_ctl) {
   return 0;
 }
 
+/* The legacy select(2)/poll(2)/epoll_wait(2) syscalls (and thus their
+ * syscalls:sys_enter/exit_* tracepoints) exist only on architectures that keep
+ * the old syscall table (x86). arm64 and other asm-generic arches implement
+ * only pselect6/ppoll/epoll_pwait, so referencing these tracepoints there makes
+ * BCC fail the ENTIRE BPF load. Guard them to x86; pselect6 below is handled on
+ * all arches. */
+#if defined(__x86_64__) || defined(__i386__) || defined(bpf_target_x86)
 TRACEPOINT_PROBE(syscalls, sys_enter_epoll_wait) {
   u64 tid = bpf_get_current_pid_tgid();
   u32 pid = tid >> 32;
@@ -5005,6 +5019,7 @@ TRACEPOINT_PROBE(syscalls, sys_exit_select) {
   select_ctx.delete(&tid);
   return 0;
 }
+#endif /* x86-only legacy select/poll/epoll_wait */
 
 /* pselect6() syscall - modern libc select() uses this */
 TRACEPOINT_PROBE(syscalls, sys_enter_pselect6) {
@@ -5030,6 +5045,79 @@ TRACEPOINT_PROBE(syscalls, sys_exit_pselect6) {
   e.ready_count = (s32)args->ret;
   net_epoll_events.perf_submit(args, &e, sizeof(e));
   select_ctx.delete(&tid);
+  return 0;
+}
+
+/* ppoll() syscall - modern libc poll() and the only poll on arm64/asm-generic.
+ * Mirrors the poll() handler (reuses poll_ctx); the ppoll timeout is a timespec
+ * we don't record, matching poll()'s behavior. */
+TRACEPOINT_PROBE(syscalls, sys_enter_ppoll) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  u64 ts = bpf_ktime_get_ns();
+  poll_ctx.update(&tid, &ts);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_ppoll) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u64 *start_ts = poll_ctx.lookup(&tid);
+  if (!start_ts) return 0;
+
+  struct epoll_event_data e = {};
+  fill_epoll_common(&e, EPOLL_EV_POLL);
+  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
+  e.ready_count = (s32)args->ret;
+  net_epoll_events.perf_submit(args, &e, sizeof(e));
+  poll_ctx.delete(&tid);
+  return 0;
+}
+
+/* epoll_pwait() syscall - what modern libc epoll_wait() issues, and the only
+ * epoll wait on arm64/asm-generic. Mirrors the epoll_wait() handler (reuses
+ * epoll_wait_ctx/epoll_wait_info); the leading args match epoll_wait. */
+TRACEPOINT_PROBE(syscalls, sys_enter_epoll_pwait) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  u64 ts = bpf_ktime_get_ns();
+  epoll_wait_ctx.update(&tid, &ts);
+
+  struct epoll_event_data info = {};
+  info.epoll_fd = (u32)args->epfd;
+  info.max_events = (u32)args->maxevents;
+  info.timeout_ms = (u64)(int)args->timeout;
+  epoll_wait_info.update(&tid, &info);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_epoll_pwait) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u64 *start_ts = epoll_wait_ctx.lookup(&tid);
+  if (!start_ts) return 0;
+
+  struct epoll_event_data e = {};
+  fill_epoll_common(&e, EPOLL_EV_WAIT);
+  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
+  e.ready_count = (s32)args->ret;
+
+  struct epoll_event_data *info = epoll_wait_info.lookup(&tid);
+  if (info) {
+    e.epoll_fd = info->epoll_fd;
+    e.max_events = info->max_events;
+    e.timeout_ms = info->timeout_ms;
+    epoll_wait_info.delete(&tid);
+  }
+
+  net_epoll_events.perf_submit(args, &e, sizeof(e));
+  epoll_wait_ctx.delete(&tid);
   return 0;
 }
 
