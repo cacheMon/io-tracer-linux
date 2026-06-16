@@ -72,6 +72,12 @@ class ObjectStorageManager:
         self.successful_upload = 0
         self.app_version = version
         self.trace_bucket = trace_bucket
+        # Per-file upload attempt counts. A permanently-failing ("poison") shard
+        # is dropped after MAX_UPLOAD_ATTEMPTS instead of being requeued forever
+        # — an unbounded requeue both hot-spins the worker and prevents
+        # clean_queue()/stop_worker() from ever draining the queue.
+        self._attempts: dict[str, int] = {}
+        self.MAX_UPLOAD_ATTEMPTS = 5
 
 
     def test_connection(self) -> bool:
@@ -195,14 +201,29 @@ class ObjectStorageManager:
             try:
                 self.put_object(fp)
                 backoff = 1  # Reset backoff after success
+                self._attempts.pop(fp, None)
             except FileNotFoundError as e:
                 # File was already uploaded and deleted, don't requeue
                 logger("debug", f"File already uploaded: {str(e)}")
+                self._attempts.pop(fp, None)
             except Exception as e:
-                logger("warn", f"Upload error: {str(e)}. Requeueing.")
-                self.file_queue.put(fp)
-                self._stop.wait(backoff)
-                backoff = min(backoff * 2, 10)
+                attempts = self._attempts.get(fp, 0) + 1
+                self._attempts[fp] = attempts
+                if attempts >= self.MAX_UPLOAD_ATTEMPTS:
+                    # Give up on this shard rather than requeue forever (which
+                    # would spin the worker and block queue drain on shutdown).
+                    # The local file is left on disk for a later manual retry.
+                    self._attempts.pop(fp, None)
+                    logger("error",
+                           f"Upload of {fp} failed {attempts} times; giving up "
+                           f"(kept locally): {str(e)}")
+                else:
+                    logger("warn",
+                           f"Upload error ({attempts}/{self.MAX_UPLOAD_ATTEMPTS}): "
+                           f"{str(e)}. Requeueing.")
+                    self.file_queue.put(fp)
+                    self._stop.wait(backoff)
+                    backoff = min(backoff * 2, 10)
             finally:
                 self.file_queue.task_done()
 

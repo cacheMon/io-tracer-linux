@@ -76,10 +76,8 @@ class KernelProbeTracker:
             kprobe: Name of the BPF function to call when probe triggers
             
         Returns:
-            bool: True if attachment succeeded, False otherwise
-            
-        Raises:
-            SystemExit: If probe attachment fails
+            bool: True if attachment succeeded, False otherwise (best-effort —
+            a probe that cannot attach is skipped, not fatal).
         """
         try:
             # logger("info", f"Attaching kprobe {event} to {kprobe}")
@@ -87,8 +85,11 @@ class KernelProbeTracker:
             self.kprobes.append((event, k))
             return True
         except Exception as e:
-            logger("error", f"Failed to attach kprobe {event}: {e}")
-            sys.exit(1)
+            # Best-effort: a single missing/un-kprobe-able symbol (inlined, or
+            # renamed across kernels/arches — many call sites here have no arch
+            # fallback) must not abort the whole tracer. Skip it and continue;
+            # attach_probes() aborts only if NOTHING attached (see its tail).
+            logger("warning", f"Failed to attach kprobe {event} (skipping): {e}")
             return False
 
     def add_kretprobe(self, event: str, kprobe: str) -> bool:
@@ -100,10 +101,8 @@ class KernelProbeTracker:
             kprobe: Name of the BPF function to call when probe triggers
             
         Returns:
-            bool: True if attachment succeeded, False otherwise
-            
-        Raises:
-            SystemExit: If probe attachment fails
+            bool: True if attachment succeeded, False otherwise (best-effort —
+            a probe that cannot attach is skipped, not fatal).
         """
         try:
             # logger("info", f"Attaching kprobe {event} to {kprobe}")
@@ -111,8 +110,9 @@ class KernelProbeTracker:
             self.kretprobes.append((event, k))
             return True
         except Exception as e:
-            logger("error", f"Failed to attach kretprobe {event}: {e}")
-            sys.exit(1)
+            # Best-effort, as in add_kprobe: skip a probe that can't attach on
+            # this kernel/arch rather than killing the entire tracing session.
+            logger("warning", f"Failed to attach kretprobe {event} (skipping): {e}")
             return False
         
     def detach_kprobes(self):
