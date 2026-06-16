@@ -403,6 +403,124 @@ struct cache_data {
   u32 count;                /**< Number of pages (for batch operations) */
 };
 
+#ifdef ENABLE_NETWORK
+/* ============================================================================
+ * NETWORK I/O STRUCTURES (low-overhead subset)
+ * ============================================================================
+ * Connection-lifecycle, epoll/multiplexing, socket-option, and drop/retransmit
+ * events. The high-frequency per-packet TCP/UDP send/recv path is intentionally
+ * omitted to keep kernel-side overhead minimal.
+ */
+
+struct connect_ctx_t {
+  u64 start_ts; /**< Timestamp at entry */
+  u32 fd;       /**< Socket fd from sys_enter_connect */
+  u8  ipver;    /**< 4 or 6 */
+  u16 dport;    /**< Remote port (host byte order) */
+  u32 daddr_v4; /**< Remote IPv4 address */
+  u8  daddr_v6[16]; /**< Remote IPv6 address */
+};
+
+/* ---- Connection lifecycle event types ---- */
+enum conn_event_type {
+  CONN_SOCKET  = 0,
+  CONN_BIND    = 1,
+  CONN_LISTEN  = 2,
+  CONN_ACCEPT  = 3,
+  CONN_CONNECT = 4,
+  CONN_SHUTDOWN = 5,
+  CONN_CLOSE   = 6
+};
+
+/** @brief Connection lifecycle event data */
+struct conn_event_data {
+  u64 ts_ns;
+  u32 pid;
+  u32 tid;
+  char comm[TASK_COMM_LEN];
+  u8 event_type;    /**< conn_event_type enum */
+  u8 ipver;
+  u8 proto;
+  u16 domain;       /**< AF_INET, AF_INET6, etc. */
+  u16 sock_type;    /**< SOCK_STREAM, SOCK_DGRAM, etc. */
+  u16 sport;
+  u16 dport;
+  u32 saddr_v4;
+  u32 daddr_v4;
+  u8 saddr_v6[16];
+  u8 daddr_v6[16];
+  u32 fd;
+  u32 backlog;        /**< For listen(): listen backlog size */
+  u32 shutdown_how;   /**< For shutdown(): SHUT_RD/SHUT_WR/SHUT_RDWR */
+  s32 ret_val;
+  u64 latency_ns;
+};
+
+/* ---- Epoll/multiplexing event types ---- */
+enum epoll_event_type {
+  EPOLL_EV_CREATE = 0,
+  EPOLL_EV_CTL    = 1,
+  EPOLL_EV_WAIT   = 2,
+  EPOLL_EV_POLL   = 3,
+  EPOLL_EV_SELECT = 4
+};
+
+/** @brief Epoll/multiplexing event data */
+struct epoll_event_data {
+  u64 ts_ns;
+  u32 pid;
+  u32 tid;
+  char comm[TASK_COMM_LEN];
+  u8 event_type;    /**< epoll_event_type enum */
+  u32 epoll_fd;
+  u32 target_fd;
+  u32 epoll_op;     /**< EPOLL_CTL_ADD/MOD/DEL */
+  u32 epoll_events; /**< Event mask */
+  u32 max_events;
+  s32 ready_count;
+  u64 timeout_ms;
+  u64 latency_ns;
+};
+
+/** @brief Socket option event data */
+struct sockopt_event_data {
+  u64 ts_ns;
+  u32 pid;
+  char comm[TASK_COMM_LEN];
+  u8 event_type;    /**< 0 = SET, 1 = GET */
+  u32 fd;
+  u32 level;
+  u32 optname;
+  s64 optval;
+  s32 ret_val;
+};
+
+/* ---- Network drop/retransmit event types ---- */
+enum net_drop_type {
+  NET_DROP_PACKET    = 0,
+  NET_DROP_RETRANSMIT = 1
+};
+
+/** @brief Network drop/retransmission event data */
+struct net_drop_data {
+  u64 ts_ns;
+  u32 pid;
+  char comm[TASK_COMM_LEN];
+  u8 event_type;    /**< net_drop_type enum */
+  u8 ipver;
+  u8 proto;
+  u16 sport;
+  u16 dport;
+  u32 saddr_v4;
+  u32 daddr_v4;
+  u8 saddr_v6[16];
+  u8 daddr_v6[16];
+  u32 skb_len;
+  u32 drop_reason;
+  u32 state;        /**< TCP state for retransmit events */
+};
+#endif /* ENABLE_NETWORK */
+
 /* ============================================================================
  * IO_URING TRACING STRUCTURES
  * ============================================================================
@@ -627,6 +745,22 @@ BPF_HASH(dio_staging, u64, u8, 10240);
  * duplicate event for the nested vfs_fsync -> vfs_fsync_range call. */
 BPF_HASH(fsync_inflight, u64, u64, 10240);
 
+#ifdef ENABLE_NETWORK
+/* Connection lifecycle context maps (low-overhead network subset) */
+BPF_HASH(accept_ctx, u64, u64);   /**< Accept start timestamp */
+BPF_HASH(connect_ctx, u64, struct connect_ctx_t); /**< Connect start timestamp + fd */
+BPF_HASH(socket_create_ctx, u64, struct conn_event_data); /**< Socket create context */
+BPF_HASH(socket_fds, u64, u8);  /**< Track socket file descriptors (key: (pid<<32)|fd) */
+
+/* Epoll wait context */
+BPF_HASH(epoll_wait_ctx, u64, u64); /**< Epoll_wait start timestamp */
+BPF_HASH(epoll_wait_info, u64, struct epoll_event_data); /**< Epoll_wait context data */
+
+/* Poll/select context */
+BPF_HASH(poll_ctx, u64, u64);      /**< Poll start timestamp */
+BPF_HASH(select_ctx, u64, u64);    /**< Select start timestamp */
+#endif /* ENABLE_NETWORK */
+
 /* io_uring request tracking map. LRU because completions that bypass the
  * probed completion path (batched completions on modern kernels) would
  * otherwise leak entries until the map is permanently full. */
@@ -674,6 +808,12 @@ BPF_PERF_OUTPUT(events);            /**< VFS single-path events (data_t) */
 BPF_PERF_OUTPUT(events_dual);       /**< VFS dual-path events (data_dual_t) */
 BPF_PERF_OUTPUT(bl_events);         /**< Block layer events (block_event) */
 BPF_PERF_OUTPUT(cache_events);      /**< Page cache events (cache_data) */
+#ifdef ENABLE_NETWORK
+BPF_PERF_OUTPUT(net_conn_events);   /**< Connection lifecycle events (conn_event_data) */
+BPF_PERF_OUTPUT(net_epoll_events);  /**< Epoll/multiplexing events (epoll_event_data) */
+BPF_PERF_OUTPUT(net_sockopt_events);/**< Socket option events (sockopt_event_data) */
+BPF_PERF_OUTPUT(net_drop_events);   /**< Drop/retransmit events (net_drop_data) */
+#endif /* ENABLE_NETWORK */
 BPF_PERF_OUTPUT(pagefault_events);  /**< Memory-mapped page faults (pagefault_data) */
 BPF_PERF_OUTPUT(io_uring_events);   /**< io_uring events (io_uring_event_data) */
 
@@ -4288,3 +4428,703 @@ TRACEPOINT_PROBE(io_uring, io_uring_complete) {
   return 0;
 }
 #endif /* disabled io_uring tracepoints */
+
+#ifdef ENABLE_NETWORK
+/* ============================================================================
+ * NETWORK PROBES (low-overhead subset)
+ * ============================================================================
+ * Connection lifecycle, epoll/multiplexing, socket-option, and drop/retransmit
+ * probes. Compiled and attached only when -DENABLE_NETWORK is passed (the
+ * --network CLI flag). The per-packet TCP/UDP send/recv path is intentionally
+ * excluded to keep kernel-side overhead minimal.
+ */
+
+/* ---- Connection lifecycle helpers ---- */
+
+/**
+ * @brief Resolve struct sock * from a file descriptor via the task's fd table.
+ * Returns NULL on any failure.
+ */
+static __always_inline struct sock *get_sock_from_fd(u32 fd) {
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+  if (!task) return NULL;
+
+  struct files_struct *files = NULL;
+  bpf_probe_read_kernel(&files, sizeof(files), &task->files);
+  if (!files) return NULL;
+
+  struct fdtable *fdt = NULL;
+  bpf_probe_read_kernel(&fdt, sizeof(fdt), &files->fdt);
+  if (!fdt) return NULL;
+
+  /* Bound fd against the table size before indexing. fd comes from a
+   * user-supplied syscall arg and can be arbitrarily large; without this the
+   * computed &fd_array[fd] could point outside the table (a wild but possibly
+   * mapped address) and yield a bogus socket pointer. */
+  unsigned int max_fds = 0;
+  bpf_probe_read_kernel(&max_fds, sizeof(max_fds), &fdt->max_fds);
+  if (fd >= max_fds) return NULL;
+
+  struct file **fd_array = NULL;
+  bpf_probe_read_kernel(&fd_array, sizeof(fd_array), &fdt->fd);
+  if (!fd_array) return NULL;
+
+  struct file *filep = NULL;
+  bpf_probe_read_kernel(&filep, sizeof(filep), &fd_array[fd]);
+  if (!filep) return NULL;
+
+  /* file->private_data == struct socket * for socket fds */
+  struct socket *sock = NULL;
+  bpf_probe_read_kernel(&sock, sizeof(sock), &filep->private_data);
+  if (!sock) return NULL;
+
+  struct sock *sk = NULL;
+  bpf_probe_read_kernel(&sk, sizeof(sk), &sock->sk);
+  return sk;
+}
+
+/**
+ * @brief Fill address/port fields in conn_event_data from a struct sock *.
+ * Handles IPv4 and IPv6; no-ops for other families.
+ */
+static __always_inline void fill_conn_addr_from_sock(struct conn_event_data *e,
+                                                     struct sock *sk) {
+  if (!sk) return;
+  u16 family = 0;
+  bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+  if (family == AF_INET) {
+    e->ipver = 4;
+    struct inet_sock *inet = (struct inet_sock *)sk;
+    bpf_probe_read_kernel(&e->saddr_v4, sizeof(e->saddr_v4), &inet->inet_saddr);
+    bpf_probe_read_kernel(&e->daddr_v4, sizeof(e->daddr_v4), &inet->inet_daddr);
+    u16 sport = 0, dport = 0;
+    bpf_probe_read_kernel(&sport, sizeof(sport), &inet->inet_sport);
+    bpf_probe_read_kernel(&dport, sizeof(dport), &inet->inet_dport);
+    e->sport = bpf_ntohs(sport);
+    e->dport = bpf_ntohs(dport);
+  } else if (family == AF_INET6) {
+    e->ipver = 6;
+    unsigned __int128 saddr6 = 0, daddr6 = 0;
+    u16 sport = 0, dport = 0;
+    bpf_probe_read_kernel(&saddr6, sizeof(saddr6),
+                          &sk->__sk_common.skc_v6_rcv_saddr.in6_u);
+    bpf_probe_read_kernel(&daddr6, sizeof(daddr6),
+                          &sk->__sk_common.skc_v6_daddr.in6_u);
+    bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
+    bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
+    __builtin_memcpy(e->saddr_v6, &saddr6, 16);
+    __builtin_memcpy(e->daddr_v6, &daddr6, 16);
+    e->sport = sport;
+    e->dport = bpf_ntohs(dport);
+  }
+}
+
+/** @brief Helper to fill common conn_event_data fields */
+static __always_inline void fill_conn_common(struct conn_event_data *e, u8 event_type) {
+  e->ts_ns = bpf_ktime_get_ns();
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  e->pid = pid_tgid >> 32;
+  e->tid = (u32)pid_tgid;
+  bpf_get_current_comm(&e->comm, sizeof(e->comm));
+  e->event_type = event_type;
+}
+
+/* socket() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_socket) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_SOCKET);
+  e.domain = (u16)args->family;
+  e.sock_type = (u16)(args->type & 0xFF); /* mask out SOCK_NONBLOCK|SOCK_CLOEXEC */
+  e.proto = (u8)args->protocol;
+  socket_create_ctx.update(&tid, &e);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_socket) {
+  u64 tid = bpf_get_current_pid_tgid();
+  struct conn_event_data *e = socket_create_ctx.lookup(&tid);
+  if (!e) return 0;
+
+  e->ret_val = (s32)args->ret;
+  e->fd = args->ret >= 0 ? (u32)args->ret : 0;
+  net_conn_events.perf_submit(args, e, sizeof(*e));
+  socket_create_ctx.delete(&tid);
+
+  /* Track this socket fd for close() filtering */
+  if (args->ret >= 0) {
+    u64 pid_fd = (tid & 0xFFFFFFFF00000000ULL) | (u32)args->ret;
+    u8 marker = 1;
+    socket_fds.update(&pid_fd, &marker);
+  }
+  return 0;
+}
+
+/* bind() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_bind) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_BIND);
+  e.fd = (u32)args->fd;
+
+  /* Read socket address family */
+  u16 family = 0;
+  bpf_probe_read_user(&family, sizeof(family), args->umyaddr);
+
+  if (family == AF_INET) {
+    e.ipver = 4;
+    struct sockaddr_in sa = {};
+    bpf_probe_read_user(&sa, sizeof(sa), args->umyaddr);
+    e.saddr_v4 = sa.sin_addr.s_addr;
+    e.sport = bpf_ntohs(sa.sin_port);
+  } else if (family == AF_INET6) {
+    e.ipver = 6;
+    struct sockaddr_in6 sa6 = {};
+    bpf_probe_read_user(&sa6, sizeof(sa6), args->umyaddr);
+    __builtin_memcpy(e.saddr_v6, &sa6.sin6_addr, 16);
+    e.sport = bpf_ntohs(sa6.sin6_port);
+  }
+  e.domain = family;
+
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+/* listen() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_listen) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_LISTEN);
+  e.fd = (u32)args->fd;
+  e.backlog = (u32)args->backlog;
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+/* accept4() syscall - entry stores timestamp */
+TRACEPOINT_PROBE(syscalls, sys_enter_accept4) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  u64 ts = bpf_ktime_get_ns();
+  accept_ctx.update(&tid, &ts);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_accept4) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u64 *start_ts = accept_ctx.lookup(&tid);
+  if (!start_ts) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_ACCEPT);
+  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
+  e.ret_val = (s32)args->ret;
+  e.fd = args->ret >= 0 ? (u32)args->ret : 0;
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+  accept_ctx.delete(&tid);
+
+  /* Track this socket fd for close() filtering */
+  if (args->ret >= 0) {
+    u64 pid_fd = (tid & 0xFFFFFFFF00000000ULL) | (u32)args->ret;
+    u8 marker = 1;
+    socket_fds.update(&pid_fd, &marker);
+  }
+  return 0;
+}
+
+/* connect() syscall - entry stores timestamp + remote addr */
+TRACEPOINT_PROBE(syscalls, sys_enter_connect) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  struct connect_ctx_t cctx = {};
+  cctx.start_ts = bpf_ktime_get_ns();
+  cctx.fd = (u32)args->fd;
+
+  /* Capture remote address from the user-supplied sockaddr */
+  if (args->uservaddr && args->addrlen >= 2) {
+    u16 family = 0;
+    bpf_probe_read_user(&family, sizeof(family), args->uservaddr);
+    if (family == AF_INET && args->addrlen >= sizeof(struct sockaddr_in)) {
+      struct sockaddr_in sa = {};
+      bpf_probe_read_user(&sa, sizeof(sa), args->uservaddr);
+      cctx.ipver    = 4;
+      cctx.daddr_v4 = sa.sin_addr.s_addr;
+      cctx.dport    = bpf_ntohs(sa.sin_port);
+    } else if (family == AF_INET6 && args->addrlen >= sizeof(struct sockaddr_in6)) {
+      struct sockaddr_in6 sa6 = {};
+      bpf_probe_read_user(&sa6, sizeof(sa6), args->uservaddr);
+      cctx.ipver = 6;
+      __builtin_memcpy(cctx.daddr_v6, &sa6.sin6_addr, 16);
+      cctx.dport = bpf_ntohs(sa6.sin6_port);
+    }
+  }
+
+  connect_ctx.update(&tid, &cctx);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_connect) {
+  u64 tid = bpf_get_current_pid_tgid();
+  struct connect_ctx_t *cctx = connect_ctx.lookup(&tid);
+  if (!cctx) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_CONNECT);
+  e.latency_ns = bpf_ktime_get_ns() - cctx->start_ts;
+  e.fd  = cctx->fd;
+  e.ret_val = (s32)args->ret;
+
+  /* Copy remote addr captured at entry */
+  e.ipver    = cctx->ipver;
+  e.dport    = cctx->dport;
+  e.daddr_v4 = cctx->daddr_v4;
+  __builtin_memcpy(e.daddr_v6, cctx->daddr_v6, 16);
+
+  /* Resolve local addr from the socket (available after connect attempt) */
+  struct sock *sk = get_sock_from_fd(cctx->fd);
+  if (sk && e.ipver == 4) {
+    struct inet_sock *inet = (struct inet_sock *)sk;
+    bpf_probe_read_kernel(&e.saddr_v4, sizeof(e.saddr_v4), &inet->inet_saddr);
+    u16 sport = 0;
+    bpf_probe_read_kernel(&sport, sizeof(sport), &inet->inet_sport);
+    e.sport = bpf_ntohs(sport);
+  } else if (sk && e.ipver == 6) {
+    unsigned __int128 saddr6 = 0;
+    bpf_probe_read_kernel(&saddr6, sizeof(saddr6),
+                          &sk->__sk_common.skc_v6_rcv_saddr.in6_u);
+    __builtin_memcpy(e.saddr_v6, &saddr6, 16);
+    u16 sport = 0;
+    bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
+    e.sport = sport;
+  }
+
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+  connect_ctx.delete(&tid);
+  return 0;
+}
+
+/* shutdown() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_shutdown) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_SHUTDOWN);
+  e.fd = (u32)args->fd;
+  e.shutdown_how = (u32)args->how;
+
+  struct sock *sk = get_sock_from_fd((u32)args->fd);
+  fill_conn_addr_from_sock(&e, sk);
+
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+/* close() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_close) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  /* Only emit close event if this fd was tracked as a socket */
+  u64 pid_fd = (tid & 0xFFFFFFFF00000000ULL) | (u32)args->fd;
+  u8 *tracked = socket_fds.lookup(&pid_fd);
+  if (!tracked) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_CLOSE);
+  e.fd = (u32)args->fd;
+
+  struct sock *sk = get_sock_from_fd((u32)args->fd);
+  fill_conn_addr_from_sock(&e, sk);
+
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+
+  /* Remove from tracking map */
+  socket_fds.delete(&pid_fd);
+  return 0;
+}
+
+/* ---- Epoll/multiplexing probes ---- */
+
+/** @brief Helper to fill common epoll_event_data fields */
+static __always_inline void fill_epoll_common(struct epoll_event_data *e, u8 event_type) {
+  e->ts_ns = bpf_ktime_get_ns();
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  e->pid = pid_tgid >> 32;
+  e->tid = (u32)pid_tgid;
+  bpf_get_current_comm(&e->comm, sizeof(e->comm));
+  e->event_type = event_type;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_epoll_create1) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  /* We submit on exit to get the returned fd */
+  u64 ts = bpf_ktime_get_ns();
+  epoll_wait_ctx.update(&tid, &ts); /* reuse for create latency */
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_epoll_create1) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u64 *start_ts = epoll_wait_ctx.lookup(&tid);
+
+  struct epoll_event_data e = {};
+  fill_epoll_common(&e, EPOLL_EV_CREATE);
+  e.epoll_fd = args->ret >= 0 ? (u32)args->ret : 0;
+  e.ready_count = (s32)args->ret;
+  if (start_ts) {
+    e.latency_ns = bpf_ktime_get_ns() - *start_ts;
+    epoll_wait_ctx.delete(&tid);
+  }
+  net_epoll_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_epoll_ctl) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  struct epoll_event_data e = {};
+  fill_epoll_common(&e, EPOLL_EV_CTL);
+  e.epoll_fd = (u32)args->epfd;
+  e.epoll_op = (u32)args->op;
+  e.target_fd = (u32)args->fd;
+
+  /* Read event mask from userspace struct epoll_event */
+  if (args->event) {
+    u32 events = 0;
+    bpf_probe_read_user(&events, sizeof(events), args->event);
+    e.epoll_events = events;
+  }
+
+  net_epoll_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_epoll_wait) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  u64 ts = bpf_ktime_get_ns();
+  epoll_wait_ctx.update(&tid, &ts);
+
+  struct epoll_event_data info = {};
+  info.epoll_fd = (u32)args->epfd;
+  info.max_events = (u32)args->maxevents;
+  info.timeout_ms = (u64)(int)args->timeout;
+  epoll_wait_info.update(&tid, &info);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_epoll_wait) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u64 *start_ts = epoll_wait_ctx.lookup(&tid);
+  if (!start_ts) return 0;
+
+  struct epoll_event_data e = {};
+  fill_epoll_common(&e, EPOLL_EV_WAIT);
+  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
+  e.ready_count = (s32)args->ret;
+
+  struct epoll_event_data *info = epoll_wait_info.lookup(&tid);
+  if (info) {
+    e.epoll_fd = info->epoll_fd;
+    e.max_events = info->max_events;
+    e.timeout_ms = info->timeout_ms;
+    epoll_wait_info.delete(&tid);
+  }
+
+  net_epoll_events.perf_submit(args, &e, sizeof(e));
+  epoll_wait_ctx.delete(&tid);
+  return 0;
+}
+
+/* poll() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_poll) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  u64 ts = bpf_ktime_get_ns();
+  poll_ctx.update(&tid, &ts);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_poll) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u64 *start_ts = poll_ctx.lookup(&tid);
+  if (!start_ts) return 0;
+
+  struct epoll_event_data e = {};
+  fill_epoll_common(&e, EPOLL_EV_POLL);
+  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
+  e.ready_count = (s32)args->ret;
+  net_epoll_events.perf_submit(args, &e, sizeof(e));
+  poll_ctx.delete(&tid);
+  return 0;
+}
+
+/* select() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_select) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  u64 ts = bpf_ktime_get_ns();
+  select_ctx.update(&tid, &ts);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_select) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u64 *start_ts = select_ctx.lookup(&tid);
+  if (!start_ts) return 0;
+
+  struct epoll_event_data e = {};
+  fill_epoll_common(&e, EPOLL_EV_SELECT);
+  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
+  e.ready_count = (s32)args->ret;
+  net_epoll_events.perf_submit(args, &e, sizeof(e));
+  select_ctx.delete(&tid);
+  return 0;
+}
+
+/* pselect6() syscall - modern libc select() uses this */
+TRACEPOINT_PROBE(syscalls, sys_enter_pselect6) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  u64 ts = bpf_ktime_get_ns();
+  select_ctx.update(&tid, &ts);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_pselect6) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u64 *start_ts = select_ctx.lookup(&tid);
+  if (!start_ts) return 0;
+
+  struct epoll_event_data e = {};
+  fill_epoll_common(&e, EPOLL_EV_SELECT);
+  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
+  e.ready_count = (s32)args->ret;
+  net_epoll_events.perf_submit(args, &e, sizeof(e));
+  select_ctx.delete(&tid);
+  return 0;
+}
+
+/* ---- Socket configuration probes ---- */
+
+TRACEPOINT_PROBE(syscalls, sys_enter_setsockopt) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  int level = args->level;
+  int optname = args->optname;
+
+  /* Filter: only SOL_SOCKET (1) and IPPROTO_TCP (6) */
+  if (level != 1 && level != 6) return 0;
+
+  struct sockopt_event_data e = {};
+  e.ts_ns = bpf_ktime_get_ns();
+  e.pid = pid;
+  bpf_get_current_comm(&e.comm, sizeof(e.comm));
+  e.event_type = 0; /* SET */
+  e.fd = (u32)args->fd;
+  e.level = (u32)level;
+  e.optname = (u32)optname;
+
+  /* Read integer option value (first 4 or 8 bytes). Use constant read sizes —
+   * a dynamic length can fail the BPF verifier on older kernels. */
+  if (args->optval && args->optlen >= 4) {
+    s64 val = 0;
+    if (args->optlen >= 8) {
+      bpf_probe_read_user(&val, 8, args->optval);
+    } else {
+      bpf_probe_read_user(&val, 4, args->optval);
+    }
+    e.optval = val;
+  }
+
+  net_sockopt_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_getsockopt) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  int level = args->level;
+  if (level != 1 && level != 6) return 0;
+
+  struct sockopt_event_data e = {};
+  e.ts_ns = bpf_ktime_get_ns();
+  e.pid = pid;
+  bpf_get_current_comm(&e.comm, sizeof(e.comm));
+  e.event_type = 1; /* GET */
+  e.fd = (u32)args->fd;
+  e.level = (u32)level;
+  e.optname = (u32)args->optname;
+
+  net_sockopt_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+/* ---- Network drops & retransmissions ---- */
+
+/* TCP retransmission tracepoint (stable, available since ~4.16) */
+TRACEPOINT_PROBE(tcp, tcp_retransmit_skb) {
+  struct net_drop_data e = {};
+  e.ts_ns = bpf_ktime_get_ns();
+  e.pid = bpf_get_current_pid_tgid() >> 32;
+  bpf_get_current_comm(&e.comm, sizeof(e.comm));
+  e.event_type = NET_DROP_RETRANSMIT;
+  e.proto = 6; /* TCP */
+
+  /* tcp:tcp_retransmit_skb tracepoint provides addr fields directly */
+  e.sport = args->sport;
+  e.dport = args->dport;
+  __builtin_memcpy(&e.saddr_v4, args->saddr, sizeof(e.saddr_v4));
+  __builtin_memcpy(&e.daddr_v4, args->daddr, sizeof(e.daddr_v4));
+
+  /* IPv6 addresses if available */
+  bpf_probe_read_kernel(&e.saddr_v6, sizeof(e.saddr_v6), args->saddr_v6);
+  bpf_probe_read_kernel(&e.daddr_v6, sizeof(e.daddr_v6), args->daddr_v6);
+
+  e.state = args->state;
+  e.ipver = (e.saddr_v4 != 0 || e.daddr_v4 != 0) ? 4 : 6;
+
+  net_drop_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+/* kfree_skb - Packet drops */
+TRACEPOINT_PROBE(skb, kfree_skb) {
+  struct net_drop_data e = {};
+  e.ts_ns = bpf_ktime_get_ns();
+  e.pid = bpf_get_current_pid_tgid() >> 32;
+  bpf_get_current_comm(&e.comm, sizeof(e.comm));
+  e.event_type = NET_DROP_PACKET;
+
+  /* Get SKB pointer and extract network info */
+  struct sk_buff *skb = (struct sk_buff *)args->skbaddr;
+  if (!skb) return 0;
+
+  /* Only handle IP packets. Without checking the L3 ethertype, non-IP drops
+   * (ARP, PPPoE, custom L2, ...) would be parsed as IP and emit garbage rows
+   * whenever the guessed offset happens to look like an IP header. */
+  u16 eth_proto = 0;
+  bpf_probe_read_kernel(&eth_proto, sizeof(eth_proto), &skb->protocol);
+  eth_proto = bpf_ntohs(eth_proto);
+  if (eth_proto != 0x0800 && eth_proto != 0x86dd) return 0;  /* not IPv4/IPv6 */
+
+  /* Read drop reason (kernel 5.17+ has this field) */
+  bpf_probe_read_kernel(&e.drop_reason, sizeof(e.drop_reason), &args->reason);
+
+  /* Read packet length */
+  bpf_probe_read_kernel(&e.skb_len, sizeof(e.skb_len), &skb->len);
+
+  /* Try to extract IP header info */
+  unsigned char *head;
+  u16 network_header, transport_header;
+
+  bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+  bpf_probe_read_kernel(&network_header, sizeof(network_header), &skb->network_header);
+  bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+  /* Bail if the network header offset is unset (e.g. drop before L3 parsing). */
+  if (!head || network_header == (u16)~0) return 0;
+
+  unsigned char *ip_header = head + network_header;
+  e.ipver = (eth_proto == 0x0800) ? 4 : 6;
+
+  if (eth_proto == 0x0800) {
+    /* IPv4 header offsets: saddr at +12, daddr at +16, protocol at +9 */
+    bpf_probe_read_kernel(&e.proto, sizeof(e.proto), ip_header + 9);
+    bpf_probe_read_kernel(&e.saddr_v4, sizeof(e.saddr_v4), ip_header + 12);
+    bpf_probe_read_kernel(&e.daddr_v4, sizeof(e.daddr_v4), ip_header + 16);
+
+    /* Extract ports if TCP/UDP */
+    if (e.proto == 6 || e.proto == 17) {  /* TCP or UDP */
+      unsigned char *l4_header = head + transport_header;
+      u16 sport_be, dport_be;
+      bpf_probe_read_kernel(&sport_be, sizeof(sport_be), l4_header);
+      bpf_probe_read_kernel(&dport_be, sizeof(dport_be), l4_header + 2);
+      e.sport = __builtin_bswap16(sport_be);
+      e.dport = __builtin_bswap16(dport_be);
+    }
+  } else {
+    /* IPv6 header offsets: next_header at +6, saddr at +8, daddr at +24 */
+    bpf_probe_read_kernel(&e.proto, sizeof(e.proto), ip_header + 6);
+    bpf_probe_read_kernel(&e.saddr_v6, sizeof(e.saddr_v6), ip_header + 8);
+    bpf_probe_read_kernel(&e.daddr_v6, sizeof(e.daddr_v6), ip_header + 24);
+
+    /* Extract ports if TCP/UDP */
+    if (e.proto == 6 || e.proto == 17) {
+      unsigned char *l4_header = head + transport_header;
+      u16 sport_be, dport_be;
+      bpf_probe_read_kernel(&sport_be, sizeof(sport_be), l4_header);
+      bpf_probe_read_kernel(&dport_be, sizeof(dport_be), l4_header + 2);
+      e.sport = __builtin_bswap16(sport_be);
+      e.dport = __builtin_bswap16(dport_be);
+    }
+  }
+
+  net_drop_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+#endif /* ENABLE_NETWORK */
