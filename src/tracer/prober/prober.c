@@ -1608,9 +1608,11 @@ int trace_vfs_fsync_range(struct pt_regs *ctx, struct file *file, loff_t start,
   }
 
   if (end == LLONG_MAX) {
-    range_size = file_size - start;
+    // file_size stays 0 if file/f_inode was unreadable; guard against a
+    // negative (start > file_size) result that would wrap to a huge u64 size.
+    range_size = (file_size > start) ? file_size - start : 0;
   } else {
-    range_size = end - start;
+    range_size = (end > start) ? end - start : 0;
   }
 
   struct data_t data = {};
@@ -2020,8 +2022,13 @@ int trace_vfs_setattr(struct pt_regs *ctx) {
     return 0;
   }
 
-  /* notify_change: arg1 = mnt_idmap*, arg2 = dentry*, arg3 = iattr* */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+  /* >=5.12: notify_change(struct mnt_idmap/user_namespace *, dentry *, iattr *) */
   struct dentry *dentry = (struct dentry *)PT_REGS_PARM2(ctx);
+#else
+  /* <5.12: notify_change(struct dentry *, struct iattr *, ...) — dentry is PARM1 */
+  struct dentry *dentry = (struct dentry *)PT_REGS_PARM1(ctx);
+#endif
   if (!dentry) {
     return 0;
   }
@@ -4839,6 +4846,13 @@ TRACEPOINT_PROBE(syscalls, sys_enter_epoll_ctl) {
   return 0;
 }
 
+/* The legacy select(2)/poll(2)/epoll_wait(2) syscalls (and thus their
+ * syscalls:sys_enter/exit_* tracepoints) exist only on architectures that keep
+ * the old syscall table (x86). arm64 and other asm-generic arches implement
+ * only pselect6/ppoll/epoll_pwait, so referencing these tracepoints there makes
+ * BCC fail the ENTIRE BPF load. Guard them to x86; pselect6 below is handled on
+ * all arches. */
+#if defined(__x86_64__) || defined(__i386__) || defined(bpf_target_x86)
 TRACEPOINT_PROBE(syscalls, sys_enter_epoll_wait) {
   u64 tid = bpf_get_current_pid_tgid();
   u32 pid = tid >> 32;
@@ -4933,6 +4947,7 @@ TRACEPOINT_PROBE(syscalls, sys_exit_select) {
   select_ctx.delete(&tid);
   return 0;
 }
+#endif /* x86-only legacy select/poll/epoll_wait */
 
 /* pselect6() syscall - modern libc select() uses this */
 TRACEPOINT_PROBE(syscalls, sys_enter_pselect6) {

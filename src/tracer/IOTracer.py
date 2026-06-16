@@ -33,7 +33,7 @@ from datetime import datetime
 
 from . import schema
 from .ObjectStorageManager import ObjectStorageManager
-from ..utility.utils import capture_machine_id, format_csv_row, logger, hash_filename_in_path, inet6_from_event, simple_hash, run_with_spinner
+from ..utility.utils import capture_machine_id, format_csv_row, logger, hash_rel_path, inet6_from_event, simple_hash, run_with_spinner
 from .WriterManager import WriteManager
 from .FlagMapper import FlagMapper
 from .KernelProbeTracker import KernelProbeTracker
@@ -272,7 +272,7 @@ class IOTracer:
         try:
             filename = event.filename.decode()
             if self.anonymous:
-                filename = hash_filename_in_path(Path(filename))
+                filename = str(hash_rel_path(Path(filename)))
             if op_name in ['MKDIR', 'RMDIR', 'CHDIR', 'READDIR'] and filename and not filename.endswith('/'):
                 filename += '/'
         except UnicodeDecodeError:
@@ -290,7 +290,9 @@ class IOTracer:
 
         inode_val = event.inode if event.inode != 0 else ""
         
-        size_val = event.size if event.size is not None else 0
+        # Empty (not 0) for non-I/O ops, matching the schema and the
+        # offset column below; ops that carry a size set event.size > 0.
+        size_val = event.size if event.size else ""
         address_val = ""
         raw_address = event.address if hasattr(event, 'address') else 0
         if raw_address:
@@ -696,8 +698,8 @@ class IOTracer:
             filename_old = event.filename_old.decode()
             filename_new = event.filename_new.decode()
             if self.anonymous:
-                filename_old = hash_filename_in_path(Path(filename_old))
-                filename_new = hash_filename_in_path(Path(filename_new))
+                filename_old = str(hash_rel_path(Path(filename_old)))
+                filename_new = str(hash_rel_path(Path(filename_new)))
         except UnicodeDecodeError:
             filename_old = ""
             filename_new = ""
@@ -1091,7 +1093,7 @@ class IOTracer:
             if cached:
                 filename = cached
             if self.anonymous and filename:
-                filename = hash_filename_in_path(Path(filename))
+                filename = str(hash_rel_path(Path(filename)))
 
         # Mirror completed file READ/WRITE into the main fs/VFS trace stream.
         self._mirror_io_uring_to_fs(e, comm, filename, ts, dev_val, fs_type_val)
