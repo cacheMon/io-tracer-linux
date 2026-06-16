@@ -930,20 +930,6 @@ class WriteManager:
             self.compress_dir(self.output_dir)
 
 
-    def clear_events(self):
-        """Clear all event buffers."""
-        print("Clear initiated")
-        self.vfs_buffer.clear()
-        self.block_buffer.clear() 
-        self.cache_buffer.clear()
-        self.process_buffer.clear()
-        self.fs_snap_buffer.clear()
-        self.pagefault_buffer.clear()
-        self.nw_conn_buffer.clear()
-        self.nw_epoll_buffer.clear()
-        self.nw_sockopt_buffer.clear()
-        self.nw_drop_buffer.clear()
-
     def _write_buffer_to_file(self, buffer, file_handle, buffer_name: str):
         """
         Write buffer contents to a file handle.
@@ -1078,7 +1064,11 @@ class WriteManager:
         for thread in threads:
             thread.join()
 
-        self.clear_events()
+        # NOTE: do NOT clear_events() here. Each write_*() above already drained
+        # its buffer (popleft under the stream lock). A blanket buffer.clear()
+        # would additionally wipe rows appended by the lock-free append_*() path
+        # in the window between a stream's drain and the clear — silently losing
+        # events on every periodic flush. The drain is the only emptying needed.
 
     def compress_log(self, input_file: str):
         """
