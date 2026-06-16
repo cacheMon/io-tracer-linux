@@ -135,6 +135,33 @@ def hash_rel_path(rel: Path, keep_ext: bool = True, length: int = 12) -> Path:
     
     return Path(*hashed_parts)
 
+def anonymize_path(path, keep_ext: bool = True, length: int = 12) -> str:
+    """Anonymize a filesystem path by hashing EVERY component.
+
+    Hashes the basename and all directory components, preserving only a leading
+    root separator ("/") and (optionally) file extensions. Unlike
+    ``hash_rel_path`` — which keeps the first two components in cleartext — this
+    never leaves a component unhashed, so bare basenames (e.g. ``"id_rsa"``) and
+    short relative paths (e.g. ``"proj/key.pem"``) are still fully anonymized.
+    Directory structure (depth) is preserved.
+
+    Example:
+        >>> anonymize_path("/home/alice/.ssh/id_rsa")
+        '/<h>/<h>/<h>/<h>'
+        >>> anonymize_path("id_rsa")
+        '<h>'
+    """
+    parts = list(Path(path).parts)
+    if not parts:
+        return path
+    out = []
+    for i, comp in enumerate(parts):
+        if i == 0 and comp == os.sep:
+            out.append(comp)  # keep the leading "/" so absolute stays absolute
+        else:
+            out.append(hash_component(comp, keep_ext=keep_ext, length=length))
+    return str(Path(*out))
+
 def simple_hash(content: str, length: int = 12) -> str:
     """
     Create a simple SHA-256 hash of a string.

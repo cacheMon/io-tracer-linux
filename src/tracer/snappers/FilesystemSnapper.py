@@ -15,9 +15,8 @@ Example:
     snapper.stop_snapper()  # Stop the snapper
 """
 
-from ...utility.utils import format_csv_row, logger, compress_log, hash_rel_path
+from ...utility.utils import format_csv_row, logger, compress_log, anonymize_path
 from ..WriterManager import WriteManager
-from pathlib import Path
 from datetime import datetime
 import shutil
 import os
@@ -111,9 +110,9 @@ class FilesystemSnapper:
                                     mtime = datetime.fromtimestamp(est.st_mtime)
                                     atime = datetime.fromtimestamp(est.st_atime)
 
-                                    # Anonymize like the live fs stream: preserve
-                                    # directory structure, hash each component.
-                                    hashed_path = str(hash_rel_path(Path(entry.path), keep_ext=True, length=12))
+                                    # Anonymize like the live fs stream: hash every
+                                    # path component (basename included), keep depth.
+                                    hashed_path = anonymize_path(entry.path, keep_ext=True, length=12)
                                     out = format_csv_row(snapshot_timestamp, hashed_path, size, ctime, mtime, atime, snapshot_mono_ns)
                                     self.wm.append_fs_snap_log(out)
                                     count += 1  
