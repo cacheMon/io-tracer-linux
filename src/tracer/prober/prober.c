@@ -4976,6 +4976,79 @@ TRACEPOINT_PROBE(syscalls, sys_exit_pselect6) {
   return 0;
 }
 
+/* ppoll() syscall - modern libc poll() and the only poll on arm64/asm-generic.
+ * Mirrors the poll() handler (reuses poll_ctx); the ppoll timeout is a timespec
+ * we don't record, matching poll()'s behavior. */
+TRACEPOINT_PROBE(syscalls, sys_enter_ppoll) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  u64 ts = bpf_ktime_get_ns();
+  poll_ctx.update(&tid, &ts);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_ppoll) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u64 *start_ts = poll_ctx.lookup(&tid);
+  if (!start_ts) return 0;
+
+  struct epoll_event_data e = {};
+  fill_epoll_common(&e, EPOLL_EV_POLL);
+  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
+  e.ready_count = (s32)args->ret;
+  net_epoll_events.perf_submit(args, &e, sizeof(e));
+  poll_ctx.delete(&tid);
+  return 0;
+}
+
+/* epoll_pwait() syscall - what modern libc epoll_wait() issues, and the only
+ * epoll wait on arm64/asm-generic. Mirrors the epoll_wait() handler (reuses
+ * epoll_wait_ctx/epoll_wait_info); the leading args match epoll_wait. */
+TRACEPOINT_PROBE(syscalls, sys_enter_epoll_pwait) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  u64 ts = bpf_ktime_get_ns();
+  epoll_wait_ctx.update(&tid, &ts);
+
+  struct epoll_event_data info = {};
+  info.epoll_fd = (u32)args->epfd;
+  info.max_events = (u32)args->maxevents;
+  info.timeout_ms = (u64)(int)args->timeout;
+  epoll_wait_info.update(&tid, &info);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_epoll_pwait) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u64 *start_ts = epoll_wait_ctx.lookup(&tid);
+  if (!start_ts) return 0;
+
+  struct epoll_event_data e = {};
+  fill_epoll_common(&e, EPOLL_EV_WAIT);
+  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
+  e.ready_count = (s32)args->ret;
+
+  struct epoll_event_data *info = epoll_wait_info.lookup(&tid);
+  if (info) {
+    e.epoll_fd = info->epoll_fd;
+    e.max_events = info->max_events;
+    e.timeout_ms = info->timeout_ms;
+    epoll_wait_info.delete(&tid);
+  }
+
+  net_epoll_events.perf_submit(args, &e, sizeof(e));
+  epoll_wait_ctx.delete(&tid);
+  return 0;
+}
+
 /* ---- Socket configuration probes ---- */
 
 TRACEPOINT_PROBE(syscalls, sys_enter_setsockopt) {
