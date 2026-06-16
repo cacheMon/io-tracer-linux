@@ -24,7 +24,7 @@ EXPECTED_COLUMN_COUNTS = {
     "filesystem_snapshot": 7,  # 6 + mono_ns
 }
 
-# Cross-OS aligned shared column prefix (schema v3). These leading columns must
+# Cross-OS aligned shared column prefix. These leading columns must
 # match the Windows tracer's fs/ds streams exactly and in the same order.
 ALIGNED_FS_PREFIX = [
     "timestamp", "operation", "pid", "tid", "command", "filename",
@@ -37,8 +37,8 @@ ALIGNED_DS_PREFIX = [
 
 
 class SchemaShapeTests(unittest.TestCase):
-    def test_schema_version_is_3(self):
-        self.assertEqual(schema.SCHEMA_VERSION, 3)
+    def test_schema_version_is_1(self):
+        self.assertEqual(schema.SCHEMA_VERSION, 1)
 
     def test_fs_ds_aligned_prefix(self):
         self.assertEqual(schema.column_names("fs")[:len(ALIGNED_FS_PREFIX)],
@@ -86,7 +86,7 @@ class ManifestTests(unittest.TestCase):
         block = schema.schema_for_manifest()
         # Round-trips through JSON without error.
         restored = json.loads(json.dumps(block))
-        self.assertEqual(restored["schema_version"], 3)
+        self.assertEqual(restored["schema_version"], 1)
         self.assertEqual(set(restored["streams"]), set(EXPECTED_COLUMN_COUNTS))
 
     def test_manifest_columns_carry_type_and_unit(self):

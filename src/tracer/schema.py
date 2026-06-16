@@ -22,7 +22,9 @@ it from ``manifest.json`` and adapt.
 #     Linux-only extras, lowercase canonical operation names, ``size_requested``
 #     renamed to ``size``, and a dedicated block ``flags`` column (rwbs sub-flags
 #     split out of ``operation``).
-SCHEMA_VERSION = 3
+# Schema version stamped into manifest.json. Reset to 1 by request; the column
+# layout remains the cross-OS aligned fs/ds format described below.
+SCHEMA_VERSION = 1
 
 
 def _col(name, ctype, unit="", desc=""):
