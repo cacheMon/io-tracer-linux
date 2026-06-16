@@ -4457,6 +4457,14 @@ static __always_inline struct sock *get_sock_from_fd(u32 fd) {
   bpf_probe_read_kernel(&fdt, sizeof(fdt), &files->fdt);
   if (!fdt) return NULL;
 
+  /* Bound fd against the table size before indexing. fd comes from a
+   * user-supplied syscall arg and can be arbitrarily large; without this the
+   * computed &fd_array[fd] could point outside the table (a wild but possibly
+   * mapped address) and yield a bogus socket pointer. */
+  unsigned int max_fds = 0;
+  bpf_probe_read_kernel(&max_fds, sizeof(max_fds), &fdt->max_fds);
+  if (fd >= max_fds) return NULL;
+
   struct file **fd_array = NULL;
   bpf_probe_read_kernel(&fd_array, sizeof(fd_array), &fdt->fd);
   if (!fd_array) return NULL;
@@ -4584,7 +4592,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_bind) {
     e.ipver = 6;
     struct sockaddr_in6 sa6 = {};
     bpf_probe_read_user(&sa6, sizeof(sa6), args->umyaddr);
-    bpf_probe_read_kernel(&e.saddr_v6, sizeof(e.saddr_v6), &sa6.sin6_addr);
+    __builtin_memcpy(e.saddr_v6, &sa6.sin6_addr, 16);
     e.sport = bpf_ntohs(sa6.sin6_port);
   }
   e.domain = family;
@@ -4670,7 +4678,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_connect) {
       struct sockaddr_in6 sa6 = {};
       bpf_probe_read_user(&sa6, sizeof(sa6), args->uservaddr);
       cctx.ipver = 6;
-      bpf_probe_read_kernel(&cctx.daddr_v6, sizeof(cctx.daddr_v6), &sa6.sin6_addr);
+      __builtin_memcpy(cctx.daddr_v6, &sa6.sin6_addr, 16);
       cctx.dport = bpf_ntohs(sa6.sin6_port);
     }
   }
@@ -4977,11 +4985,15 @@ TRACEPOINT_PROBE(syscalls, sys_enter_setsockopt) {
   e.level = (u32)level;
   e.optname = (u32)optname;
 
-  /* Read integer option value (first 8 bytes) */
+  /* Read integer option value (first 4 or 8 bytes). Use constant read sizes —
+   * a dynamic length can fail the BPF verifier on older kernels. */
   if (args->optval && args->optlen >= 4) {
     s64 val = 0;
-    int read_len = args->optlen < 8 ? args->optlen : 8;
-    bpf_probe_read_user(&val, read_len, args->optval);
+    if (args->optlen >= 8) {
+      bpf_probe_read_user(&val, 8, args->optval);
+    } else {
+      bpf_probe_read_user(&val, 4, args->optval);
+    }
     e.optval = val;
   }
 
@@ -5052,6 +5064,14 @@ TRACEPOINT_PROBE(skb, kfree_skb) {
   struct sk_buff *skb = (struct sk_buff *)args->skbaddr;
   if (!skb) return 0;
 
+  /* Only handle IP packets. Without checking the L3 ethertype, non-IP drops
+   * (ARP, PPPoE, custom L2, ...) would be parsed as IP and emit garbage rows
+   * whenever the guessed offset happens to look like an IP header. */
+  u16 eth_proto = 0;
+  bpf_probe_read_kernel(&eth_proto, sizeof(eth_proto), &skb->protocol);
+  eth_proto = bpf_ntohs(eth_proto);
+  if (eth_proto != 0x0800 && eth_proto != 0x86dd) return 0;  /* not IPv4/IPv6 */
+
   /* Read drop reason (kernel 5.17+ has this field) */
   bpf_probe_read_kernel(&e.drop_reason, sizeof(e.drop_reason), &args->reason);
 
@@ -5059,24 +5079,20 @@ TRACEPOINT_PROBE(skb, kfree_skb) {
   bpf_probe_read_kernel(&e.skb_len, sizeof(e.skb_len), &skb->len);
 
   /* Try to extract IP header info */
-  unsigned char *head, *data;
+  unsigned char *head;
   u16 network_header, transport_header;
 
   bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
-  bpf_probe_read_kernel(&data, sizeof(data), &skb->data);
   bpf_probe_read_kernel(&network_header, sizeof(network_header), &skb->network_header);
   bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
 
+  /* Bail if the network header offset is unset (e.g. drop before L3 parsing). */
+  if (!head || network_header == (u16)~0) return 0;
+
   unsigned char *ip_header = head + network_header;
+  e.ipver = (eth_proto == 0x0800) ? 4 : 6;
 
-  /* Read IP version from first byte of IP header */
-  u8 ip_version_byte;
-  bpf_probe_read_kernel(&ip_version_byte, sizeof(ip_version_byte), ip_header);
-  u8 ip_version = (ip_version_byte >> 4) & 0x0F;
-
-  e.ipver = ip_version;
-
-  if (ip_version == 4) {
+  if (eth_proto == 0x0800) {
     /* IPv4 header offsets: saddr at +12, daddr at +16, protocol at +9 */
     bpf_probe_read_kernel(&e.proto, sizeof(e.proto), ip_header + 9);
     bpf_probe_read_kernel(&e.saddr_v4, sizeof(e.saddr_v4), ip_header + 12);
@@ -5091,7 +5107,7 @@ TRACEPOINT_PROBE(skb, kfree_skb) {
       e.sport = __builtin_bswap16(sport_be);
       e.dport = __builtin_bswap16(dport_be);
     }
-  } else if (ip_version == 6) {
+  } else {
     /* IPv6 header offsets: next_header at +6, saddr at +8, daddr at +24 */
     bpf_probe_read_kernel(&e.proto, sizeof(e.proto), ip_header + 6);
     bpf_probe_read_kernel(&e.saddr_v6, sizeof(e.saddr_v6), ip_header + 8);

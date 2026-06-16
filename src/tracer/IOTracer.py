@@ -805,8 +805,11 @@ class IOTracer:
         ipver = str(e.ipver) if e.ipver else ""
 
         if e.ipver == 4:
-            local_addr = socket.inet_ntop(socket.AF_INET, struct.pack("!I", e.saddr_v4)) if e.saddr_v4 else ""
-            remote_addr = socket.inet_ntop(socket.AF_INET, struct.pack("!I", e.daddr_v4)) if e.daddr_v4 else ""
+            # saddr_v4/daddr_v4 hold the raw network-order bytes from the kernel;
+            # ctypes already read them with native endianness, so pack back with
+            # native "I" (not "!I") to reproduce the original bytes for inet_ntop.
+            local_addr = socket.inet_ntop(socket.AF_INET, struct.pack("I", e.saddr_v4)) if e.saddr_v4 else ""
+            remote_addr = socket.inet_ntop(socket.AF_INET, struct.pack("I", e.daddr_v4)) if e.daddr_v4 else ""
         elif e.ipver == 6:
             local_addr = inet6_from_event(e.saddr_v6) if e.saddr_v6 else ""
             remote_addr = inet6_from_event(e.daddr_v6) if e.daddr_v6 else ""
@@ -907,8 +910,10 @@ class IOTracer:
         ipver = str(e.ipver) if e.ipver else ""
 
         if e.ipver == 4:
-            s_addr = socket.inet_ntop(socket.AF_INET, struct.pack("!I", e.saddr_v4)) if e.saddr_v4 else ""
-            d_addr = socket.inet_ntop(socket.AF_INET, struct.pack("!I", e.daddr_v4)) if e.daddr_v4 else ""
+            # Native "I" pack (see _print_event_conn) reproduces the network-order
+            # bytes ctypes read from the kernel; "!I" would reverse them.
+            s_addr = socket.inet_ntop(socket.AF_INET, struct.pack("I", e.saddr_v4)) if e.saddr_v4 else ""
+            d_addr = socket.inet_ntop(socket.AF_INET, struct.pack("I", e.daddr_v4)) if e.daddr_v4 else ""
         elif e.ipver == 6:
             s_addr = inet6_from_event(e.saddr_v6) if e.saddr_v6 else ""
             d_addr = inet6_from_event(e.daddr_v6) if e.daddr_v6 else ""
