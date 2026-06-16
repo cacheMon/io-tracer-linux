@@ -2665,7 +2665,8 @@ int trace_sendfile(struct pt_regs *ctx, int out_fd, int in_fd, loff_t *offset,
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
   data.op = OP_SENDFILE;
   data.inode = 0;
-  data.size = count;   /* requested ceiling; replaced with actual bytes at return */
+  data.size = 0;   /* set to actual transferred bytes at return; never the
+                      requested `count` ceiling (often SSIZE_MAX) */
   data.flags = 0;
 
   // Defer submission to the kretprobe, which records the real transferred byte
@@ -2678,9 +2679,10 @@ int trace_sendfile(struct pt_regs *ctx, int out_fd, int in_fd, loff_t *offset,
  * @brief Trace sendfile() return — record actual bytes transferred and latency.
  *
  * The entry ``count`` is only the caller's requested ceiling (often SSIZE_MAX),
- * so emitting it as ``size`` poisons byte totals. Here we overwrite ``size`` with
- * the syscall return (actual bytes moved) and skip calls that moved nothing or
- * failed (ret <= 0).
+ * so it is never used as ``size``; we record the syscall return (actual bytes
+ * moved, 0 on error/EOF) instead. We emit on ALL returns — like the vfs_read/
+ * vfs_write kretprobes — so failed and zero-byte sendfiles are captured and the
+ * userspace SENDFILE branch can format errno from the negative return_value.
  */
 int trace_sendfile_ret(struct pt_regs *ctx) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -2691,10 +2693,8 @@ int trace_sendfile_ret(struct pt_regs *ctx) {
   long ret = PT_REGS_RC(ctx);
   data->ret_val = (s64)ret;
   data->latency_ns = bpf_ktime_get_ns() - data->ts;
-  if (ret > 0) {
-    data->size = (u64)ret;   /* actual bytes transferred */
-    events.perf_submit(ctx, data, sizeof(*data));
-  }
+  data->size = (ret > 0) ? (u64)ret : 0;   /* actual bytes; 0 on error/EOF */
+  events.perf_submit(ctx, data, sizeof(*data));
   sendfile_staging.delete(&pid_tgid);
   return 0;
 }

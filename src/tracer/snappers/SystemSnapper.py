@@ -33,6 +33,30 @@ import requests
 import json
 
 
+# ARM "CPU implementer" hex codes (from /proc/cpuinfo) → vendor name. Used only
+# as a last-resort fallback when neither "model name" nor the device-tree model
+# is available, so the recorded cpu brand is a vendor name rather than a raw code.
+_ARM_IMPLEMENTERS = {
+    "0x41": "ARM",
+    "0x42": "Broadcom",
+    "0x43": "Cavium",
+    "0x44": "DEC",
+    "0x46": "Fujitsu",
+    "0x48": "HiSilicon",
+    "0x49": "Infineon",
+    "0x4d": "Motorola/Freescale",
+    "0x4e": "NVIDIA",
+    "0x50": "Ampere(APM)",
+    "0x51": "Qualcomm",
+    "0x53": "Samsung",
+    "0x56": "Marvell",
+    "0x61": "Apple",
+    "0x66": "Faraday",
+    "0x69": "Intel",
+    "0xc0": "Ampere",
+}
+
+
 class SystemSnapper:
     """
     Captures system hardware and software specifications.
@@ -82,17 +106,23 @@ class SystemSnapper:
                             fields.setdefault(k.strip(), v.strip())
                 try:
                     # e.g. "NVIDIA Jetson ..." / SoC name on many ARM boards.
-                    with open("/proc/device-tree/model") as f:
-                        model = f.read().strip("\x00").strip()
+                    # Read in binary: the node is NUL-terminated and may contain
+                    # non-UTF8 bytes, which would raise UnicodeDecodeError in text
+                    # mode and defeat this fallback.
+                    with open("/proc/device-tree/model", "rb") as f:
+                        model = f.read().split(b"\x00", 1)[0].decode("utf-8", "replace").strip()
                         if model:
                             return model
                 except OSError:
                     pass
-                # Synthesize something from the ARM fields if present.
-                arm = fields.get("CPU implementer") or fields.get("CPU part")
-                if arm:
-                    parts = [fields.get("CPU implementer", ""), fields.get("CPU part", "")]
-                    return "ARM CPU " + " ".join(p for p in parts if p)
+                # Last resort: synthesize a name from the ARM cpuinfo fields,
+                # decoding the implementer code to a vendor name (the part number
+                # stays hex — decoding it needs a per-vendor table).
+                impl = fields.get("CPU implementer")
+                part = fields.get("CPU part")
+                if impl or part:
+                    vendor = _ARM_IMPLEMENTERS.get((impl or "").lower(), impl or "ARM")
+                    return f"{vendor} CPU" + (f" (part {part})" if part else "")
                 return platform.processor() or None
             elif system == "Windows":
                 out = subprocess.check_output("wmic cpu get Name", shell=True, text=True)
