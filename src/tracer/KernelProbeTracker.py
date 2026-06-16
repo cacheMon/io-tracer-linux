@@ -239,11 +239,15 @@ class KernelProbeTracker:
             self.add_kprobe("vfs_symlink", "trace_vfs_symlink")
             self.add_kprobe("vfs_fallocate", "trace_vfs_fallocate")
             
-            # Try to attach sendfile probe (may not be available on all kernels)
+            # Try to attach sendfile probe (may not be available on all kernels).
+            # The kretprobe records the actual transferred byte count (the entry
+            # ``count`` arg is only the requested ceiling, often SSIZE_MAX).
             if BPF.get_kprobe_functions(b'do_sendfile'):
                 self.add_kprobe("do_sendfile", "trace_sendfile")
+                self.add_kretprobe("do_sendfile", "trace_sendfile_ret")
             elif BPF.get_kprobe_functions(b'__do_sendfile'):
                 self.add_kprobe("__do_sendfile", "trace_sendfile")
+                self.add_kretprobe("__do_sendfile", "trace_sendfile_ret")
             else:
                 if self.developer_mode:
                     logger("warning", "sendfile probe not available on this kernel version")

@@ -69,10 +69,31 @@ class SystemSnapper:
         system = platform.system()
         try:
             if system == "Linux":
+                # x86 exposes a human-readable "model name"; ARM/aarch64 and some
+                # other arches do not, so fall back to the device-tree model, then
+                # the decoded ARM implementer/part fields, then platform.processor().
+                fields = {}
                 with open("/proc/cpuinfo") as f:
                     for line in f:
                         if "model name" in line:
                             return line.split(":", 1)[1].strip()
+                        if ":" in line:
+                            k, v = line.split(":", 1)
+                            fields.setdefault(k.strip(), v.strip())
+                try:
+                    # e.g. "NVIDIA Jetson ..." / SoC name on many ARM boards.
+                    with open("/proc/device-tree/model") as f:
+                        model = f.read().strip("\x00").strip()
+                        if model:
+                            return model
+                except OSError:
+                    pass
+                # Synthesize something from the ARM fields if present.
+                arm = fields.get("CPU implementer") or fields.get("CPU part")
+                if arm:
+                    parts = [fields.get("CPU implementer", ""), fields.get("CPU part", "")]
+                    return "ARM CPU " + " ".join(p for p in parts if p)
+                return platform.processor() or None
             elif system == "Windows":
                 out = subprocess.check_output("wmic cpu get Name", shell=True, text=True)
                 lines = [l.strip() for l in out.splitlines() if l.strip() and "Name" not in l]
