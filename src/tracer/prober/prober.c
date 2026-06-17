@@ -907,33 +907,28 @@ static __always_inline void get_file_source(struct file *file, u32 *dev,
 }
 
 /**
- * @brief Check if a file is a regular file (not virtual/pseudo filesystem)
+ * @brief True if a superblock magic belongs to a pseudo / virtual filesystem
+ *        that carries no durable storage I/O (procfs, sysfs, cgroup, tracefs,
+ *        debugfs, bpffs, sockets, pipes, ptys, ...).
  *
- * Filters out pseudo-filesystems (proc, sys, devtmpfs, etc.) to focus
- * tracing on real storage I/O. Uses filesystem magic numbers for detection.
+ * Single source of truth for the pseudo-fs denylist, used by both the regular-
+ * file checks (read/write/open) and the directory-iteration probe (readdir).
+ * Skipping these keeps the trace focused on real storage and removes the large
+ * readdir flood from /proc-walking monitors (htop/top/ps) and the tracer's own
+ * /proc polling — see analysis: ~27% of all VFS events were htop reading
+ * /proc/<pid>/task.
  *
- * @param file  Kernel file structure pointer
- * @return      true if regular file on real filesystem, false otherwise
+ * NOTE: tmpfs (and ramfs) are deliberately NOT treated as pseudo here — they
+ * hold real application data (/dev/shm shared memory, /tmp scratch) that is
+ * storage-relevant, so their read/write/mmap/readdir are captured like any real
+ * filesystem. (This is a deliberate change from the previous behavior, which
+ * dropped tmpfs in is_regular_file.) ramdisk-backed data is still I/O we care
+ * about; only the synthetic introspection/IPC filesystems below are dropped.
  */
-static bool is_regular_file(struct file *file) {
-  bool is_reg, is_virtual;
-  if (!file || !file->f_path.dentry || !file->f_path.dentry->d_inode ||
-      !file->f_path.dentry->d_sb) {
-    return false;
-  }
-  umode_t mode;
-  bpf_probe_read_kernel(&mode, sizeof(mode),
-                        &file->f_path.dentry->d_inode->i_mode);
-  is_reg = S_ISREG(mode);  /* Check if regular file (not dir/socket/pipe) */
-
-  struct super_block *sb = file->f_path.dentry->d_sb;
-  unsigned long magic = 0;
-  bpf_probe_read_kernel(&magic, sizeof(magic), &sb->s_magic);
-
+static __always_inline bool is_pseudo_fs_magic(unsigned long magic) {
   switch (magic) {
   case PROC_SUPER_MAGIC:
   case SYSFS_MAGIC:
-  case TMPFS_MAGIC:
   case SOCKFS_MAGIC:
   case DEBUGFS_MAGIC:
   case DEVPTS_SUPER_MAGIC:
@@ -948,14 +943,48 @@ static bool is_regular_file(struct file *file) {
   case TRACEFS_MAGIC:
   case 0x63677270:  /* CGROUP2_SUPER_MAGIC — cgroup v2 unified hierarchy */
   case 0xCAFE4A11:  /* BPF_FS_MAGIC — bpffs */
-  case 0x19800202:
-    is_virtual = true;
-    break;
+  case 0x19800202:  /* mqueue / eventpoll / aio-ring family */
+    return true;
   default:
-    is_virtual = false;
+    return false;
   }
+}
 
-  return !is_virtual && is_reg;
+/**
+ * @brief True if the file lives on a pseudo / virtual filesystem.
+ */
+static __always_inline bool is_pseudo_fs_file(struct file *file) {
+  if (!file) return false;
+  struct dentry *d = NULL;
+  bpf_probe_read_kernel(&d, sizeof(d), &file->f_path.dentry);
+  if (!d) return false;
+  struct super_block *sb = NULL;
+  bpf_probe_read_kernel(&sb, sizeof(sb), &d->d_sb);
+  if (!sb) return false;
+  unsigned long magic = 0;
+  bpf_probe_read_kernel(&magic, sizeof(magic), &sb->s_magic);
+  return is_pseudo_fs_magic(magic);
+}
+
+/**
+ * @brief Check if a file is a regular file on a real (non-pseudo) filesystem.
+ *
+ * Filters out pseudo-filesystems (proc, sys, devtmpfs, etc.) to focus
+ * tracing on real storage I/O. Uses filesystem magic numbers for detection.
+ *
+ * @param file  Kernel file structure pointer
+ * @return      true if regular file on real filesystem, false otherwise
+ */
+static bool is_regular_file(struct file *file) {
+  if (!file || !file->f_path.dentry || !file->f_path.dentry->d_inode ||
+      !file->f_path.dentry->d_sb) {
+    return false;
+  }
+  umode_t mode;
+  bpf_probe_read_kernel(&mode, sizeof(mode),
+                        &file->f_path.dentry->d_inode->i_mode);
+  if (!S_ISREG(mode)) return false;  /* not dir/socket/pipe/etc. */
+  return !is_pseudo_fs_file(file);
 }
 
 static bool is_regular_file_from_path(const struct path *path) {
@@ -977,30 +1006,7 @@ static bool is_regular_file_from_path(const struct path *path) {
 
   unsigned long magic = 0;
   bpf_probe_read_kernel(&magic, sizeof(magic), &sb->s_magic);
-
-  switch (magic) {
-  case PROC_SUPER_MAGIC:
-  case SYSFS_MAGIC:
-  case TMPFS_MAGIC:
-  case SOCKFS_MAGIC:
-  case DEBUGFS_MAGIC:
-  case DEVPTS_SUPER_MAGIC:
-  case DEVTMPFS_MAGIC:
-  case PIPEFS_MAGIC:
-  case CGROUP_SUPER_MAGIC:
-  case SELINUX_MAGIC:
-  case FUTEXFS_SUPER_MAGIC:
-  case INOTIFYFS_SUPER_MAGIC:
-  case XENFS_SUPER_MAGIC:
-  case RPCAUTH_GSSMAGIC:
-  case TRACEFS_MAGIC:
-  case 0x63677270:  /* CGROUP2_SUPER_MAGIC — cgroup v2 unified hierarchy */
-  case 0xCAFE4A11:  /* BPF_FS_MAGIC — bpffs */
-  case 0x19800202:
-    return false;
-  default:
-    return true;
-  }
+  return !is_pseudo_fs_magic(magic);
 }
 
 /**
@@ -2130,6 +2136,15 @@ int trace_readdir(struct pt_regs *ctx, struct file *file,
   u32 config_key = 0;
   u32 *tracer_pid = tracer_config.lookup(&config_key);
   if (tracer_pid && pid == *tracer_pid) {
+    return 0;
+  }
+
+  /* Skip directory reads on pseudo filesystems (/proc, /sys, cgroup, ...).
+   * Unlike read/write/open (which go through is_regular_file), readdir operates
+   * on a directory and so was never filtered — and it dominated event volume:
+   * /proc-walking monitors (htop/top/ps reading /proc/<pid>/task) accounted for
+   * ~27% of all VFS events, none of it real storage I/O. */
+  if (is_pseudo_fs_file(file)) {
     return 0;
   }
 
