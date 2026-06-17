@@ -918,15 +918,17 @@ static __always_inline void get_file_source(struct file *file, u32 *dev,
  * /proc polling — see analysis: ~27% of all VFS events were htop reading
  * /proc/<pid>/task.
  *
- * NOTE: TMPFS_MAGIC is listed here to preserve the existing read/write filtering
- * behavior unchanged. To also capture tmpfs (/tmp, /dev/shm) as real I/O, remove
- * the TMPFS_MAGIC case below — it then applies uniformly to every op.
+ * NOTE: tmpfs (and ramfs) are deliberately NOT treated as pseudo here — they
+ * hold real application data (/dev/shm shared memory, /tmp scratch) that is
+ * storage-relevant, so their read/write/mmap/readdir are captured like any real
+ * filesystem. (This is a deliberate change from the previous behavior, which
+ * dropped tmpfs in is_regular_file.) ramdisk-backed data is still I/O we care
+ * about; only the synthetic introspection/IPC filesystems below are dropped.
  */
 static __always_inline bool is_pseudo_fs_magic(unsigned long magic) {
   switch (magic) {
   case PROC_SUPER_MAGIC:
   case SYSFS_MAGIC:
-  case TMPFS_MAGIC:
   case SOCKFS_MAGIC:
   case DEBUGFS_MAGIC:
   case DEVPTS_SUPER_MAGIC:
