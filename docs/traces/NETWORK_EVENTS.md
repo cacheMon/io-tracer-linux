@@ -28,7 +28,18 @@ from the kernel `bpf_ktime_get_ns()`) — the common cross-stream correlation
 clock. Add the manifest's `clock.mono_to_real_offset_ns` to recover wall-clock
 nanoseconds.
 
-## Connection Lifecycle — `nw_conn/nw_conn_*.csv`
+**Output Files:** Like every other trace stream, network streams are
+Zstandard-compressed on disk and on upload:
+
+- `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/nw_conn/nw_conn_*.csv.zst`
+- `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/nw_epoll/nw_epoll_*.csv.zst`
+- `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/nw_sockopt/nw_sockopt_*.csv.zst`
+- `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/nw_drop/nw_drop_*.csv.zst`
+
+(They are left uncompressed only when the optional `zstandard` library is
+unavailable — the same fallback that applies to all streams.)
+
+## Connection Lifecycle — `nw_conn/nw_conn_*.csv.zst`
 
 | # | Field | Type | Description |
 |---|-------|------|-------------|
@@ -51,7 +62,7 @@ nanoseconds.
 | 17 | return_value | `s32` | Syscall return value |
 | 18 | mono_ns | `u64` | Cross-stream correlation clock |
 
-## Multiplexing (epoll/poll/select) — `nw_epoll/nw_epoll_*.csv`
+## Multiplexing (epoll/poll/select) — `nw_epoll/nw_epoll_*.csv.zst`
 
 | # | Field | Type | Description |
 |---|-------|------|-------------|
@@ -70,7 +81,7 @@ nanoseconds.
 | 13 | latency_ns | `u64` | Wait entry→exit latency; empty otherwise |
 | 14 | mono_ns | `u64` | Cross-stream correlation clock |
 
-## Socket Options — `nw_sockopt/nw_sockopt_*.csv`
+## Socket Options — `nw_sockopt/nw_sockopt_*.csv.zst`
 
 | # | Field | Type | Description |
 |---|-------|------|-------------|
@@ -85,7 +96,7 @@ nanoseconds.
 | 9 | return_value | `s32` | Syscall return value |
 | 10 | mono_ns | `u64` | Cross-stream correlation clock |
 
-## Drops & Retransmits — `nw_drop/nw_drop_*.csv`
+## Drops & Retransmits — `nw_drop/nw_drop_*.csv.zst`
 
 | # | Field | Type | Description |
 |---|-------|------|-------------|
