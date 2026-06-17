@@ -16,10 +16,11 @@ Subcommands:
 Options:
     -v, --verbose             Print verbose output
     -a, --anonimize           Enable anonymization of process and file names
-    --cache                   Enable page-cache event tracing (off by default;
-                              higher overhead)
+    --cache                   Enable page-cache event tracing (higher overhead).
+                              Auto-enabled when the host has enough CPU and DRAM.
     --network                 Enable network event tracing — connection
-                              lifecycle, epoll, sockopt, drops (off by default)
+                              lifecycle, epoll, sockopt, drops. Auto-enabled when
+                              the host has enough CPU, DRAM and network.
     --computer-id             Print this machine ID and exit
     --reward                  Show your reward code (unlocked after uploading traces)
     --no-upload               Disable automatic upload of traces
@@ -51,7 +52,12 @@ import sys
 import tempfile
 
 from src.tracer.IOTracer import IOTracer
-from src.utility.utils import capture_machine_id, get_reward_code, is_reward_unlocked
+from src.utility.utils import (
+    auto_select_tracing,
+    capture_machine_id,
+    get_reward_code,
+    is_reward_unlocked,
+)
 
 
 def maximize_fd_limit():
@@ -78,8 +84,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Trace IO syscalls')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
     parser.add_argument('-a', '--anonimize', action='store_true', help='Enable anonymization of process and file names')
-    parser.add_argument('--cache', action='store_true', help='Enable page-cache event tracing (off by default; higher overhead)')
-    parser.add_argument('--network', action='store_true', help='Enable network event tracing: connection lifecycle, epoll, sockopt, drops (off by default)')
+    parser.add_argument('--cache', action='store_true', help='Force-enable page-cache event tracing (higher overhead; otherwise auto-enabled when the host has enough CPU and DRAM)')
+    parser.add_argument('--network', action='store_true', help='Force-enable network event tracing: connection lifecycle, epoll, sockopt, drops (otherwise auto-enabled when the host has enough CPU, DRAM and network)')
     parser.add_argument('--computer-id', action='store_true', help='Print this machine ID and exit')
     parser.add_argument('--reward', action='store_true', help='Show your reward code (unlocked after uploading traces)')
     parser.add_argument('--no-upload', action='store_true', help='Disable automatic upload of traces (for testing)')
@@ -88,8 +94,8 @@ if __name__ == "__main__":
     dev_parser = subparsers.add_parser('dev', help='Run in developer mode with extra logs and checks')
     dev_parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
     dev_parser.add_argument('-a', '--anonimize', action='store_true', help='Enable anonymization of process and file names')
-    dev_parser.add_argument('--cache', action='store_true', help='Enable page-cache event tracing (off by default; higher overhead)')
-    dev_parser.add_argument('--network', action='store_true', help='Enable network event tracing: connection lifecycle, epoll, sockopt, drops (off by default)')
+    dev_parser.add_argument('--cache', action='store_true', help='Force-enable page-cache event tracing (higher overhead; otherwise auto-enabled when the host has enough CPU and DRAM)')
+    dev_parser.add_argument('--network', action='store_true', help='Force-enable network event tracing: connection lifecycle, epoll, sockopt, drops (otherwise auto-enabled when the host has enough CPU, DRAM and network)')
     dev_parser.add_argument('--no-upload', action='store_true', help='Disable automatic upload of traces (for testing)')
     dev_parser.add_argument('--trace-bucket', type=str, default=None, help='Override upload bucket name (default: linux_trace_v4_test)')
 
@@ -117,6 +123,13 @@ if __name__ == "__main__":
     trace_cache = parse_args.cache
     trace_network = parse_args.network
     trace_bucket = parse_args.trace_bucket if developer_mode else None
+
+    # Auto-enable the higher-overhead cache/network probes when the host has
+    # enough CPU, DRAM and network headroom. Explicit --cache/--network flags
+    # are always honored; this only switches a subsystem on, never off.
+    trace_cache, trace_network = auto_select_tracing(
+        trace_cache, trace_network, verbose=verbose
+    )
 
     # Initialize and start the IO tracer
     tracer = IOTracer(

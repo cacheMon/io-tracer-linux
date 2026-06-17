@@ -22,6 +22,12 @@ from src.utility.utils import (
     hash_filename_in_path,
     anonymize_path,
     inet4_from_event,
+    evaluate_resource_tracing,
+    auto_select_tracing,
+    AUTO_TRACE_MIN_LOGICAL_CORES,
+    AUTO_TRACE_MIN_TOTAL_RAM_GB,
+    AUTO_TRACE_MIN_AVAIL_RAM_GB,
+    AUTO_TRACE_MIN_NET_SPEED_MBPS,
 )
 
 
@@ -97,6 +103,53 @@ class InetTests(unittest.TestCase):
         import struct
         packed = struct.unpack("!I", socket.inet_aton("127.0.0.1"))[0]
         self.assertEqual(inet4_from_event(packed), "127.0.0.1")
+
+
+class ResourceTracingTests(unittest.TestCase):
+    # A machine that comfortably clears every threshold.
+    BIG = dict(
+        logical_cores=AUTO_TRACE_MIN_LOGICAL_CORES,
+        total_ram_gb=AUTO_TRACE_MIN_TOTAL_RAM_GB,
+        available_ram_gb=AUTO_TRACE_MIN_AVAIL_RAM_GB,
+        max_net_speed_mbps=AUTO_TRACE_MIN_NET_SPEED_MBPS,
+    )
+
+    def test_enough_of_everything_enables_both(self):
+        d = evaluate_resource_tracing(**self.BIG)
+        self.assertTrue(d["enable_cache"])
+        self.assertTrue(d["enable_network"])
+
+    def test_slow_network_keeps_cache_but_drops_network(self):
+        d = evaluate_resource_tracing(**{**self.BIG, "max_net_speed_mbps": 100})
+        self.assertTrue(d["enable_cache"])
+        self.assertFalse(d["enable_network"])
+
+    def test_too_few_cores_disables_both(self):
+        d = evaluate_resource_tracing(**{**self.BIG, "logical_cores": 1})
+        self.assertFalse(d["enable_cache"])
+        self.assertFalse(d["enable_network"])
+
+    def test_low_total_ram_disables_both(self):
+        d = evaluate_resource_tracing(**{**self.BIG, "total_ram_gb": 2.0})
+        self.assertFalse(d["enable_cache"])
+        self.assertFalse(d["enable_network"])
+
+    def test_low_available_ram_disables_both(self):
+        d = evaluate_resource_tracing(**{**self.BIG, "available_ram_gb": 0.5})
+        self.assertFalse(d["enable_cache"])
+        self.assertFalse(d["enable_network"])
+
+    def test_zero_resources_is_safe(self):
+        d = evaluate_resource_tracing(0, 0, 0, 0)
+        self.assertFalse(d["enable_cache"])
+        self.assertFalse(d["enable_network"])
+
+    def test_auto_select_never_disables_explicit_optin(self):
+        # Even on a resource-starved host (detection returns zeros here since
+        # psutil may be unavailable), an explicit request is preserved.
+        cache, network = auto_select_tracing(True, True)
+        self.assertTrue(cache)
+        self.assertTrue(network)
 
 
 if __name__ == "__main__":
