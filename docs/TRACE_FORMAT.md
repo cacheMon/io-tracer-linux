@@ -64,7 +64,7 @@ than hard-coding column positions.
 timestamp,operation,pid,tid,command,filename,size,offset,bytes_completed,inode,device,flags,duration_ns,return_value,errno,mmap_prot,mmap_flags,address,cmdline,ppid,container_id,fs_type,mono_ns
 ```
 
-**Schema v3 — cross-OS aligned.** Columns 1–12 (`timestamp` … `flags`) are the
+**Cross-OS aligned.** Columns 1–12 (`timestamp` … `flags`) are the
 **shared prefix** emitted identically by the Windows tracer's `filesystem/`
 stream, so a single parser reads the comparable fields from either OS. The
 remaining columns are Linux-only extras. `operation` is now a **lowercase**
@@ -89,7 +89,7 @@ For operations captured and examples, see [VFS_EVENTS.md](traces/VFS_EVENTS.md).
 timestamp,operation,pid,tid,command,sector,size,latency_ms,device,flags,cpu_id,ppid,queue_latency_ms,command_flags,operation_code,request_id,mono_ns
 ```
 
-**Schema v3 — cross-OS aligned.** Columns 1–10 (`timestamp` … `flags`) are the
+**Cross-OS aligned.** Columns 1–10 (`timestamp` … `flags`) are the
 **shared prefix** emitted identically by the Windows tracer's `ds/` stream. The
 `operation` column now holds the **base op only** (`read`, `write`, `flush`,
 `discard`, …); the rwbs sub-flags (`sync`, `meta`, `ahead`, …) that used to be
@@ -319,7 +319,7 @@ events in the kernel buffer.
 ## Version Information
 
 This documentation applies to:
-- **Trace schema:** version 2 (`SCHEMA_VERSION` in `src/tracer/schema.py`)
+- **Trace schema:** version 1 (`SCHEMA_VERSION` in `src/tracer/schema.py`)
 - **Kernel:** Linux 5.4+
 - **BCC:** 0.18.0+
 

@@ -15,6 +15,7 @@ Bump ``SCHEMA_VERSION`` whenever a stream's columns change; consumers should rea
 it from ``manifest.json`` and adapt.
 """
 
+# Historical format evolution (for reference only — see the note below):
 # v1: original headerless CSVs, no manifest, per-stream clocks.
 # v2: CSV headers + manifest.json + a common ``mono_ns`` column on every stream.
 # v3: cross-OS aligned layout for ``fs`` and ``ds`` — a fixed shared column
@@ -22,7 +23,11 @@ it from ``manifest.json`` and adapt.
 #     Linux-only extras, lowercase canonical operation names, ``size_requested``
 #     renamed to ``size``, and a dedicated block ``flags`` column (rwbs sub-flags
 #     split out of ``operation``).
-SCHEMA_VERSION = 3
+# Schema version stamped into manifest.json. Reset to 1 by request; the column
+# layout remains the cross-OS aligned fs/ds format described below.
+# NOTE: this overrides the historical v1–v3 numbering above — the on-disk format
+# is the aligned layout (what the changelog calls v3), not the original v1 format.
+SCHEMA_VERSION = 1
 
 
 def _col(name, ctype, unit="", desc=""):
