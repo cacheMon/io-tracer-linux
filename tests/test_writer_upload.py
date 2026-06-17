@@ -345,5 +345,65 @@ class MultiPartSnapshotHeaderTests(unittest.TestCase):
         self.assertEqual(second[0], "rowB,2")
 
 
+class NetworkStreamCompressionTests(unittest.TestCase):
+    """Network streams (nw_conn/nw_epoll/nw_sockopt/nw_drop) must be compressed
+    and uploaded exactly like every other trace stream — both at shutdown
+    (force_flush) and on mid-trace rotation."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.output_dir = os.path.join(self.tmp, "trace")
+        self.upload = FakeUploadManager()
+        self.wm = SilentWriteManager(
+            output_dir=self.output_dir,
+            upload_manager=self.upload,
+            automatic_upload=True,
+        )
+
+    def tearDown(self):
+        import shutil
+        try:
+            self.wm.close_handles()
+        except Exception:
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_all_network_streams_registered_for_rotation(self):
+        # Every network stream must be in the generic rotation registry so a
+        # slow stream is compressed+uploaded mid-trace, not just at shutdown.
+        for key in ("nw_conn", "nw_epoll", "nw_sockopt", "nw_drop"):
+            self.assertIn(key, self.wm._streams, key)
+
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
+    def test_force_flush_compresses_network_streams(self):
+        self.wm.append_conn_log("ts,CONNECT,1,1,proc,AF_INET")
+        self.wm.append_epoll_log("ts,EPOLL_WAIT,1,1,proc")
+        self.wm.append_sockopt_log("ts,SET,1,proc,3")
+        self.wm.append_drop_log("ts,PACKET_DROP,1,proc,TCP")
+
+        self.wm.force_flush()
+
+        # Each stream produced exactly one compressed upload under its own subdir.
+        subdirs = {os.path.basename(os.path.dirname(p)) for p in self.upload.uploaded}
+        for sub in ("nw_conn", "nw_epoll", "nw_sockopt", "nw_drop"):
+            self.assertIn(sub, subdirs, sub)
+        for p in self.upload.uploaded:
+            self.assertTrue(p.endswith(".csv.zst"), p)
+            self.assertTrue(os.path.exists(p))
+
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
+    def test_network_threshold_rotation_compresses(self):
+        # Dropping the threshold forces a mid-trace rotation, which must
+        # compress+upload the rotated file just like the continuous streams.
+        self.wm.nw_conn_max_events = 3
+        for i in range(7):
+            self.wm.append_conn_log(f"row{i}")
+
+        self.assertTrue(self.upload.uploaded)
+        for p in self.upload.uploaded:
+            self.assertTrue(p.endswith(".csv.zst"), p)
+            self.assertEqual(os.path.basename(os.path.dirname(p)), "nw_conn")
+
+
 if __name__ == "__main__":
     unittest.main()
