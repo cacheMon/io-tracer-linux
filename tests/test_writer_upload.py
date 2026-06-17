@@ -384,6 +384,7 @@ class NetworkStreamCompressionTests(unittest.TestCase):
         self.wm.force_flush()
 
         # Each stream produced exactly one compressed upload under its own subdir.
+        self.assertEqual(len(self.upload.uploaded), 4)
         subdirs = {os.path.basename(os.path.dirname(p)) for p in self.upload.uploaded}
         for sub in ("nw_conn", "nw_epoll", "nw_sockopt", "nw_drop"):
             self.assertIn(sub, subdirs, sub)
@@ -399,7 +400,9 @@ class NetworkStreamCompressionTests(unittest.TestCase):
         for i in range(7):
             self.wm.append_conn_log(f"row{i}")
 
-        self.assertTrue(self.upload.uploaded)
+        # 7 events at a threshold of 3 → 2 full rotations (2 uploads), with 1
+        # event left buffered (force_flush is not called here).
+        self.assertEqual(len(self.upload.uploaded), 2)
         for p in self.upload.uploaded:
             self.assertTrue(p.endswith(".csv.zst"), p)
             self.assertEqual(os.path.basename(os.path.dirname(p)), "nw_conn")
