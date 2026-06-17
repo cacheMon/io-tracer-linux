@@ -510,10 +510,10 @@ def format_csv_row(*fields) -> str:
 # host resources. The page-cache and network probes add CPU and DRAM overhead,
 # so they are only switched on automatically when the machine has headroom to
 # spare. Tune these in one place rather than scattering magic numbers.
-AUTO_TRACE_MIN_LOGICAL_CORES = 4      # cores needed to absorb extra probe work
-AUTO_TRACE_MIN_TOTAL_RAM_GB = 7.5     # total DRAM for the larger event buffers (8 GB hosts report ~7.5-7.8 GiB usable)
+AUTO_TRACE_MIN_LOGICAL_CORES = 8      # cores needed to absorb extra probe work
+AUTO_TRACE_MIN_TOTAL_RAM_GB = 15.0    # total DRAM for the larger event buffers
 AUTO_TRACE_MIN_AVAIL_RAM_GB = 2.0     # free DRAM headroom at start-of-trace
-AUTO_TRACE_MIN_NET_SPEED_MBPS = 1000  # a link fast enough (>=1 Gbps) to be worth tracing
+AUTO_TRACE_MIN_NET_SPEED_MBPS = 10    # a link fast enough (>=10 Mbps) to be worth tracing
 
 
 def detect_host_resources() -> dict:

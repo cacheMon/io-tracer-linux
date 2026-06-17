@@ -120,7 +120,7 @@ class ResourceTracingTests(unittest.TestCase):
         self.assertTrue(d["enable_network"])
 
     def test_slow_network_keeps_cache_but_drops_network(self):
-        d = evaluate_resource_tracing(**{**self.BIG, "max_net_speed_mbps": 100})
+        d = evaluate_resource_tracing(**{**self.BIG, "max_net_speed_mbps": 1})
         self.assertTrue(d["enable_cache"])
         self.assertFalse(d["enable_network"])
 
