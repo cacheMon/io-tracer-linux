@@ -1123,12 +1123,20 @@ static int get_file_path_from_dentry(struct dentry *dentry, char *buf,
 #define DPATH_MAX_DEPTH 12
 #define DPATH_MASK (FILENAME_MAX_LEN - 1)
 
+/* Per-CPU scratch for the component-pointer chain — kept off the BPF stack,
+ * which is only 512 bytes and already mostly consumed by struct data_t. */
+struct dpath_scratch { const unsigned char *names[DPATH_MAX_DEPTH]; };
+BPF_PERCPU_ARRAY(dpath_scratch_map, struct dpath_scratch, 1);
+
 static __always_inline void build_dentry_path(struct dentry *dentry,
                                               char *buf, int buf_size) {
   buf[0] = '\0';
   if (!dentry) return;
 
-  const unsigned char *names[DPATH_MAX_DEPTH];
+  u32 zero = 0;
+  struct dpath_scratch *sc = dpath_scratch_map.lookup(&zero);
+  if (!sc) return;
+
   int n = 0;
   struct dentry *d = dentry;
 
@@ -1138,7 +1146,7 @@ static __always_inline void build_dentry_path(struct dentry *dentry,
     const unsigned char *np = NULL;
     bpf_probe_read_kernel(&parent, sizeof(parent), &d->d_parent);
     bpf_probe_read_kernel(&np, sizeof(np), &d->d_name.name);
-    names[i] = np;
+    sc->names[i] = np;
     n = i + 1;
     if (!parent || parent == d) break;   /* reached the (mount) root */
     d = parent;
@@ -1148,7 +1156,7 @@ static __always_inline void build_dentry_path(struct dentry *dentry,
 #pragma unroll
   for (int i = DPATH_MAX_DEPTH - 1; i >= 0; i--) {
     if (i >= n) continue;
-    const unsigned char *np = names[i];
+    const unsigned char *np = sc->names[i];
     if (!np) continue;
 
     if (off < buf_size - 1) {            /* component separator */
