@@ -506,6 +506,142 @@ def format_csv_row(*fields) -> str:
     return output.getvalue()
 
 
+# Thresholds for auto-enabling the higher-overhead tracing subsystems based on
+# host resources. The page-cache and network probes add CPU and DRAM overhead,
+# so they are only switched on automatically when the machine has headroom to
+# spare. Tune these in one place rather than scattering magic numbers.
+AUTO_TRACE_MIN_LOGICAL_CORES = 8      # cores needed to absorb extra probe work
+AUTO_TRACE_MIN_TOTAL_RAM_GB = 15.0    # total DRAM for the larger event buffers
+AUTO_TRACE_MIN_AVAIL_RAM_GB = 2.0     # free DRAM headroom at start-of-trace
+AUTO_TRACE_MIN_NET_SPEED_MBPS = 10    # a link fast enough (>=10 Mbps) to be worth tracing
+
+
+def detect_host_resources() -> dict:
+    """
+    Sample the host's CPU, DRAM and network capacity.
+
+    Uses psutil (already a runtime dependency). Returns a dict with keys
+    ``logical_cores``, ``total_ram_gb``, ``available_ram_gb`` and
+    ``max_net_speed_mbps``. Any field that cannot be determined is reported as
+    0 so callers can treat it as "not enough" rather than crashing.
+
+    The network figure is the fastest reported speed among up, non-loopback
+    interfaces; interfaces that report an unknown speed (0) are ignored.
+    """
+    resources = {
+        "logical_cores": 0,
+        "total_ram_gb": 0.0,
+        "available_ram_gb": 0.0,
+        "max_net_speed_mbps": 0,
+    }
+    try:
+        import psutil
+
+        # psutil can return None in some virtualized/containerized environments;
+        # fall back to the stdlib count before giving up.
+        resources["logical_cores"] = psutil.cpu_count(logical=True) or os.cpu_count() or 0
+
+        mem = psutil.virtual_memory()
+        resources["total_ram_gb"] = mem.total / (1024 ** 3)
+        resources["available_ram_gb"] = mem.available / (1024 ** 3)
+
+        speeds = [
+            stats.speed
+            for name, stats in psutil.net_if_stats().items()
+            if stats.isup and name != "lo" and stats.speed and stats.speed > 0
+        ]
+        resources["max_net_speed_mbps"] = max(speeds) if speeds else 0
+    except Exception:
+        # Leave the conservative zero defaults in place; the evaluator will
+        # then decline to auto-enable anything.
+        pass
+    return resources
+
+
+def evaluate_resource_tracing(
+    logical_cores: int,
+    total_ram_gb: float,
+    available_ram_gb: float,
+    max_net_speed_mbps: int,
+) -> dict:
+    """
+    Decide whether cache/network tracing is advisable for the given resources.
+
+    Pure function (no I/O) so it is easy to unit test. Page-cache tracing is
+    gated on CPU and DRAM; network tracing additionally requires a fast enough
+    link to be worthwhile. Returns a dict with boolean ``enable_cache`` /
+    ``enable_network`` plus the individual ``cpu_ok`` / ``ram_ok`` / ``net_ok``
+    checks for logging.
+    """
+    cpu_ok = (logical_cores or 0) >= AUTO_TRACE_MIN_LOGICAL_CORES
+    ram_ok = (
+        (total_ram_gb or 0) >= AUTO_TRACE_MIN_TOTAL_RAM_GB
+        and (available_ram_gb or 0) >= AUTO_TRACE_MIN_AVAIL_RAM_GB
+    )
+    net_ok = (max_net_speed_mbps or 0) >= AUTO_TRACE_MIN_NET_SPEED_MBPS
+    return {
+        "cpu_ok": cpu_ok,
+        "ram_ok": ram_ok,
+        "net_ok": net_ok,
+        "enable_cache": cpu_ok and ram_ok,
+        "enable_network": cpu_ok and ram_ok and net_ok,
+    }
+
+
+def auto_select_tracing(
+    trace_cache: bool, trace_network: bool, verbose: bool = False
+) -> tuple[bool, bool]:
+    """
+    Auto-enable cache/network tracing when the host has spare resources.
+
+    Explicit opt-ins are always honored: a flag already set to True is never
+    turned back off. A feature is only flipped on when the host clears the
+    resource thresholds (see ``evaluate_resource_tracing``).
+
+    Args:
+        trace_cache: whether page-cache tracing was explicitly requested
+        trace_network: whether network tracing was explicitly requested
+        verbose: when True, log the detected resources and the decision
+
+    Returns:
+        (trace_cache, trace_network) after applying the auto policy.
+    """
+    resources = detect_host_resources()
+    decision = evaluate_resource_tracing(
+        resources["logical_cores"],
+        resources["total_ram_gb"],
+        resources["available_ram_gb"],
+        resources["max_net_speed_mbps"],
+    )
+
+    auto_cache = trace_cache or decision["enable_cache"]
+    auto_network = trace_network or decision["enable_network"]
+
+    if verbose:
+        logger(
+            "info",
+            "Host resources: "
+            f"{resources['logical_cores']} logical cores, "
+            f"{resources['total_ram_gb']:.1f} GB RAM total / "
+            f"{resources['available_ram_gb']:.1f} GB available, "
+            f"{resources['max_net_speed_mbps']} Mbps fastest link "
+            f"(thresholds: >={AUTO_TRACE_MIN_LOGICAL_CORES} cores, "
+            f">={AUTO_TRACE_MIN_TOTAL_RAM_GB:.0f} GB total / "
+            f">={AUTO_TRACE_MIN_AVAIL_RAM_GB:.0f} GB free, "
+            f">={AUTO_TRACE_MIN_NET_SPEED_MBPS} Mbps).",
+        )
+        if auto_cache and not trace_cache:
+            logger("info", "Auto-enabled page-cache tracing (host has enough CPU and DRAM).")
+        if auto_network and not trace_network:
+            logger("info", "Auto-enabled network tracing (host has enough CPU, DRAM and network).")
+        if not auto_cache:
+            logger("info", "Page-cache tracing left off (insufficient CPU/DRAM headroom).")
+        if not auto_network:
+            logger("info", "Network tracing left off (insufficient CPU/DRAM/network headroom).")
+
+    return auto_cache, auto_network
+
+
 if __name__ == "__main__":
     out = format_csv_row("field1", "field,with,commas", 'field "with" quotes', "simplefield")
     print(out)  # For demonstration purposes
