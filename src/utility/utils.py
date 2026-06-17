@@ -511,7 +511,7 @@ def format_csv_row(*fields) -> str:
 # so they are only switched on automatically when the machine has headroom to
 # spare. Tune these in one place rather than scattering magic numbers.
 AUTO_TRACE_MIN_LOGICAL_CORES = 4      # cores needed to absorb extra probe work
-AUTO_TRACE_MIN_TOTAL_RAM_GB = 8.0     # total DRAM for the larger event buffers
+AUTO_TRACE_MIN_TOTAL_RAM_GB = 7.5     # total DRAM for the larger event buffers (8 GB hosts report ~7.5-7.8 GiB usable)
 AUTO_TRACE_MIN_AVAIL_RAM_GB = 2.0     # free DRAM headroom at start-of-trace
 AUTO_TRACE_MIN_NET_SPEED_MBPS = 1000  # a link fast enough (>=1 Gbps) to be worth tracing
 
@@ -537,7 +537,9 @@ def detect_host_resources() -> dict:
     try:
         import psutil
 
-        resources["logical_cores"] = psutil.cpu_count(logical=True) or 0
+        # psutil can return None in some virtualized/containerized environments;
+        # fall back to the stdlib count before giving up.
+        resources["logical_cores"] = psutil.cpu_count(logical=True) or os.cpu_count() or 0
 
         mem = psutil.virtual_memory()
         resources["total_ram_gb"] = mem.total / (1024 ** 3)
@@ -586,7 +588,9 @@ def evaluate_resource_tracing(
     }
 
 
-def auto_select_tracing(trace_cache: bool, trace_network: bool, verbose: bool = False):
+def auto_select_tracing(
+    trace_cache: bool, trace_network: bool, verbose: bool = False
+) -> tuple[bool, bool]:
     """
     Auto-enable cache/network tracing when the host has spare resources.
 
