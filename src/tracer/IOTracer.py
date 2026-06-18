@@ -109,7 +109,7 @@ class IOTracer:
             trace_cache: Attach page-cache probes and stream cache events
                 (default: False — off to keep overhead minimal)
             trace_network: Compile/attach the low-overhead network probe subset
-                (connection lifecycle, epoll, sockopt, drops) and stream their
+                (connection lifecycle, sockopt, drops) and stream their
                 events (default: False — off to keep overhead minimal)
 
         Raises:
@@ -216,7 +216,7 @@ class IOTracer:
                         if "cmd_flags" in f.read():
                             cflags.append("-DHAS_CMD_FLAGS")
                 # Compile the network probe subset only when requested. The
-                # connection/epoll/sockopt/drop probes auto-attach when compiled,
+                # connection/sockopt/drop probes auto-attach when compiled,
                 # so gating at compile time keeps overhead at zero when off.
                 if self.trace_network:
                     cflags.append("-DENABLE_NETWORK")
@@ -851,36 +851,6 @@ class IOTracer:
         )
         self.writer.append_conn_log(output)
 
-    def _print_event_epoll(self, cpu, data, size):
-        """
-        Callback for epoll/multiplexing events (epoll_create/ctl/wait, poll, select).
-        """
-        e = self.b["net_epoll_events"].event(data)
-        if e.pid == self._self_pid:
-            return
-        comm = e.comm.decode("utf-8", errors="replace").strip("\x00")
-        if self._should_filter_process(comm):
-            return
-
-        timestamp = self._ns_to_walltime(getattr(e, "ts_ns", 0))
-        output = format_csv_row(
-            timestamp,
-            FlagMapper.format_epoll_event_type(e.event_type),
-            str(e.pid),
-            str(e.tid),
-            comm,
-            str(e.epoll_fd) if e.epoll_fd else "",
-            str(e.target_fd) if e.target_fd else "",
-            FlagMapper.format_epoll_op(e.epoll_op) if e.epoll_op else "",
-            FlagMapper.format_epoll_events(e.epoll_events) if e.epoll_events else "",
-            str(e.max_events) if e.max_events else "",
-            str(e.ready_count),
-            str(e.timeout_ms) if e.timeout_ms else "",
-            str(e.latency_ns) if e.latency_ns else "",
-            getattr(e, "ts_ns", 0),
-        )
-        self.writer.append_epoll_log(output)
-
     def _print_event_sockopt(self, cpu, data, size):
         """
         Callback for socket-option events (setsockopt/getsockopt).
@@ -1361,7 +1331,6 @@ class IOTracer:
         if self.trace_network:
             for buf_name, callback, stream in (
                 ("net_conn_events", self._print_event_conn, "nw_conn"),
-                ("net_epoll_events", self._print_event_epoll, "nw_epoll"),
                 ("net_sockopt_events", self._print_event_sockopt, "nw_sockopt"),
                 ("net_drop_events", self._print_event_drop, "nw_drop"),
             ):

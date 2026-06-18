@@ -96,7 +96,7 @@ def main():
     b.cleanup()
 
     # Opt-in network subset: compile + load with -DENABLE_NETWORK so the
-    # connection/epoll/sockopt/drop probes get verifier coverage too. Their
+    # connection/sockopt/drop probes get verifier coverage too. Their
     # TRACEPOINT_PROBE handlers auto-attach on load, so a successful BPF()
     # construction validates both compile and attach.
     net_cflags = build_cflags() + ["-DENABLE_NETWORK"]

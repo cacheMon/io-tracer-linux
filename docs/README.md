@@ -21,7 +21,6 @@ linux_trace_v4_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── cache/                 # Page cache events (opt-in: --cache)
 ├── pagefault/             # Page fault events
 ├── nw_conn/               # Network connection lifecycle (opt-in: --network)
-├── nw_epoll/              # Network epoll/poll/select events (opt-in: --network)
 ├── nw_sockopt/            # Network socket-option events (opt-in: --network)
 ├── nw_drop/               # Network drops/retransmits (opt-in: --network)
 ├── process/               # Process state snapshots

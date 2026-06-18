@@ -21,7 +21,6 @@ EXPECTED_COLUMN_COUNTS = {
     "cache": 11,               # 10 + mono_ns
     "pagefault": 11,           # 10 + mono_ns
     "nw_conn": 18,             # 17 + mono_ns
-    "nw_epoll": 14,            # 13 + mono_ns
     "nw_sockopt": 10,          # 9 + mono_ns
     "nw_drop": 14,             # 13 + mono_ns
     "process": 12,             # 11 + mono_ns

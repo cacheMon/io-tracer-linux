@@ -407,9 +407,9 @@ struct cache_data {
 /* ============================================================================
  * NETWORK I/O STRUCTURES (low-overhead subset)
  * ============================================================================
- * Connection-lifecycle, epoll/multiplexing, socket-option, and drop/retransmit
- * events. The high-frequency per-packet TCP/UDP send/recv path is intentionally
- * omitted to keep kernel-side overhead minimal.
+ * Connection-lifecycle, socket-option, and drop/retransmit events. The
+ * high-frequency per-packet TCP/UDP send/recv path is intentionally omitted to
+ * keep kernel-side overhead minimal.
  */
 
 struct connect_ctx_t {
@@ -453,32 +453,6 @@ struct conn_event_data {
   u32 backlog;        /**< For listen(): listen backlog size */
   u32 shutdown_how;   /**< For shutdown(): SHUT_RD/SHUT_WR/SHUT_RDWR */
   s32 ret_val;
-  u64 latency_ns;
-};
-
-/* ---- Epoll/multiplexing event types ---- */
-enum epoll_event_type {
-  EPOLL_EV_CREATE = 0,
-  EPOLL_EV_CTL    = 1,
-  EPOLL_EV_WAIT   = 2,
-  EPOLL_EV_POLL   = 3,
-  EPOLL_EV_SELECT = 4
-};
-
-/** @brief Epoll/multiplexing event data */
-struct epoll_event_data {
-  u64 ts_ns;
-  u32 pid;
-  u32 tid;
-  char comm[TASK_COMM_LEN];
-  u8 event_type;    /**< epoll_event_type enum */
-  u32 epoll_fd;
-  u32 target_fd;
-  u32 epoll_op;     /**< EPOLL_CTL_ADD/MOD/DEL */
-  u32 epoll_events; /**< Event mask */
-  u32 max_events;
-  s32 ready_count;
-  u64 timeout_ms;
   u64 latency_ns;
 };
 
@@ -770,14 +744,6 @@ BPF_HASH(accept_ctx, u64, u64);   /**< Accept start timestamp */
 BPF_HASH(connect_ctx, u64, struct connect_ctx_t); /**< Connect start timestamp + fd */
 BPF_HASH(socket_create_ctx, u64, struct conn_event_data); /**< Socket create context */
 BPF_HASH(socket_fds, u64, u8);  /**< Track socket file descriptors (key: (pid<<32)|fd) */
-
-/* Epoll wait context */
-BPF_HASH(epoll_wait_ctx, u64, u64); /**< Epoll_wait start timestamp */
-BPF_HASH(epoll_wait_info, u64, struct epoll_event_data); /**< Epoll_wait context data */
-
-/* Poll/select context */
-BPF_HASH(poll_ctx, u64, u64);      /**< Poll start timestamp */
-BPF_HASH(select_ctx, u64, u64);    /**< Select start timestamp */
 #endif /* ENABLE_NETWORK */
 
 /* io_uring request tracking map. LRU because completions that bypass the
@@ -834,7 +800,6 @@ BPF_PERF_OUTPUT(bl_events);         /**< Block layer events (block_event) */
 BPF_PERF_OUTPUT(cache_events);      /**< Page cache events (cache_data) */
 #ifdef ENABLE_NETWORK
 BPF_PERF_OUTPUT(net_conn_events);   /**< Connection lifecycle events (conn_event_data) */
-BPF_PERF_OUTPUT(net_epoll_events);  /**< Epoll/multiplexing events (epoll_event_data) */
 BPF_PERF_OUTPUT(net_sockopt_events);/**< Socket option events (sockopt_event_data) */
 BPF_PERF_OUTPUT(net_drop_events);   /**< Drop/retransmit events (net_drop_data) */
 #endif /* ENABLE_NETWORK */
@@ -4527,9 +4492,9 @@ TRACEPOINT_PROBE(io_uring, io_uring_complete) {
 /* ============================================================================
  * NETWORK PROBES (low-overhead subset)
  * ============================================================================
- * Connection lifecycle, epoll/multiplexing, socket-option, and drop/retransmit
- * probes. Compiled and attached only when -DENABLE_NETWORK is passed (the
- * --network CLI flag). The per-packet TCP/UDP send/recv path is intentionally
+ * Connection lifecycle, socket-option, and drop/retransmit probes. Compiled
+ * and attached only when -DENABLE_NETWORK is passed (the --network CLI flag).
+ * The per-packet TCP/UDP send/recv path is intentionally
  * excluded to keep kernel-side overhead minimal.
  */
 
@@ -4865,274 +4830,6 @@ TRACEPOINT_PROBE(syscalls, sys_enter_close) {
 
   /* Remove from tracking map */
   socket_fds.delete(&pid_fd);
-  return 0;
-}
-
-/* ---- Epoll/multiplexing probes ---- */
-
-/** @brief Helper to fill common epoll_event_data fields */
-static __always_inline void fill_epoll_common(struct epoll_event_data *e, u8 event_type) {
-  e->ts_ns = bpf_ktime_get_ns();
-  u64 pid_tgid = bpf_get_current_pid_tgid();
-  e->pid = pid_tgid >> 32;
-  e->tid = (u32)pid_tgid;
-  bpf_get_current_comm(&e->comm, sizeof(e->comm));
-  e->event_type = event_type;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_enter_epoll_create1) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u32 pid = tid >> 32;
-  u32 config_key = 0;
-  u32 *tracer_pid = tracer_config.lookup(&config_key);
-  if (tracer_pid && pid == *tracer_pid) return 0;
-
-  /* We submit on exit to get the returned fd */
-  u64 ts = bpf_ktime_get_ns();
-  epoll_wait_ctx.update(&tid, &ts); /* reuse for create latency */
-  return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_exit_epoll_create1) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u64 *start_ts = epoll_wait_ctx.lookup(&tid);
-
-  struct epoll_event_data e = {};
-  fill_epoll_common(&e, EPOLL_EV_CREATE);
-  e.epoll_fd = args->ret >= 0 ? (u32)args->ret : 0;
-  e.ready_count = (s32)args->ret;
-  if (start_ts) {
-    e.latency_ns = bpf_ktime_get_ns() - *start_ts;
-    epoll_wait_ctx.delete(&tid);
-  }
-  net_epoll_events.perf_submit(args, &e, sizeof(e));
-  return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_enter_epoll_ctl) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u32 pid = tid >> 32;
-  u32 config_key = 0;
-  u32 *tracer_pid = tracer_config.lookup(&config_key);
-  if (tracer_pid && pid == *tracer_pid) return 0;
-
-  struct epoll_event_data e = {};
-  fill_epoll_common(&e, EPOLL_EV_CTL);
-  e.epoll_fd = (u32)args->epfd;
-  e.epoll_op = (u32)args->op;
-  e.target_fd = (u32)args->fd;
-
-  /* Read event mask from userspace struct epoll_event */
-  if (args->event) {
-    u32 events = 0;
-    bpf_probe_read_user(&events, sizeof(events), args->event);
-    e.epoll_events = events;
-  }
-
-  net_epoll_events.perf_submit(args, &e, sizeof(e));
-  return 0;
-}
-
-/* The legacy select(2)/poll(2)/epoll_wait(2) syscalls (and thus their
- * syscalls:sys_enter/exit_* tracepoints) exist only on architectures that keep
- * the old syscall table (x86). arm64 and other asm-generic arches implement
- * only pselect6/ppoll/epoll_pwait, so referencing these tracepoints there makes
- * BCC fail the ENTIRE BPF load. Guard them to x86; pselect6 below is handled on
- * all arches. */
-#if defined(__x86_64__) || defined(__i386__) || defined(bpf_target_x86)
-TRACEPOINT_PROBE(syscalls, sys_enter_epoll_wait) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u32 pid = tid >> 32;
-  u32 config_key = 0;
-  u32 *tracer_pid = tracer_config.lookup(&config_key);
-  if (tracer_pid && pid == *tracer_pid) return 0;
-
-  u64 ts = bpf_ktime_get_ns();
-  epoll_wait_ctx.update(&tid, &ts);
-
-  struct epoll_event_data info = {};
-  info.epoll_fd = (u32)args->epfd;
-  info.max_events = (u32)args->maxevents;
-  info.timeout_ms = (u64)(int)args->timeout;
-  epoll_wait_info.update(&tid, &info);
-  return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_exit_epoll_wait) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u64 *start_ts = epoll_wait_ctx.lookup(&tid);
-  if (!start_ts) return 0;
-
-  struct epoll_event_data e = {};
-  fill_epoll_common(&e, EPOLL_EV_WAIT);
-  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
-  e.ready_count = (s32)args->ret;
-
-  struct epoll_event_data *info = epoll_wait_info.lookup(&tid);
-  if (info) {
-    e.epoll_fd = info->epoll_fd;
-    e.max_events = info->max_events;
-    e.timeout_ms = info->timeout_ms;
-    epoll_wait_info.delete(&tid);
-  }
-
-  net_epoll_events.perf_submit(args, &e, sizeof(e));
-  epoll_wait_ctx.delete(&tid);
-  return 0;
-}
-
-/* poll() syscall */
-TRACEPOINT_PROBE(syscalls, sys_enter_poll) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u32 pid = tid >> 32;
-  u32 config_key = 0;
-  u32 *tracer_pid = tracer_config.lookup(&config_key);
-  if (tracer_pid && pid == *tracer_pid) return 0;
-
-  u64 ts = bpf_ktime_get_ns();
-  poll_ctx.update(&tid, &ts);
-  return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_exit_poll) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u64 *start_ts = poll_ctx.lookup(&tid);
-  if (!start_ts) return 0;
-
-  struct epoll_event_data e = {};
-  fill_epoll_common(&e, EPOLL_EV_POLL);
-  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
-  e.ready_count = (s32)args->ret;
-  net_epoll_events.perf_submit(args, &e, sizeof(e));
-  poll_ctx.delete(&tid);
-  return 0;
-}
-
-/* select() syscall */
-TRACEPOINT_PROBE(syscalls, sys_enter_select) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u32 pid = tid >> 32;
-  u32 config_key = 0;
-  u32 *tracer_pid = tracer_config.lookup(&config_key);
-  if (tracer_pid && pid == *tracer_pid) return 0;
-
-  u64 ts = bpf_ktime_get_ns();
-  select_ctx.update(&tid, &ts);
-  return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_exit_select) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u64 *start_ts = select_ctx.lookup(&tid);
-  if (!start_ts) return 0;
-
-  struct epoll_event_data e = {};
-  fill_epoll_common(&e, EPOLL_EV_SELECT);
-  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
-  e.ready_count = (s32)args->ret;
-  net_epoll_events.perf_submit(args, &e, sizeof(e));
-  select_ctx.delete(&tid);
-  return 0;
-}
-#endif /* x86-only legacy select/poll/epoll_wait */
-
-/* pselect6() syscall - modern libc select() uses this */
-TRACEPOINT_PROBE(syscalls, sys_enter_pselect6) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u32 pid = tid >> 32;
-  u32 config_key = 0;
-  u32 *tracer_pid = tracer_config.lookup(&config_key);
-  if (tracer_pid && pid == *tracer_pid) return 0;
-
-  u64 ts = bpf_ktime_get_ns();
-  select_ctx.update(&tid, &ts);
-  return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_exit_pselect6) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u64 *start_ts = select_ctx.lookup(&tid);
-  if (!start_ts) return 0;
-
-  struct epoll_event_data e = {};
-  fill_epoll_common(&e, EPOLL_EV_SELECT);
-  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
-  e.ready_count = (s32)args->ret;
-  net_epoll_events.perf_submit(args, &e, sizeof(e));
-  select_ctx.delete(&tid);
-  return 0;
-}
-
-/* ppoll() syscall - modern libc poll() and the only poll on arm64/asm-generic.
- * Mirrors the poll() handler (reuses poll_ctx); the ppoll timeout is a timespec
- * we don't record, matching poll()'s behavior. */
-TRACEPOINT_PROBE(syscalls, sys_enter_ppoll) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u32 pid = tid >> 32;
-  u32 config_key = 0;
-  u32 *tracer_pid = tracer_config.lookup(&config_key);
-  if (tracer_pid && pid == *tracer_pid) return 0;
-
-  u64 ts = bpf_ktime_get_ns();
-  poll_ctx.update(&tid, &ts);
-  return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_exit_ppoll) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u64 *start_ts = poll_ctx.lookup(&tid);
-  if (!start_ts) return 0;
-
-  struct epoll_event_data e = {};
-  fill_epoll_common(&e, EPOLL_EV_POLL);
-  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
-  e.ready_count = (s32)args->ret;
-  net_epoll_events.perf_submit(args, &e, sizeof(e));
-  poll_ctx.delete(&tid);
-  return 0;
-}
-
-/* epoll_pwait() syscall - what modern libc epoll_wait() issues, and the only
- * epoll wait on arm64/asm-generic. Mirrors the epoll_wait() handler (reuses
- * epoll_wait_ctx/epoll_wait_info); the leading args match epoll_wait. */
-TRACEPOINT_PROBE(syscalls, sys_enter_epoll_pwait) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u32 pid = tid >> 32;
-  u32 config_key = 0;
-  u32 *tracer_pid = tracer_config.lookup(&config_key);
-  if (tracer_pid && pid == *tracer_pid) return 0;
-
-  u64 ts = bpf_ktime_get_ns();
-  epoll_wait_ctx.update(&tid, &ts);
-
-  struct epoll_event_data info = {};
-  info.epoll_fd = (u32)args->epfd;
-  info.max_events = (u32)args->maxevents;
-  info.timeout_ms = (u64)(int)args->timeout;
-  epoll_wait_info.update(&tid, &info);
-  return 0;
-}
-
-TRACEPOINT_PROBE(syscalls, sys_exit_epoll_pwait) {
-  u64 tid = bpf_get_current_pid_tgid();
-  u64 *start_ts = epoll_wait_ctx.lookup(&tid);
-  if (!start_ts) return 0;
-
-  struct epoll_event_data e = {};
-  fill_epoll_common(&e, EPOLL_EV_WAIT);
-  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
-  e.ready_count = (s32)args->ret;
-
-  struct epoll_event_data *info = epoll_wait_info.lookup(&tid);
-  if (info) {
-    e.epoll_fd = info->epoll_fd;
-    e.max_events = info->max_events;
-    e.timeout_ms = info->timeout_ms;
-    epoll_wait_info.delete(&tid);
-  }
-
-  net_epoll_events.perf_submit(args, &e, sizeof(e));
-  epoll_wait_ctx.delete(&tid);
   return 0;
 }
 

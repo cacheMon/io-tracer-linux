@@ -18,7 +18,6 @@ linux_trace_v4_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── cache/                 # Page cache events (opt-in: --cache)
 ├── pagefault/             # Memory-mapped page fault events
 ├── nw_conn/               # Network connection lifecycle (opt-in: --network)
-├── nw_epoll/              # Network epoll/poll/select events (opt-in: --network)
 ├── nw_sockopt/            # Network socket-option events (opt-in: --network)
 ├── nw_drop/               # Network drops/retransmits (opt-in: --network)
 ├── process/               # Process state snapshots
@@ -134,9 +133,9 @@ For fault types and examples, see [PAGE_FAULT_EVENTS.md](traces/PAGE_FAULT_EVENT
 
 ## 4b. Network Events (opt-in: `--network`)
 
-**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/nw_conn|nw_epoll|nw_sockopt|nw_drop/*.csv.zst`
+**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/nw_conn|nw_sockopt|nw_drop/*.csv.zst`
 
-**Description:** Low-overhead network subset — connection lifecycle, epoll/poll/select,
+**Description:** Low-overhead network subset — connection lifecycle,
 socket options, and drops/retransmits. **Off by default**; enable with `--network`.
 The high-frequency per-packet TCP/UDP send/recv path is intentionally not traced.
 
@@ -145,8 +144,6 @@ The high-frequency per-packet TCP/UDP send/recv path is intentionally not traced
 ```csv
 # nw_conn
 timestamp,event_type,pid,tid,command,domain,sock_type,ipver,local_addr,remote_addr,sport,dport,fd,backlog,shutdown_how,latency_ns,return_value,mono_ns
-# nw_epoll
-timestamp,event_type,pid,tid,command,epoll_fd,target_fd,operation,event_mask,max_events,ready_count,timeout_ms,latency_ns,mono_ns
 # nw_sockopt
 timestamp,event_type,pid,command,fd,level,option_name,optval,return_value,mono_ns
 # nw_drop
