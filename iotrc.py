@@ -26,7 +26,7 @@ Options:
     --no-upload               Disable automatic upload of traces
 
 Dev Options (only available with 'dev' subcommand):
-    --trace-bucket NAME       Override upload bucket name (default: linux_trace_v4_test)
+    --trace-bucket NAME       Override upload bucket name (default: io-tracer/linux_v1)
 
 Examples:
     # Run with default settings
@@ -97,7 +97,7 @@ if __name__ == "__main__":
     dev_parser.add_argument('--cache', action='store_true', help='Force-enable page-cache event tracing (higher overhead; otherwise auto-enabled when the host has enough CPU and DRAM)')
     dev_parser.add_argument('--network', action='store_true', help='Force-enable network event tracing: connection lifecycle, epoll, sockopt, drops (otherwise auto-enabled when the host has enough CPU, DRAM and network)')
     dev_parser.add_argument('--no-upload', action='store_true', help='Disable automatic upload of traces (for testing)')
-    dev_parser.add_argument('--trace-bucket', type=str, default=None, help='Override upload bucket name (default: linux_trace_v4_test)')
+    dev_parser.add_argument('--trace-bucket', type=str, default=None, help='Override upload bucket name (default: io-tracer/linux_v1)')
 
     parse_args = parser.parse_args()
     output_dir = tempfile.gettempdir()
