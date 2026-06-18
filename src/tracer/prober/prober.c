@@ -1073,6 +1073,71 @@ static int get_file_path_from_dentry(struct dentry *dentry, char *buf,
   return 0;
 }
 
+/* Bounded reconstruction of a path by walking the dentry's d_parent chain.
+ *
+ * The kernel stores only the basename in d_name; bpf_d_path() would give the
+ * full path but is restricted to an attach-point allowlist that excludes the
+ * probes that need it (readdir/unlink/rename/...). So we walk up to
+ * DPATH_MAX_DEPTH parents and emit the deepest components as "/c1/c2/.../leaf".
+ *
+ * Limitations (documented for consumers): does NOT cross mount points (path is
+ * relative to the file's own mount root), and truncates to the last
+ * DPATH_MAX_DEPTH components on very deep paths. FILENAME_MAX_LEN is a power of
+ * two so masking the write offset keeps the verifier happy.
+ */
+#define DPATH_MAX_DEPTH 12
+#define DPATH_MASK (FILENAME_MAX_LEN - 1)
+
+/* Per-CPU scratch for the component-pointer chain — kept off the BPF stack,
+ * which is only 512 bytes and already mostly consumed by struct data_t. */
+struct dpath_scratch { const unsigned char *names[DPATH_MAX_DEPTH]; };
+BPF_PERCPU_ARRAY(dpath_scratch_map, struct dpath_scratch, 1);
+
+static __always_inline void build_dentry_path(struct dentry *dentry,
+                                              char *buf, int buf_size) {
+  buf[0] = '\0';
+  if (!dentry) return;
+
+  u32 zero = 0;
+  struct dpath_scratch *sc = dpath_scratch_map.lookup(&zero);
+  if (!sc) return;
+
+  int n = 0;
+  struct dentry *d = dentry;
+
+#pragma unroll
+  for (int i = 0; i < DPATH_MAX_DEPTH; i++) {
+    struct dentry *parent = NULL;
+    const unsigned char *np = NULL;
+    bpf_probe_read_kernel(&parent, sizeof(parent), &d->d_parent);
+    bpf_probe_read_kernel(&np, sizeof(np), &d->d_name.name);
+    sc->names[i] = np;
+    n = i + 1;
+    if (!parent || parent == d) break;   /* reached the (mount) root */
+    d = parent;
+  }
+
+  int off = 0;
+#pragma unroll
+  for (int i = DPATH_MAX_DEPTH - 1; i >= 0; i--) {
+    if (i >= n) continue;
+    const unsigned char *np = sc->names[i];
+    if (!np) continue;
+
+    if (off < buf_size - 1) {            /* component separator */
+      buf[off & DPATH_MASK] = '/';
+      off++;
+    }
+    int pos = off & DPATH_MASK;          /* 0..buf_size-1 */
+    int cap = buf_size - pos;            /* pos + cap == buf_size, so in-bounds */
+    if (cap > 1) {
+      long w = bpf_probe_read_kernel_str(&buf[pos], cap, np);
+      if (w > 1) off = pos + (int)(w - 1);   /* advance past name, exclude NUL */
+    }
+  }
+  buf[off & DPATH_MASK] = '\0';
+}
+
 /**
  * @brief Populate cache event metadata from inode
  *
@@ -2120,7 +2185,11 @@ int trace_readdir(struct pt_regs *ctx, struct file *file,
   data.op = OP_READDIR;
   data.inode = get_file_inode(file);
   data.size = 0;
-  get_file_path(file, data.filename, sizeof(data.filename));
+  /* readdir only ever had the basename; reconstruct the directory path by
+   * walking d_parent so directory-traversal activity is attributable. */
+  struct dentry *rd_dentry = NULL;
+  bpf_probe_read_kernel(&rd_dentry, sizeof(rd_dentry), &file->f_path.dentry);
+  build_dentry_path(rd_dentry, data.filename, sizeof(data.filename));
   bpf_probe_read_kernel(&data.flags, sizeof(data.flags), &file->f_flags);
 
   events.perf_submit(ctx, &data, sizeof(data));
