@@ -1082,11 +1082,17 @@ static int get_file_path_from_dentry(struct dentry *dentry, char *buf,
  *
  * Limitations (documented for consumers): does NOT cross mount points (path is
  * relative to the file's own mount root), and truncates to the last
- * DPATH_MAX_DEPTH components on very deep paths. FILENAME_MAX_LEN is a power of
- * two so masking the write offset keeps the verifier happy.
+ * DPATH_MAX_DEPTH components on very deep paths.
+ *
+ * The output buffer is always FILENAME_MAX_LEN bytes (a power of two), so the
+ * write offset is masked with DPATH_MASK to keep the verifier happy. The buffer
+ * size is hardcoded rather than passed in: a caller-supplied size that differed
+ * from the mask would let buf[off & DPATH_MASK] index past the buffer, so the
+ * two must stay coupled.
  */
 #define DPATH_MAX_DEPTH 12
-#define DPATH_MASK (FILENAME_MAX_LEN - 1)
+#define DPATH_BUF_SIZE FILENAME_MAX_LEN
+#define DPATH_MASK (DPATH_BUF_SIZE - 1)
 
 /* Per-CPU scratch for the component-pointer chain — kept off the BPF stack,
  * which is only 512 bytes and already mostly consumed by struct data_t. */
@@ -1094,7 +1100,7 @@ struct dpath_scratch { const unsigned char *names[DPATH_MAX_DEPTH]; };
 BPF_PERCPU_ARRAY(dpath_scratch_map, struct dpath_scratch, 1);
 
 static __always_inline void build_dentry_path(struct dentry *dentry,
-                                              char *buf, int buf_size) {
+                                              char *buf) {
   buf[0] = '\0';
   if (!dentry) return;
 
@@ -1124,12 +1130,12 @@ static __always_inline void build_dentry_path(struct dentry *dentry,
     const unsigned char *np = sc->names[i];
     if (!np) continue;
 
-    if (off < buf_size - 1) {            /* component separator */
+    if (off < DPATH_BUF_SIZE - 1) {      /* component separator */
       buf[off & DPATH_MASK] = '/';
       off++;
     }
-    int pos = off & DPATH_MASK;          /* 0..buf_size-1 */
-    int cap = buf_size - pos;            /* pos + cap == buf_size, so in-bounds */
+    int pos = off & DPATH_MASK;          /* 0..DPATH_BUF_SIZE-1 */
+    int cap = DPATH_BUF_SIZE - pos;      /* pos + cap == DPATH_BUF_SIZE, in-bounds */
     if (cap > 1) {
       long w = bpf_probe_read_kernel_str(&buf[pos], cap, np);
       if (w > 1) off = pos + (int)(w - 1);   /* advance past name, exclude NUL */
@@ -2189,7 +2195,8 @@ int trace_readdir(struct pt_regs *ctx, struct file *file,
    * walking d_parent so directory-traversal activity is attributable. */
   struct dentry *rd_dentry = NULL;
   bpf_probe_read_kernel(&rd_dentry, sizeof(rd_dentry), &file->f_path.dentry);
-  build_dentry_path(rd_dentry, data.filename, sizeof(data.filename));
+  /* data.filename is FILENAME_MAX_LEN, which build_dentry_path requires. */
+  build_dentry_path(rd_dentry, data.filename);
   bpf_probe_read_kernel(&data.flags, sizeof(data.flags), &file->f_flags);
 
   events.perf_submit(ctx, &data, sizeof(data));
