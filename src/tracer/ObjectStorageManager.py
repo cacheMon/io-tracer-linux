@@ -51,13 +51,13 @@ class ObjectStorageManager:
         _t: List of worker threads
     """
     
-    def __init__(self, version: str = "vdev", trace_bucket: str = "linux_trace_v4_test"):
+    def __init__(self, version: str = "vdev", trace_bucket: str = "linux_v1"):
         """
         Initialize the ObjectStorageManager.
 
         Args:
             version: Application version string (default: "vdev")
-            trace_bucket: Storage bucket/path prefix for uploads (default: "linux_trace_v4_test")
+            trace_bucket: Storage bucket/path prefix for uploads (default: "linux_v1")
 
         Initializes the upload queue, counters, and prepares
         for automatic upload operations.
