@@ -15,6 +15,7 @@ import sys
 import tempfile
 import types
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -165,6 +166,117 @@ class FilesystemSnapperDeltaTests(unittest.TestCase):
         self.assertTrue(self.snapper.filesystem_snapshot())
         rows = _paths_and_sizes(self.wm.take())
         self.assertEqual(set(rows), {os.path.join(self.tmp, "a.txt")})
+
+    def test_delta_reports_subtree_removal_as_tombstones(self):
+        self._write("keep.txt", "k")
+        self._write("sub/b.txt", "b")
+        self._write("sub/c.txt", "c")
+        self.snapper.filesystem_snapshot()
+        self.wm.take()
+
+        # Remove an entire subdirectory: its files must still be tombstoned even
+        # though scan_dir is never invoked on the now-missing directory.
+        import shutil
+        shutil.rmtree(os.path.join(self.tmp, "sub"))
+
+        self.snapper._visited_inodes.clear()
+        self.snapper.filesystem_snapshot()
+        rows = _paths_and_sizes(self.wm.take())
+
+        self.assertEqual(
+            set(rows),
+            {os.path.join(self.tmp, "sub/b.txt"), os.path.join(self.tmp, "sub/c.txt")},
+        )
+        self.assertTrue(all(v == DELETED_SIZE for v in rows.values()))
+
+    def test_transient_scandir_error_does_not_tombstone(self):
+        # A directory that can't be listed this pass (e.g. PermissionError) must
+        # not have its contents reported as deleted.
+        self._write("keep.txt", "k")
+        self._write("sub/b.txt", "b")
+        self.snapper.filesystem_snapshot()
+        self.wm.take()
+
+        target = os.path.join(self.tmp, "sub")
+        real_scandir = os.scandir
+
+        def fake_scandir(path):
+            if os.path.abspath(path) == target:
+                raise PermissionError(13, "Permission denied")
+            return real_scandir(path)
+
+        self.snapper._visited_inodes.clear()
+        with unittest.mock.patch(
+            "src.tracer.snappers.FilesystemSnapper.os.scandir", side_effect=fake_scandir
+        ):
+            self.snapper.filesystem_snapshot()
+
+        # No tombstones; sub/b.txt is carried forward into the new baseline.
+        self.assertEqual(self.wm.take(), [])
+        self.assertIn(os.path.join(self.tmp, "sub/b.txt"), self.snapper._prev_state)
+
+    def test_transient_file_stat_error_carries_over(self):
+        # A single file we fail to stat (transient) is carried over, not deleted;
+        # the same failure as a genuine absence (FileNotFoundError) tombstones.
+        a_path = self._write("a.txt", "a")
+        self.snapper.filesystem_snapshot()
+        self.wm.take()
+
+        class _RaisingEntry:
+            def __init__(self, path, exc):
+                self.path = path
+                self._exc = exc
+
+            def is_file(self, follow_symlinks=True):
+                return True
+
+            def is_symlink(self):
+                return False
+
+            def is_dir(self, follow_symlinks=True):
+                return False
+
+            def stat(self, follow_symlinks=True):
+                raise self._exc
+
+        class _FakeScandirCtx:
+            def __init__(self, entries):
+                self._entries = entries
+
+            def __enter__(self):
+                return iter(self._entries)
+
+            def __exit__(self, *exc):
+                return False
+
+        real_scandir = os.scandir
+
+        def patched(exc):
+            def fake_scandir(path):
+                if os.path.abspath(path) == os.path.abspath(self.tmp):
+                    return _FakeScandirCtx([_RaisingEntry(a_path, exc)])
+                return real_scandir(path)
+            return fake_scandir
+
+        # Transient (PermissionError): carried over, no tombstone.
+        self.snapper._visited_inodes.clear()
+        with unittest.mock.patch(
+            "src.tracer.snappers.FilesystemSnapper.os.scandir",
+            side_effect=patched(PermissionError(13, "denied")),
+        ):
+            self.snapper.filesystem_snapshot()
+        self.assertEqual(self.wm.take(), [])
+        self.assertIn(a_path, self.snapper._prev_state)
+
+        # Absence (FileNotFoundError): tombstoned.
+        self.snapper._visited_inodes.clear()
+        with unittest.mock.patch(
+            "src.tracer.snappers.FilesystemSnapper.os.scandir",
+            side_effect=patched(FileNotFoundError(2, "missing")),
+        ):
+            self.snapper.filesystem_snapshot()
+        rows = _paths_and_sizes(self.wm.take())
+        self.assertEqual(rows, {a_path: DELETED_SIZE})
 
     def test_anonymous_delta_emits_hashed_paths(self):
         self._write("secret.txt", "x")

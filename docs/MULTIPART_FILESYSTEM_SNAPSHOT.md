@@ -28,6 +28,16 @@ baseline for the next delta. An interrupted scan never advances the baseline,
 so after an interruption the next completed pass is diffed against the last
 good snapshot (and the first ever snapshot is always full).
 
+### Transient errors vs. real deletions
+
+Deletion detection distinguishes "the path is gone" from "we couldn't read it
+this pass". A file or directory that fails to `stat()`/`scandir()` with a
+*transient* error (e.g. `PermissionError`, an I/O error) has its previous state
+carried forward, so it is **not** falsely tombstoned. Only paths that are
+genuinely absent — `FileNotFoundError`/`NotADirectoryError`, or a path missing
+from a directory that *was* fully scanned — become tombstones. Removing an
+entire directory therefore still tombstones every file under it.
+
 ### Reconstructing state from deltas
 
 To reconstruct the filesystem state at snapshot *k*: start from the full

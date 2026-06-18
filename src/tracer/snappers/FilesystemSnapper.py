@@ -97,6 +97,13 @@ class FilesystemSnapper:
         ``DELETED_SIZE``). access time (atime) is deliberately excluded from the
         change check since it changes on every read.
 
+        Deletion detection distinguishes a genuine removal from a transient
+        read failure: if a file or directory cannot be stat'd/scanned because of
+        a transient error (e.g. a permission error), its previous state is
+        carried forward so it is not falsely tombstoned. Only paths that are
+        actually absent (or whose containing directory was fully scanned without
+        them) become tombstones.
+
         Args:
             max_depth: Maximum directory depth to traverse (default: None = unlimited)
 
@@ -132,13 +139,37 @@ class FilesystemSnapper:
             self.wm.append_fs_snap_log(out)
             count += 1
 
+        def is_transient(exc: Exception) -> bool:
+            """True for errors that mean "couldn't read it this pass" rather than
+            "it's gone". A transient failure (e.g. PermissionError, an I/O error,
+            or a momentary lock) must not be mistaken for a deletion; an absence
+            error (the path really vanished) should fall through to a tombstone.
+            """
+            return not isinstance(exc, (FileNotFoundError, NotADirectoryError))
+
+        def carry_over_subtree(dir_path: str):
+            """Preserve the previous snapshot's entries under ``dir_path`` so a
+            directory we transiently failed to read is not mistaken for the
+            deletion of everything inside it. ``setdefault`` avoids clobbering
+            entries already captured this pass (e.g. before a mid-scan failure).
+            """
+            prefix = dir_path if dir_path.endswith(os.sep) else dir_path + os.sep
+            for p, meta in self._prev_state.items():
+                if p.startswith(prefix):
+                    new_state.setdefault(p, meta)
+
         def scan_dir(path: str, depth: int = 0):
             """Inner function for recursive directory scanning."""
             if self.interrupt or (max_depth is not None and depth > max_depth):
                 return
             try:
                 st = os.stat(path, follow_symlinks=False)
-            except Exception:
+            except Exception as e:
+                # Couldn't stat the directory itself. Only carry its contents
+                # forward when the failure is transient; if it genuinely no
+                # longer exists, let its files fall through to tombstones.
+                if is_delta and is_transient(e):
+                    carry_over_subtree(path)
                 return
 
             key = (st.st_dev, st.st_ino)
@@ -170,9 +201,21 @@ class FilesystemSnapper:
                                 emit(entry.path, size, mtime_ts, ctime_ts, atime_ts)
                             elif entry.is_dir(follow_symlinks=False):
                                 scan_dir(entry.path, depth + 1)
-                        except Exception:
+                        except Exception as e:
+                            # Couldn't read this entry. On a transient failure
+                            # keep its previous state so a file we merely failed
+                            # to stat is not reported as deleted; a genuinely
+                            # missing entry falls through to the deletion pass.
+                            if is_delta and is_transient(e):
+                                prev = self._prev_state.get(entry.path)
+                                if prev is not None:
+                                    new_state.setdefault(entry.path, prev)
                             continue
-            except Exception:
+            except Exception as e:
+                # Couldn't list the directory's contents. Same rule: carry the
+                # subtree forward on a transient failure, tombstone on absence.
+                if is_delta and is_transient(e):
+                    carry_over_subtree(path)
                 return
 
         logger("info", f"Filesystem Snapshot: session started ({'delta' if is_delta else 'full'})")
