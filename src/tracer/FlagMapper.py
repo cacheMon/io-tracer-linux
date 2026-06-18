@@ -801,9 +801,9 @@ class FlagMapper:
         return cls.fs_type_map.get(int(magic), f"FS(0x{int(magic):x})")
 
     # ========================================================================
-    # NETWORK FLAG MAPS (low-overhead subset: connection lifecycle, epoll,
-    # socket options, drops). The per-packet send/recv path is not traced, so
-    # its direction/MSG_* maps are intentionally omitted.
+    # NETWORK FLAG MAPS (low-overhead subset: connection lifecycle, socket
+    # options, drops). The per-packet send/recv path is not traced, so its
+    # direction/MSG_* maps are intentionally omitted.
     # ========================================================================
 
     network_proto_map = {
@@ -854,31 +854,6 @@ class FlagMapper:
         (6, 13): "TCP_CONGESTION",
     }
 
-    epoll_op_map = {
-        1: "EPOLL_CTL_ADD",
-        2: "EPOLL_CTL_DEL",
-        3: "EPOLL_CTL_MOD",
-    }
-
-    epoll_event_flags = {
-        0x001: "EPOLLIN",
-        0x002: "EPOLLPRI",
-        0x004: "EPOLLOUT",
-        0x008: "EPOLLERR",
-        0x010: "EPOLLHUP",
-        0x020: "EPOLLNVAL",
-        0x040: "EPOLLRDNORM",
-        0x080: "EPOLLRDBAND",
-        0x100: "EPOLLWRNORM",
-        0x200: "EPOLLWRBAND",
-        0x400: "EPOLLMSG",
-        0x2000: "EPOLLRDHUP",
-        (1 << 28): "EPOLLEXCLUSIVE",
-        (1 << 29): "EPOLLWAKEUP",
-        (1 << 30): "EPOLLONESHOT",
-        (1 << 31): "EPOLLET",
-    }
-
     shutdown_how_map = {
         0: "SHUT_RD",
         1: "SHUT_WR",
@@ -893,14 +868,6 @@ class FlagMapper:
         4: "CONNECT",
         5: "SHUTDOWN",
         6: "CLOSE",
-    }
-
-    epoll_event_type_map = {
-        0: "EPOLL_CREATE",
-        1: "EPOLL_CTL",
-        2: "EPOLL_WAIT",
-        3: "POLL",
-        4: "SELECT",
     }
 
     sockopt_event_type_map = {
@@ -949,28 +916,9 @@ class FlagMapper:
         return cls.sockopt_map.get((level, optname), f"OPT({level},{optname})")
 
     @classmethod
-    def format_epoll_op(cls, op):
-        """Map epoll_ctl op to name."""
-        return cls.epoll_op_map.get(op, f"OP({op})")
-
-    @classmethod
-    def format_epoll_events(cls, mask):
-        """Decode epoll event mask to pipe-separated names."""
-        result = []
-        for flag, name in cls.epoll_event_flags.items():
-            if mask & flag:
-                result.append(name)
-        return "|".join(result) if result else "NONE"
-
-    @classmethod
     def format_conn_event(cls, event_type):
         """Map connection event type to name."""
         return cls.conn_event_type_map.get(event_type, f"CONN({event_type})")
-
-    @classmethod
-    def format_epoll_event_type(cls, event_type):
-        """Map epoll event type to name."""
-        return cls.epoll_event_type_map.get(event_type, f"EPOLL({event_type})")
 
     @classmethod
     def format_sockopt_event(cls, event_type):

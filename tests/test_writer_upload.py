@@ -346,7 +346,7 @@ class MultiPartSnapshotHeaderTests(unittest.TestCase):
 
 
 class NetworkStreamCompressionTests(unittest.TestCase):
-    """Network streams (nw_conn/nw_epoll/nw_sockopt/nw_drop) must be compressed
+    """Network streams (nw_conn/nw_sockopt/nw_drop) must be compressed
     and uploaded exactly like every other trace stream — both at shutdown
     (force_flush) and on mid-trace rotation."""
 
@@ -371,22 +371,21 @@ class NetworkStreamCompressionTests(unittest.TestCase):
     def test_all_network_streams_registered_for_rotation(self):
         # Every network stream must be in the generic rotation registry so a
         # slow stream is compressed+uploaded mid-trace, not just at shutdown.
-        for key in ("nw_conn", "nw_epoll", "nw_sockopt", "nw_drop"):
+        for key in ("nw_conn", "nw_sockopt", "nw_drop"):
             self.assertIn(key, self.wm._streams, key)
 
     @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
     def test_force_flush_compresses_network_streams(self):
         self.wm.append_conn_log("ts,CONNECT,1,1,proc,AF_INET")
-        self.wm.append_epoll_log("ts,EPOLL_WAIT,1,1,proc")
         self.wm.append_sockopt_log("ts,SET,1,proc,3")
         self.wm.append_drop_log("ts,PACKET_DROP,1,proc,TCP")
 
         self.wm.force_flush()
 
         # Each stream produced exactly one compressed upload under its own subdir.
-        self.assertEqual(len(self.upload.uploaded), 4)
+        self.assertEqual(len(self.upload.uploaded), 3)
         subdirs = {os.path.basename(os.path.dirname(p)) for p in self.upload.uploaded}
-        for sub in ("nw_conn", "nw_epoll", "nw_sockopt", "nw_drop"):
+        for sub in ("nw_conn", "nw_sockopt", "nw_drop"):
             self.assertIn(sub, subdirs, sub)
         for p in self.upload.uploaded:
             self.assertTrue(p.endswith(".csv.zst"), p)

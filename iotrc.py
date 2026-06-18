@@ -19,7 +19,7 @@ Options:
     --cache                   Enable page-cache event tracing (higher overhead).
                               Auto-enabled when the host has enough CPU and DRAM.
     --network                 Enable network event tracing — connection
-                              lifecycle, epoll, sockopt, drops. Auto-enabled when
+                              lifecycle, sockopt, drops. Auto-enabled when
                               the host has enough CPU, DRAM and network.
     --computer-id             Print this machine ID and exit
     --reward                  Show your reward code (unlocked after uploading traces)
@@ -85,7 +85,7 @@ if __name__ == "__main__":
     parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
     parser.add_argument('-a', '--anonimize', action='store_true', help='Enable anonymization of process and file names')
     parser.add_argument('--cache', action='store_true', help='Force-enable page-cache event tracing (higher overhead; otherwise auto-enabled when the host has enough CPU and DRAM)')
-    parser.add_argument('--network', action='store_true', help='Force-enable network event tracing: connection lifecycle, epoll, sockopt, drops (otherwise auto-enabled when the host has enough CPU, DRAM and network)')
+    parser.add_argument('--network', action='store_true', help='Force-enable network event tracing: connection lifecycle, sockopt, drops (otherwise auto-enabled when the host has enough CPU, DRAM and network)')
     parser.add_argument('--computer-id', action='store_true', help='Print this machine ID and exit')
     parser.add_argument('--reward', action='store_true', help='Show your reward code (unlocked after uploading traces)')
     parser.add_argument('--no-upload', action='store_true', help='Disable automatic upload of traces (for testing)')
@@ -95,7 +95,7 @@ if __name__ == "__main__":
     dev_parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
     dev_parser.add_argument('-a', '--anonimize', action='store_true', help='Enable anonymization of process and file names')
     dev_parser.add_argument('--cache', action='store_true', help='Force-enable page-cache event tracing (higher overhead; otherwise auto-enabled when the host has enough CPU and DRAM)')
-    dev_parser.add_argument('--network', action='store_true', help='Force-enable network event tracing: connection lifecycle, epoll, sockopt, drops (otherwise auto-enabled when the host has enough CPU, DRAM and network)')
+    dev_parser.add_argument('--network', action='store_true', help='Force-enable network event tracing: connection lifecycle, sockopt, drops (otherwise auto-enabled when the host has enough CPU, DRAM and network)')
     dev_parser.add_argument('--no-upload', action='store_true', help='Disable automatic upload of traces (for testing)')
     dev_parser.add_argument('--trace-bucket', type=str, default=None, help='Override upload bucket name (default: linux_trace_v4_test)')
 

@@ -10,7 +10,7 @@ IO Tracer uses eBPF/BPF technology to intercept kernel functions and collect var
 | 2 | [Block I/O Events](traces/BLOCK_IO_EVENTS.md) | Block-level device I/O operations | `ds/ds_*.csv` |
 | 3 | [Page Cache Events](traces/PAGE_CACHE_EVENTS.md) | Page cache hits, misses, writebacks, evictions | `cache/cache_*.csv` |
 | 4 | [Page Fault Events](traces/PAGE_FAULT_EVENTS.md) | File-backed page faults from mmap access | `pagefault/pagefault_*.csv` |
-| 5 | [Network Events](traces/NETWORK_EVENTS.md) | Connection lifecycle, epoll/poll/select, socket options, drops | `nw_conn/*.csv`, `nw_epoll/*.csv`, `nw_sockopt/*.csv`, `nw_drop/*.csv` |
+| 5 | [Network Events](traces/NETWORK_EVENTS.md) | Connection lifecycle, socket options, drops | `nw_conn/*.csv`, `nw_sockopt/*.csv`, `nw_drop/*.csv` |
 
 > **Opt-in streams.** Page-cache and network tracing are **off by default** to
 > keep overhead minimal. Enable them explicitly with `--cache` and `--network`.
@@ -79,7 +79,6 @@ IO Tracer uses eBPF/BPF technology to intercept kernel functions and collect var
   (cache hit/miss fire on nearly every page access), so use `cache_sample_rate`
   sampling for long traces
 - **Network tracing** is opt-in (`--network`) and restored as a low-overhead
-  subset: connection lifecycle, epoll/poll/select, socket options, and
-  drops/retransmits. The high-frequency per-packet send/recv path is omitted to
-  keep overhead minimal
+  subset: connection lifecycle, socket options, and drops/retransmits. The
+  high-frequency per-packet send/recv path is omitted to keep overhead minimal
 - **Snapshots** are lightweight and only captured at trace start (except periodic process snapshots)

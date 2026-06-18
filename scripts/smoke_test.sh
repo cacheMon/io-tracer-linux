@@ -9,8 +9,7 @@
 #   * trace shards were written with the expected CSV header.
 #
 # Run on BOTH x86_64 and aarch64, since several probes/tracepoints are
-# arch-specific (legacy select/poll/epoll_wait vs pselect6/ppoll/epoll_pwait,
-# openat/mremap syscall wrappers, etc.).
+# arch-specific (openat/mremap syscall wrappers, etc.).
 #
 # Usage:  sudo bash scripts/smoke_test.sh [run_seconds]
 #

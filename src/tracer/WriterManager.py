@@ -90,10 +90,9 @@ class WriteManager:
         self.output_process_file = f"{self.output_dir}/process/process_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_fs_snapshot_file = f"{self.output_dir}/filesystem_snapshot/filesystem_snapshot_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_pagefault_file = f"{self.output_dir}/pagefault/pagefault_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-        # Network streams (low-overhead subset: connection lifecycle, epoll,
-        # socket options, drops). Files stay empty unless --network is enabled.
+        # Network streams (low-overhead subset: connection lifecycle, socket
+        # options, drops). Files stay empty unless --network is enabled.
         self.output_nw_conn_file = f"{self.output_dir}/nw_conn/nw_conn_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-        self.output_nw_epoll_file = f"{self.output_dir}/nw_epoll/nw_epoll_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_nw_sockopt_file = f"{self.output_dir}/nw_sockopt/nw_sockopt_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_nw_drop_file = f"{self.output_dir}/nw_drop/nw_drop_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
 
@@ -106,7 +105,6 @@ class WriteManager:
         os.makedirs(f"{self.output_dir}/filesystem_snapshot", exist_ok=True)
         os.makedirs(f"{self.output_dir}/pagefault", exist_ok=True)
         os.makedirs(f"{self.output_dir}/nw_conn", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/nw_epoll", exist_ok=True)
         os.makedirs(f"{self.output_dir}/nw_sockopt", exist_ok=True)
         os.makedirs(f"{self.output_dir}/nw_drop", exist_ok=True)
 
@@ -121,7 +119,6 @@ class WriteManager:
         self.fs_snap_buffer = deque()
         self.pagefault_buffer = deque()
         self.nw_conn_buffer = deque()
-        self.nw_epoll_buffer = deque()
         self.nw_sockopt_buffer = deque()
         self.nw_drop_buffer = deque()
 
@@ -134,7 +131,6 @@ class WriteManager:
             'proc_state': deque(maxlen=1000),
             'pagefault': deque(maxlen=1000),
             'nw_conn': deque(maxlen=1000),
-            'nw_epoll': deque(maxlen=1000),
             'nw_sockopt': deque(maxlen=1000),
             'nw_drop': deque(maxlen=1000),
         }
@@ -175,7 +171,6 @@ class WriteManager:
         # Network streams are comparatively low-volume (no per-packet path), so a
         # fixed threshold is sufficient; they are not adaptively resized.
         self.nw_conn_max_events = 80000
-        self.nw_epoll_max_events = 80000
         self.nw_sockopt_max_events = 80000
         self.nw_drop_max_events = 80000
 
@@ -192,7 +187,6 @@ class WriteManager:
             'fs_snap':   threading.Lock(),
             'pagefault': threading.Lock(),
             'nw_conn':    threading.Lock(),
-            'nw_epoll':   threading.Lock(),
             'nw_sockopt': threading.Lock(),
             'nw_drop':    threading.Lock(),
         }
@@ -205,7 +199,6 @@ class WriteManager:
         self._pagefault_handle = None
         self._fs_snap_handle = None
         self._nw_conn_handle = None
-        self._nw_epoll_handle = None
         self._nw_sockopt_handle = None
         self._nw_drop_handle = None
 
@@ -220,7 +213,6 @@ class WriteManager:
             'cache':     {'subdir': 'cache',     'prefix': 'cache',     'buf': 'cache_buffer',     'handle': '_cache_handle',     'file': 'output_cache_file',     'log': 'Cache'},
             'pagefault': {'subdir': 'pagefault', 'prefix': 'pagefault', 'buf': 'pagefault_buffer', 'handle': '_pagefault_handle', 'file': 'output_pagefault_file', 'log': 'PageFault'},
             'nw_conn':    {'subdir': 'nw_conn',    'prefix': 'nw_conn',    'buf': 'nw_conn_buffer',    'handle': '_nw_conn_handle',    'file': 'output_nw_conn_file',    'log': 'NetConn'},
-            'nw_epoll':   {'subdir': 'nw_epoll',   'prefix': 'nw_epoll',   'buf': 'nw_epoll_buffer',   'handle': '_nw_epoll_handle',   'file': 'output_nw_epoll_file',   'log': 'NetEpoll'},
             'nw_sockopt': {'subdir': 'nw_sockopt', 'prefix': 'nw_sockopt', 'buf': 'nw_sockopt_buffer', 'handle': '_nw_sockopt_handle', 'file': 'output_nw_sockopt_file', 'log': 'NetSockopt'},
             'nw_drop':    {'subdir': 'nw_drop',    'prefix': 'nw_drop',    'buf': 'nw_drop_buffer',    'handle': '_nw_drop_handle',    'file': 'output_nw_drop_file',    'log': 'NetDrop'},
         }
@@ -255,7 +247,7 @@ class WriteManager:
     _SCHEMA_KEY = {
         'vfs': 'fs', 'block': 'ds', 'cache': 'cache', 'pagefault': 'pagefault',
         'process': 'process', 'fs_snap': 'filesystem_snapshot',
-        'nw_conn': 'nw_conn', 'nw_epoll': 'nw_epoll',
+        'nw_conn': 'nw_conn',
         'nw_sockopt': 'nw_sockopt', 'nw_drop': 'nw_drop',
     }
 
@@ -553,16 +545,6 @@ class WriteManager:
                 self._rotate_stream('nw_conn')
         else:
             logger("error", "Invalid connection log output format. Expected a string.")
-
-    def append_epoll_log(self, log_output: str):
-        """Add a network epoll/multiplexing log entry."""
-        if isinstance(log_output, str):
-            self.nw_epoll_buffer.append(log_output)
-            self.event_timestamps['nw_epoll'].append(time.time())
-            if len(self.nw_epoll_buffer) >= self.nw_epoll_max_events:
-                self._rotate_stream('nw_epoll')
-        else:
-            logger("error", "Invalid epoll log output format. Expected a string.")
 
     def append_sockopt_log(self, log_output: str):
         """Add a socket-option log entry."""
@@ -915,7 +897,6 @@ class WriteManager:
         
         self.compress_log(self.output_pagefault_file)
         self.compress_log(self.output_nw_conn_file)
-        self.compress_log(self.output_nw_epoll_file)
         self.compress_log(self.output_nw_sockopt_file)
         self.compress_log(self.output_nw_drop_file)
 
@@ -1009,7 +990,7 @@ class WriteManager:
         def write_network():
             # Land any buffered network rows into their current files. Each stream
             # is keyed in the generic _streams registry, so reuse it.
-            for key, label in (('nw_conn', 'NetConn'), ('nw_epoll', 'NetEpoll'),
+            for key, label in (('nw_conn', 'NetConn'),
                                ('nw_sockopt', 'NetSockopt'), ('nw_drop', 'NetDrop')):
                 s = self._streams[key]
                 with self._stream_locks[key]:
@@ -1054,7 +1035,7 @@ class WriteManager:
             threads.append(t7)
             t7.start()
 
-        if (self.nw_conn_buffer or self.nw_epoll_buffer
+        if (self.nw_conn_buffer
                 or self.nw_sockopt_buffer or self.nw_drop_buffer):
             t8 = threading.Thread(target=write_network)
             threads.append(t8)
@@ -1151,7 +1132,6 @@ class WriteManager:
             (self._fs_snap_handle, "Filesystem Snapshot"),
             (self._pagefault_handle, "PageFault"),
             (self._nw_conn_handle, "NetConn"),
-            (self._nw_epoll_handle, "NetEpoll"),
             (self._nw_sockopt_handle, "NetSockopt"),
             (self._nw_drop_handle, "NetDrop"),
         ]
@@ -1172,6 +1152,5 @@ class WriteManager:
         self._fs_snap_handle = None
         self._pagefault_handle = None
         self._nw_conn_handle = None
-        self._nw_epoll_handle = None
         self._nw_sockopt_handle = None
         self._nw_drop_handle = None

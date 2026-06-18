@@ -101,14 +101,6 @@ class NetworkFlagTests(unittest.TestCase):
         self.assertEqual(FlagMapper.format_sockopt(6, 999), "OPT(6,999)")
         self.assertEqual(FlagMapper.format_sockopt_event(0), "SET")
 
-    def test_epoll(self):
-        self.assertEqual(FlagMapper.format_epoll_event_type(2), "EPOLL_WAIT")
-        self.assertEqual(FlagMapper.format_epoll_op(1), "EPOLL_CTL_ADD")
-        # EPOLLIN (0x1) | EPOLLOUT (0x4)
-        decoded = FlagMapper.format_epoll_events(0x5)
-        self.assertIn("EPOLLIN", decoded)
-        self.assertIn("EPOLLOUT", decoded)
-
     def test_drop_and_tcp_state(self):
         self.assertEqual(FlagMapper.format_drop_event(0), "PACKET_DROP")
         self.assertEqual(FlagMapper.format_drop_event(1), "TCP_RETRANSMIT")
