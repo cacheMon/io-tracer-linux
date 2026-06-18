@@ -13,9 +13,20 @@ import io
 import os
 import sys
 import tempfile
+import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Importing FilesystemSnapper pulls in WriterManager -> ObjectStorageManager,
+# which imports `requests` at module load time. These tests never touch the
+# network, and minimal CI environments do not install `requests`, so fall back
+# to a stub module when it is unavailable (mirrors test_writer_upload.py).
+if "requests" not in sys.modules:
+    try:
+        import requests  # noqa: F401
+    except ModuleNotFoundError:
+        sys.modules["requests"] = types.ModuleType("requests")
 
 from src.tracer.snappers.FilesystemSnapper import FilesystemSnapper, DELETED_SIZE
 
