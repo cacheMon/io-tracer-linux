@@ -1084,19 +1084,35 @@ static int get_file_path_from_dentry(struct dentry *dentry, char *buf,
  * relative to the file's own mount root), and truncates to the last
  * DPATH_MAX_DEPTH components on very deep paths.
  *
- * The output buffer is always FILENAME_MAX_LEN bytes (a power of two), so the
- * write offset is masked with DPATH_MASK to keep the verifier happy. The buffer
- * size is hardcoded rather than passed in: a caller-supplied size that differed
- * from the mask would let buf[off & DPATH_MASK] index past the buffer, so the
- * two must stay coupled.
+ * The path is assembled in a per-CPU map value (sc->out) rather than directly
+ * in the caller's buffer, then copied out with a constant-size memcpy. This is
+ * required for the verifier: it rejects variable-offset writes to the *stack*
+ * outright (it tracks stack slots individually), but accepts them into a map
+ * value whose bounds it can prove. The caller's buffer (e.g. data.filename) is
+ * a stack object, so the masking trick alone is not enough — the write must
+ * land in the map value first.
+ *
+ * sc->out is deliberately oversized to DPATH_OUT_SIZE. The verifier checks a
+ * variable-offset helper write conservatively, treating the destination offset
+ * (<= DPATH_MASK) and the access size (<= DPATH_BUF_SIZE) as independent, so the
+ * destination must satisfy DPATH_MASK + DPATH_BUF_SIZE <= sizeof(sc->out). The
+ * DPATH_MASK on every write keeps the actual bytes within the first
+ * DPATH_BUF_SIZE; the slack is purely to satisfy the verifier's worst case.
  */
 #define DPATH_MAX_DEPTH 12
 #define DPATH_BUF_SIZE FILENAME_MAX_LEN
 #define DPATH_MASK (DPATH_BUF_SIZE - 1)
+/* Worst-case verifier bound: max masked offset (DPATH_MASK) + max str size
+ * (DPATH_BUF_SIZE). 2*DPATH_BUF_SIZE covers it with room to spare. */
+#define DPATH_OUT_SIZE (DPATH_BUF_SIZE * 2)
 
-/* Per-CPU scratch for the component-pointer chain — kept off the BPF stack,
- * which is only 512 bytes and already mostly consumed by struct data_t. */
-struct dpath_scratch { const unsigned char *names[DPATH_MAX_DEPTH]; };
+/* Per-CPU scratch for the component-pointer chain and the assembled path —
+ * kept off the BPF stack, which is only 512 bytes and already mostly consumed
+ * by struct data_t. */
+struct dpath_scratch {
+  const unsigned char *names[DPATH_MAX_DEPTH];
+  char out[DPATH_OUT_SIZE];
+};
 BPF_PERCPU_ARRAY(dpath_scratch_map, struct dpath_scratch, 1);
 
 static __always_inline void build_dentry_path(struct dentry *dentry,
@@ -1131,17 +1147,23 @@ static __always_inline void build_dentry_path(struct dentry *dentry,
     if (!np) continue;
 
     if (off < DPATH_BUF_SIZE - 1) {      /* component separator */
-      buf[off & DPATH_MASK] = '/';
+      sc->out[off & DPATH_MASK] = '/';
       off++;
     }
     int pos = off & DPATH_MASK;          /* 0..DPATH_BUF_SIZE-1 */
     int cap = DPATH_BUF_SIZE - pos;      /* pos + cap == DPATH_BUF_SIZE, in-bounds */
     if (cap > 1) {
-      long w = bpf_probe_read_kernel_str(&buf[pos], cap, np);
+      long w = bpf_probe_read_kernel_str(&sc->out[pos], cap, np);
       if (w > 1) off = pos + (int)(w - 1);   /* advance past name, exclude NUL */
     }
   }
-  buf[off & DPATH_MASK] = '\0';
+  sc->out[off & DPATH_MASK] = '\0';
+
+  /* Copy the assembled path back to the caller's FILENAME_MAX_LEN stack buffer
+   * with a constant size — a variable-offset write to the stack would be
+   * rejected by the verifier, but a fixed-size copy is fine. */
+  __builtin_memcpy(buf, sc->out, DPATH_BUF_SIZE);
+  buf[DPATH_BUF_SIZE - 1] = '\0';
 }
 
 /**
