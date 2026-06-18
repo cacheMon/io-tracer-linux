@@ -63,6 +63,11 @@ def main():
         ("kprobe", "vfs_fsync", "trace_vfs_fsync"),
         ("kretprobe", "vfs_fsync", "trace_vfs_fsync_ret"),
         ("kprobe", "vfs_fsync_range", "trace_vfs_fsync_range"),
+        # readdir reconstructs the directory path via a bounded d_parent walk
+        # (build_dentry_path). That path is assembled with variable-offset
+        # writes, which only verify against a map value — attaching here runs
+        # the verifier on trace_readdir so a stack-buffer regression fails CI.
+        ("kprobe", "iterate_dir", "trace_readdir"),
     ]
 
     # Symbol-conditional probes. These validate that the pt_regs-unwrapping

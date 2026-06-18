@@ -1124,6 +1124,13 @@ static __always_inline void build_dentry_path(struct dentry *dentry,
   struct dpath_scratch *sc = dpath_scratch_map.lookup(&zero);
   if (!sc) return;
 
+  /* sc->out is per-CPU and persists across calls, so bytes past the path's NUL
+   * terminator would otherwise be stale data from a previous readdir on this
+   * CPU. The final memcpy copies the whole DPATH_BUF_SIZE window into the
+   * perf-submitted event, so zero that window first to avoid leaking stale
+   * path bytes to userspace. */
+  __builtin_memset(sc->out, 0, DPATH_BUF_SIZE);
+
   int n = 0;
   struct dentry *d = dentry;
 
