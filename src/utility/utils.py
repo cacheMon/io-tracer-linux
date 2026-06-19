@@ -317,17 +317,31 @@ def compress_file(src: str, level: int | None = None) -> str | None:
     zstandard = zstandard_available()
     if zstandard is not None:
         dst = src + ".zst"
-        cctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL if level is None else level)
-        with open(src, "rb") as f_in, open(dst, "wb") as f_out:
-            cctx.copy_stream(f_in, f_out)
+    else:
+        # gzip fallback — always available in the standard library.
+        dst = src + ".gz"
+
+    try:
+        if zstandard is not None:
+            cctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL if level is None else level)
+            with open(src, "rb") as f_in, open(dst, "wb") as f_out:
+                cctx.copy_stream(f_in, f_out)
+        else:
+            with open(src, "rb") as f_in, gzip.open(
+                dst, "wb", compresslevel=GZIP_LEVEL if level is None else level
+            ) as f_out:
+                shutil.copyfileobj(f_in, f_out)
         return dst
-    # gzip fallback — always available in the standard library.
-    dst = src + ".gz"
-    with open(src, "rb") as f_in, gzip.open(
-        dst, "wb", compresslevel=GZIP_LEVEL if level is None else level
-    ) as f_out:
-        shutil.copyfileobj(f_in, f_out)
-    return dst
+    except Exception as e:
+        # Don't leave a half-written archive behind, and signal failure so the
+        # caller keeps the uncompressed source rather than losing trace data.
+        logger("error", f"Failed to compress {src}: {e}")
+        try:
+            if os.path.exists(dst):
+                os.remove(dst)
+        except OSError:
+            pass
+        return None
 
 
 def compress_log(input_file: str):
