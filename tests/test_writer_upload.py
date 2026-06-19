@@ -46,6 +46,13 @@ def _zstd_read_text(path):
         return reader.read().decode()
 
 
+def _gz_read_text(path):
+    """Decompress a .gz file to text for round-trip assertions."""
+    import gzip
+    with gzip.open(path, "rb") as f:
+        return f.read().decode()
+
+
 from src.tracer.WriterManager import WriteManager
 
 
@@ -144,9 +151,9 @@ class PerFileUploadTests(unittest.TestCase):
 
 class ZstandardMissingFallbackTests(unittest.TestCase):
     """When the optional ``zstandard`` library is unavailable, the tracer must
-    keep (and upload) trace files uncompressed rather than losing data. These
-    tests force the missing-dependency path so they run regardless of whether
-    ``zstandard`` happens to be installed.
+    fall back to gzip (.gz / .tar.gz) — using the standard library — rather than
+    leaving trace files uncompressed. These tests force the missing-dependency
+    path so they run regardless of whether ``zstandard`` happens to be installed.
     """
 
     def setUp(self):
@@ -184,25 +191,29 @@ class ZstandardMissingFallbackTests(unittest.TestCase):
             f.write(text)
         return path
 
-    def test_compress_log_uploads_uncompressed_when_zstd_missing(self):
+    def test_compress_log_uploads_gzip_when_zstd_missing(self):
         src = self._make_log("process", "process_x.csv", "a,b,c\n1,2,3\n")
         self.wm.compress_log(src)
 
-        # The uncompressed .csv is uploaded and left on disk; no .zst created.
-        self.assertEqual(self.upload.uploaded, [src])
-        self.assertTrue(os.path.exists(src))
+        # The gzip-compressed .gz is uploaded; the original .csv is removed and
+        # no .zst is created.
+        gz = src + ".gz"
+        self.assertEqual(self.upload.uploaded, [gz])
+        self.assertTrue(os.path.exists(gz))
+        self.assertFalse(os.path.exists(src))
         self.assertFalse(os.path.exists(src + ".zst"))
-        with open(src) as f:
-            self.assertEqual(f.read(), "a,b,c\n1,2,3\n")
+        # Content round-trips through gzip.
+        self.assertEqual(_gz_read_text(gz), "a,b,c\n1,2,3\n")
 
-    def test_compress_dir_falls_back_to_plain_tar(self):
+    def test_compress_dir_falls_back_to_tar_gz(self):
         self.wm.automatic_upload = False
         self._make_log("process", "process_x.csv", "row\n")
         self.wm.compress_dir(self.output_dir)
 
-        # A plain .tar bundle is produced instead of .tar.zst.
-        self.assertTrue(os.path.exists(self.output_dir.rstrip("/") + ".tar"))
+        # A gzip-compressed .tar.gz bundle is produced instead of .tar.zst.
+        self.assertTrue(os.path.exists(self.output_dir.rstrip("/") + ".tar.gz"))
         self.assertFalse(os.path.exists(self.output_dir.rstrip("/") + ".tar.zst"))
+        self.assertFalse(os.path.exists(self.output_dir.rstrip("/") + ".tar"))
 
 
 class StaleLogRotationTests(unittest.TestCase):
