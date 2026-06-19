@@ -278,6 +278,51 @@ class FilesystemSnapperDeltaTests(unittest.TestCase):
         rows = _paths_and_sizes(self.wm.take())
         self.assertEqual(rows, {a_path: DELETED_SIZE})
 
+    def test_pseudo_fs_subtree_is_skipped(self):
+        # A directory whose filesystem is detected as pseudo (e.g. a /proc or
+        # /sys mount) must not be descended into or inventoried, while sibling
+        # real-storage files are still captured.
+        self._write("real.txt", "r")
+        self._write("proc/cmdline", "x")
+        self._write("proc/deep/stat", "y")
+
+        pseudo_dir = os.path.abspath(os.path.join(self.tmp, "proc"))
+        real_stat = os.stat
+
+        class _FakeStat:
+            # Wrap a real stat_result but override st_dev so 'proc' looks like a
+            # separate mount, which is what triggers the pseudo-fs boundary check.
+            def __init__(self, st, dev):
+                self._st = st
+                self.st_dev = dev
+                self.st_ino = st.st_ino
+
+            def __getattr__(self, name):
+                return getattr(self._st, name)
+
+        def stat_with_fake_dev(path, *a, **k):
+            st = real_stat(path, *a, **k)
+            if os.path.abspath(path) == pseudo_dir:
+                return _FakeStat(st, -12345)  # distinct device id => mount boundary
+            return st
+
+        def fake_is_pseudo_fs(path):
+            return os.path.abspath(path) == pseudo_dir
+
+        with unittest.mock.patch(
+            "src.tracer.snappers.FilesystemSnapper.is_pseudo_fs",
+            side_effect=fake_is_pseudo_fs,
+        ), unittest.mock.patch(
+            "src.tracer.snappers.FilesystemSnapper.os.stat",
+            side_effect=stat_with_fake_dev,
+        ):
+            self.assertTrue(self.snapper.filesystem_snapshot())
+
+        rows = _paths_and_sizes(self.wm.take())
+        self.assertIn(os.path.join(self.tmp, "real.txt"), rows)
+        self.assertNotIn(os.path.join(self.tmp, "proc/cmdline"), rows)
+        self.assertNotIn(os.path.join(self.tmp, "proc/deep/stat"), rows)
+
     def test_anonymous_delta_emits_hashed_paths(self):
         self._write("secret.txt", "x")
         self.snapper.anonymous = True
