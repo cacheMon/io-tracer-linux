@@ -755,8 +755,10 @@ BPF_TABLE("lru_hash", u64, u64, fsync_inflight, 10240);
 
 /* Staged fsync/fdatasync event, completed by trace_vfs_fsync_ret with the
  * entry->return latency (latency_ns). Mirrors the rw_staging pattern so the
- * durability-latency column is populated instead of always empty. */
-BPF_HASH(fsync_staging, u64, struct data_t, 10240);
+ * durability-latency column is populated instead of always empty -- including
+ * lru_hash, so a missed vfs_fsync kretprobe return evicts a stale entry rather
+ * than wedging the map (see the staging-map note above rw_staging). */
+BPF_TABLE("lru_hash", u64, struct data_t, fsync_staging, 10240);
 
 #ifdef ENABLE_NETWORK
 /* Connection lifecycle context maps (low-overhead network subset) */
@@ -813,8 +815,10 @@ BPF_TABLE("lru_hash", u64, struct mremap_args, mremap_staging, 4096);
 
 /* Staged sendfile event from the do_sendfile entry probe, completed by its
  * kretprobe which records the actual transferred byte count (the entry ``count``
- * is only the requested ceiling, frequently SSIZE_MAX). */
-BPF_HASH(sendfile_staging, u64, struct data_t, 4096);
+ * is only the requested ceiling, frequently SSIZE_MAX). lru_hash so a missed
+ * kretprobe return evicts a stale entry rather than wedging the map (see the
+ * staging-map note above rw_staging). */
+BPF_TABLE("lru_hash", u64, struct data_t, sendfile_staging, 4096);
 
 /* ============================================================================
  * PERF OUTPUT BUFFERS
