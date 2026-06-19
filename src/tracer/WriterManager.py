@@ -58,7 +58,7 @@ class WriteManager:
         
     Output Files:
         fs/*.csv: File system operation traces
-        ds/*.csv: Block device traces
+        block/*.csv: Block device traces
         cache/*.csv: Page cache event traces
         process/*.csv: Process state snapshots
         filesystem_snapshot/*.csv: Filesystem snapshot
@@ -85,7 +85,7 @@ class WriteManager:
         self.status_log_interval = 60  # Log status every 60 seconds
         self.output_dir = output_dir
         self.output_vfs_file = f"{self.output_dir}/fs/fs_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-        self.output_block_file = f"{self.output_dir}/ds/ds_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
+        self.output_block_file = f"{self.output_dir}/block/block_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_cache_file = f"{self.output_dir}/cache/cache_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_process_file = f"{self.output_dir}/process/process_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_fs_snapshot_file = f"{self.output_dir}/filesystem_snapshot/filesystem_snapshot_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
@@ -99,7 +99,7 @@ class WriteManager:
         # Create output directories
         os.makedirs(f"{self.output_dir}/system_spec", exist_ok=True)
         os.makedirs(f"{self.output_dir}/fs", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/ds", exist_ok=True)
+        os.makedirs(f"{self.output_dir}/block", exist_ok=True)
         os.makedirs(f"{self.output_dir}/cache", exist_ok=True)
         os.makedirs(f"{self.output_dir}/process", exist_ok=True)
         os.makedirs(f"{self.output_dir}/filesystem_snapshot", exist_ok=True)
@@ -209,7 +209,7 @@ class WriteManager:
         # and current output path, plus its output subdir/prefix and log label.
         self._streams = {
             'vfs':       {'subdir': 'fs',        'prefix': 'fs',        'buf': 'vfs_buffer',       'handle': '_vfs_handle',       'file': 'output_vfs_file',       'log': 'VFS'},
-            'block':     {'subdir': 'ds',        'prefix': 'ds',        'buf': 'block_buffer',     'handle': '_block_handle',     'file': 'output_block_file',     'log': 'Block'},
+            'block':     {'subdir': 'block',     'prefix': 'block',     'buf': 'block_buffer',     'handle': '_block_handle',     'file': 'output_block_file',     'log': 'Block'},
             'cache':     {'subdir': 'cache',     'prefix': 'cache',     'buf': 'cache_buffer',     'handle': '_cache_handle',     'file': 'output_cache_file',     'log': 'Cache'},
             'pagefault': {'subdir': 'pagefault', 'prefix': 'pagefault', 'buf': 'pagefault_buffer', 'handle': '_pagefault_handle', 'file': 'output_pagefault_file', 'log': 'PageFault'},
             'nw_conn':    {'subdir': 'nw_conn',    'prefix': 'nw_conn',    'buf': 'nw_conn_buffer',    'handle': '_nw_conn_handle',    'file': 'output_nw_conn_file',    'log': 'NetConn'},
@@ -245,7 +245,7 @@ class WriteManager:
 
     # WriteManager stream key -> schema.STREAMS key.
     _SCHEMA_KEY = {
-        'vfs': 'fs', 'block': 'ds', 'cache': 'cache', 'pagefault': 'pagefault',
+        'vfs': 'fs', 'block': 'block', 'cache': 'cache', 'pagefault': 'pagefault',
         'process': 'process', 'fs_snap': 'filesystem_snapshot',
         'nw_conn': 'nw_conn',
         'nw_sockopt': 'nw_sockopt', 'nw_drop': 'nw_drop',
@@ -1080,7 +1080,7 @@ class WriteManager:
                 self.created_files += 1
                 logger('info', f"Files Created: {str(self.created_files)}", True)
                 # Upload each log individually, preserving its subdirectory
-                # (fs, ds, cache, process, ...) on the backend.
+                # (fs, block, cache, process, ...) on the backend.
                 self.upload_manager.append_object(upload_target)
             if compressed is not None and compressed != src:
                 os.remove(src)

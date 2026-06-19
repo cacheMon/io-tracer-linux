@@ -17,7 +17,7 @@ Traces are stored in object storage with the following prefix structure:
 ```
 linux_trace_v4_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── fs/                    # VFS traces (also receives mirrored io_uring I/O)
-├── ds/                    # Block device traces
+├── block/                 # Block device traces
 ├── cache/                 # Page cache events (opt-in: --cache)
 ├── pagefault/             # Page fault events
 ├── nw_conn/               # Network connection lifecycle (opt-in: --network)

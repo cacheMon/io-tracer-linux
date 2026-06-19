@@ -1316,7 +1316,7 @@ class IOTracer:
         self.b["bl_events"].open_perf_buffer(
             self._print_event_block,
             page_cnt=self.page_cnt,
-            lost_cb=self._make_lost_cb("ds")
+            lost_cb=self._make_lost_cb("block")
         )
 
         # Page-cache events are opt-in (--cache). The probes are only attached

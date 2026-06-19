@@ -18,13 +18,15 @@ it from ``manifest.json`` and adapt.
 # Historical format evolution (for reference only — see the note below):
 # v1: original headerless CSVs, no manifest, per-stream clocks.
 # v2: CSV headers + manifest.json + a common ``mono_ns`` column on every stream.
-# v3: cross-OS aligned layout for ``fs`` and ``ds`` — a fixed shared column
-#     prefix (identical names/order to the Windows tracer) followed by the
+# v3: cross-OS aligned column layout for ``fs`` and ``block`` — a fixed shared
+#     column prefix (identical names/order to the Windows tracer) followed by the
 #     Linux-only extras, lowercase canonical operation names, ``size_requested``
 #     renamed to ``size``, and a dedicated block ``flags`` column (rwbs sub-flags
-#     split out of ``operation``).
+#     split out of ``operation``). NOTE: the column layout still matches the
+#     Windows tracer, but this Linux stream is named ``block`` (subdir/prefix
+#     ``block``) where the Windows tracer calls the equivalent stream ``ds``.
 # Schema version stamped into manifest.json. Reset to 1 by request; the column
-# layout remains the cross-OS aligned fs/ds format described below.
+# layout remains the cross-OS aligned fs/block format described below.
 # NOTE: this overrides the historical v1–v3 numbering above — the on-disk format
 # is the aligned layout (what the changelog calls v3), not the original v1 format.
 SCHEMA_VERSION = 1
@@ -88,8 +90,8 @@ STREAMS = {
             _col("fs_type", "string", "", "Source filesystem name from superblock magic."),
         ],
     ),
-    "ds": _stream(
-        "ds", "ds",
+    "block": _stream(
+        "block", "block",
         "Block-device (disk) I/O completion events.",
         "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
         [

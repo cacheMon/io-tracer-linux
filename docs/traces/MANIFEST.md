@@ -17,10 +17,11 @@ adapt rather than assume a fixed layout. The current value is **`1`**
 
 The current format (**schema_version 1**) is the **cross-OS aligned** layout:
 
-- The `fs`/`ds` streams use a fixed shared column prefix (identical names/order
-  to the Windows tracer), **lowercase** canonical operation names, `size`
-  (formerly `size_requested`), and a dedicated block `flags` column (rwbs
-  sub-flags split out of `operation`).
+- The `fs`/`block` streams use a fixed shared column prefix (identical
+  names/order to the Windows tracer, whose equivalent stream is named `ds`),
+  **lowercase** canonical operation names, `size` (formerly `size_requested`),
+  and a dedicated block `flags` column (rwbs sub-flags split out of
+  `operation`).
 - Every CSV file (including rotated parts) begins with a **header row** naming
   its columns — the same names listed under `streams.<key>.columns` here.
 - Every record carries a trailing **`mono_ns`** column: `CLOCK_MONOTONIC`
@@ -38,7 +39,7 @@ The current format (**schema_version 1**) is the **cross-OS aligned** layout:
     "fs":  { "subdir": "fs", "filename_prefix": "fs", "description": "...",
              "wall_clock": "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
              "columns": [ { "name": "timestamp", "type": "datetime", "unit": "", "description": "..." }, ... ] },
-    "ds":  { ... }, "cache": { ... }, "pagefault": { ... },
+    "block":  { ... }, "cache": { ... }, "pagefault": { ... },
     "process": { ... }, "filesystem_snapshot": { ... }
   },
   "tracer":  { "version": "..." },
@@ -53,7 +54,7 @@ The current format (**schema_version 1**) is the **cross-OS aligned** layout:
   "session": { "started_at": "ISO-8601", "stopped_at": "ISO-8601", "duration_seconds": 123.4 },
   "diagnostics": {
     "attached_probes": [ "vfs_read", "vfs_write", "block_rq_complete", ... ],
-    "lost_events":     { "fs": 0, "ds": 0 },
+    "lost_events":     { "fs": 0, "block": 0 },
     "rows_written":    { "VFS": 12345, "Block": 678, ... },
     "block":           { "issued": 1000, "completed": 990, "missed": 10 }
   }
