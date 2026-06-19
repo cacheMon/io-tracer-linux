@@ -76,7 +76,7 @@ STREAMS = {
             _col("device", "string", "", "Backing device major:minor for READ/WRITE/OPEN (Windows: empty)."),
             _col("flags", "string", "", "Operation-specific flags; empty when none."),
             # --- Linux-only extras (columns 13+) --- #
-            _col("duration_ns", "u64", "nanoseconds", "READ/WRITE entry->return duration; empty otherwise."),
+            _col("duration_ns", "u64", "nanoseconds", "READ/WRITE/SENDFILE/FSYNC/FDATASYNC entry->return duration; empty otherwise."),
             _col("return_value", "s64", "", "Raw READ/WRITE return (bytes or -errno); empty otherwise."),
             _col("errno", "string", "", "Error name when READ/WRITE failed; empty otherwise."),
             _col("mmap_prot", "string", "", "MMAP PROT_* flags; empty for non-MMAP."),
@@ -234,7 +234,7 @@ STREAMS = {
             _col("snapshot_timestamp", "datetime", "", "Time the snapshot was taken."),
             _col("file_path", "string", "", "Full path (hashed in anonymous mode)."),
             _col("size", "integer", "bytes"),
-            _col("creation_time", "datetime", "", "st_birthtime (falls back to st_mtime)."),
+            _col("creation_time", "datetime", "", "Birth time via statx STATX_BTIME (falls back to st_mtime when unavailable)."),
             _col("modification_time", "datetime", "", "st_mtime."),
             _col("access_time", "datetime", "", "st_atime."),
         ],

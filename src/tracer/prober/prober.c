@@ -727,6 +727,18 @@ BPF_PERCPU_ARRAY(block_stats, u64, 4);
 #define MAX_BLOCK_LATENCY_NS   (60ULL * 1000000000ULL)   /* 60 seconds */
 #define MAX_QUEUE_LATENCY_NS   (60ULL * 1000000000ULL)   /* 60 seconds */
 
+/* The absolute MAX_QUEUE_LATENCY_NS cap above only catches stale (dev, sector)
+ * insert matches larger than 60s; a stale insert_ts a few seconds old slips
+ * through and yields e.g. a 30s queue latency on a request the device serviced
+ * in microseconds. That is physically impossible — a queue deep enough to add
+ * seconds of wait implies a busy device, so service latency would be high too.
+ * Treat a multi-second queue wait that also dwarfs the device service latency
+ * as a stale match and zero it. The floor keeps the relative test away from the
+ * sub-millisecond noise (and the degenerate latency≈0 case), so only the clearly
+ * bogus seconds-long values are affected; real queueing on slow media is kept. */
+#define QUEUE_LATENCY_REL_FLOOR_NS  (1000000000ULL)   /* 1 second */
+#define QUEUE_LATENCY_REL_FACTOR    (1000ULL)         /* queue > 1000x service */
+
 /* Configuration map - stores tracer PID to exclude self-tracing */
 BPF_HASH(tracer_config, u32, u32, 1);    /**< Key 0 = tracer PID to exclude */
 
@@ -737,6 +749,11 @@ BPF_HASH(dio_staging, u64, u8, 10240);
 /* vfs_fsync entry timestamp, used by trace_vfs_fsync_range to suppress the
  * duplicate event for the nested vfs_fsync -> vfs_fsync_range call. */
 BPF_HASH(fsync_inflight, u64, u64, 10240);
+
+/* Staged fsync/fdatasync event, completed by trace_vfs_fsync_ret with the
+ * entry->return latency (latency_ns). Mirrors the rw_staging pattern so the
+ * durability-latency column is populated instead of always empty. */
+BPF_HASH(fsync_staging, u64, struct data_t, 10240);
 
 #ifdef ENABLE_NETWORK
 /* Connection lifecycle context maps (low-overhead network subset) */
@@ -1607,16 +1624,28 @@ int trace_vfs_fsync(struct pt_regs *ctx, struct file *file, int datasync) {
   // second event for the same syscall. Cleared by the vfs_fsync kretprobe.
   fsync_inflight.update(&pid_tgid, &data.ts);
 
-  events.perf_submit(ctx, &data, sizeof(data));
+  // Defer submission to the kretprobe so the event carries the entry->return
+  // duration in latency_ns (durability latency), instead of emitting at entry
+  // with no timing. Mirrors the READ/WRITE rw_staging pattern.
+  fsync_staging.update(&pid_tgid, &data);
 
   return 0;
 }
 
 /**
- * @brief vfs_fsync() kretprobe — clears the nested-call suppression marker.
+ * @brief vfs_fsync() kretprobe — completes the staged fsync event with latency.
+ *
+ * Sets latency_ns to the entry->return duration, submits the event, and clears
+ * both the staging entry and the nested-call suppression marker.
  */
 int trace_vfs_fsync_ret(struct pt_regs *ctx) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
+  struct data_t *data = fsync_staging.lookup(&pid_tgid);
+  if (data) {
+    data->latency_ns = bpf_ktime_get_ns() - data->ts;
+    events.perf_submit(ctx, data, sizeof(*data));
+    fsync_staging.delete(&pid_tgid);
+  }
   fsync_inflight.delete(&pid_tgid);
   return 0;
 }
@@ -2903,7 +2932,12 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
   u64 *insert_ts = block_insert_times.lookup(&key);
   if (insert_ts && ictx->ts >= *insert_ts) {
     queue_time = ictx->ts - *insert_ts;
-    if (queue_time > MAX_QUEUE_LATENCY_NS)
+    // Stale insert match: absolute (> 60s) or relative (a seconds-long queue
+    // wait that dwarfs the device service latency — physically impossible, see
+    // QUEUE_LATENCY_REL_* above). Either way the insert_ts is untrustworthy.
+    if (queue_time > MAX_QUEUE_LATENCY_NS ||
+        (queue_time > QUEUE_LATENCY_REL_FLOOR_NS &&
+         queue_time > QUEUE_LATENCY_REL_FACTOR * latency))
       queue_time = 0;
   }
 
@@ -3545,6 +3579,17 @@ int trace_invalidate_mapping(struct pt_regs *ctx, struct address_space *mapping,
     }
   }
 
+  // Full-file invalidation passes end == (pgoff_t)-1, so the raw page count
+  // (end - start + 1) becomes a meaningless ~4.29e9 sentinel. Clamp to the
+  // number of pages the mapping actually has cached (an exact upper bound on
+  // what this call can drop) so the column stays summable downstream.
+  if (mapping) {
+    unsigned long nrpages = 0;
+    bpf_probe_read_kernel(&nrpages, sizeof(nrpages), &mapping->nrpages);
+    if (data.count > (u32)nrpages)
+      data.count = (u32)nrpages;
+  }
+
   data.cpu_id = bpf_get_smp_processor_id();
   cache_events.perf_submit(ctx, &data, sizeof(data));
   return 0;
@@ -3592,6 +3637,16 @@ int trace_truncate_pages(struct pt_regs *ctx, struct address_space *mapping,
     }
   }
 
+  // Full-file truncation makes (end_index - start_index + 1) a multi-billion
+  // page count; clamp to the pages actually cached in the mapping (see the
+  // invalidate_mapping_pages probe for rationale).
+  if (mapping) {
+    unsigned long nrpages = 0;
+    bpf_probe_read_kernel(&nrpages, sizeof(nrpages), &mapping->nrpages);
+    if (data.count > (u32)nrpages)
+      data.count = (u32)nrpages;
+  }
+
   data.cpu_id = bpf_get_smp_processor_id();
   cache_events.perf_submit(ctx, &data, sizeof(data));
   return 0;
@@ -3637,6 +3692,10 @@ int trace_cache_drop_folio(struct pt_regs *ctx, struct address_space *mapping,
       populate_cache_metadata(&data, host);
     }
   }
+
+  // Note: unlike invalidate_mapping_pages / truncate_inode_pages_range, this
+  // probe derives no count from a byte range — populate_cache_metadata always
+  // leaves data.count == 1 (single folio), so no page-count clamp is needed.
 
   data.cpu_id = bpf_get_smp_processor_id();
   cache_events.perf_submit(ctx, &data, sizeof(data));
