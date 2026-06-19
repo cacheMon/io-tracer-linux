@@ -2,7 +2,7 @@
 Unit tests for WriteManager's per-file upload behavior.
 
 Trace logs are uploaded individually (no tar bundling), each under its own
-subdirectory (fs, ds, cache, process, ...), and the per-stream flush
+subdirectory (fs, block, cache, process, ...), and the per-stream flush
 thresholds are sized so each rotated log is large. These tests use a fake
 upload manager so no network or kernel access is required.
 
@@ -121,14 +121,14 @@ class PerFileUploadTests(unittest.TestCase):
     @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
     def test_upload_preserves_subdirectory(self):
         # The backend file_type is derived from the parent directory, so each
-        # stream must stay under its own subdir (fs, ds, cache, ...).
-        for subdir in ("fs", "ds", "cache", "process"):
+        # stream must stay under its own subdir (fs, block, cache, ...).
+        for subdir in ("fs", "block", "cache", "process"):
             src = self._make_log(subdir, f"{subdir}_x.csv", "row\n")
             self.wm.compress_log(src)
 
         self.assertEqual(len(self.upload.uploaded), 4)
         parents = {os.path.basename(os.path.dirname(p)) for p in self.upload.uploaded}
-        self.assertEqual(parents, {"fs", "ds", "cache", "process"})
+        self.assertEqual(parents, {"fs", "block", "cache", "process"})
 
     @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
     def test_no_upload_when_automatic_disabled(self):
@@ -268,7 +268,7 @@ class StaleLogRotationTests(unittest.TestCase):
 
         self.assertEqual(len(self.upload.uploaded), 1)
         self.assertEqual(
-            os.path.basename(os.path.dirname(self.upload.uploaded[0])), "ds"
+            os.path.basename(os.path.dirname(self.upload.uploaded[0])), "block"
         )
 
     def test_fresh_small_log_is_not_rotated(self):

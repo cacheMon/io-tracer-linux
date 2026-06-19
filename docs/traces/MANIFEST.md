@@ -18,7 +18,7 @@ adapt rather than assume a fixed layout.
 |---------|--------|
 | 1 | Headerless CSVs, no manifest, per-stream clocks. |
 | 2 | **CSV header row** on every file + this manifest + a common `mono_ns` (CLOCK_MONOTONIC) column appended to every stream. |
-| 3 | **Cross-OS aligned** `fs`/`ds` layout: a fixed shared column prefix (identical names/order to the Windows tracer), **lowercase** canonical operation names, `size_requested` renamed to `size`, and a dedicated block `flags` column (rwbs sub-flags split out of `operation`). |
+| 3 | **Cross-OS aligned** `fs`/`block` column layout: a fixed shared column prefix (identical names/order to the Windows tracer, whose equivalent stream is named `ds`), **lowercase** canonical operation names, `size_requested` renamed to `size`, and a dedicated block `flags` column (rwbs sub-flags split out of `operation`). |
 
 As of **schema_version 2**:
 
@@ -39,7 +39,7 @@ As of **schema_version 2**:
     "fs":  { "subdir": "fs", "filename_prefix": "fs", "description": "...",
              "wall_clock": "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
              "columns": [ { "name": "timestamp", "type": "datetime", "unit": "", "description": "..." }, ... ] },
-    "ds":  { ... }, "cache": { ... }, "pagefault": { ... },
+    "block":  { ... }, "cache": { ... }, "pagefault": { ... },
     "process": { ... }, "filesystem_snapshot": { ... }
   },
   "tracer":  { "version": "..." },
@@ -54,7 +54,7 @@ As of **schema_version 2**:
   "session": { "started_at": "ISO-8601", "stopped_at": "ISO-8601", "duration_seconds": 123.4 },
   "diagnostics": {
     "attached_probes": [ "vfs_read", "vfs_write", "block_rq_complete", ... ],
-    "lost_events":     { "fs": 0, "ds": 0 },
+    "lost_events":     { "fs": 0, "block": 0 },
     "rows_written":    { "VFS": 12345, "Block": 678, ... },
     "block":           { "issued": 1000, "completed": 990, "missed": 10 }
   }

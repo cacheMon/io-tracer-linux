@@ -7,7 +7,7 @@ IO Tracer uses eBPF/BPF technology to intercept kernel functions and collect var
 | # | Trace Type | Description | Output |
 |---|------------|-------------|--------|
 | 1 | [VFS Events](traces/VFS_EVENTS.md) | File system operations at the VFS layer | `fs/fs_*.csv` |
-| 2 | [Block I/O Events](traces/BLOCK_IO_EVENTS.md) | Block-level device I/O operations | `ds/ds_*.csv` |
+| 2 | [Block I/O Events](traces/BLOCK_IO_EVENTS.md) | Block-level device I/O operations | `block/block_*.csv` |
 | 3 | [Page Cache Events](traces/PAGE_CACHE_EVENTS.md) | Page cache hits, misses, writebacks, evictions | `cache/cache_*.csv` |
 | 4 | [Page Fault Events](traces/PAGE_FAULT_EVENTS.md) | File-backed page faults from mmap access | `pagefault/pagefault_*.csv` |
 | 5 | [Network Events](traces/NETWORK_EVENTS.md) | Connection lifecycle, socket options, drops | `nw_conn/*.csv`, `nw_sockopt/*.csv`, `nw_drop/*.csv` |
@@ -61,7 +61,7 @@ IO Tracer uses eBPF/BPF technology to intercept kernel functions and collect var
 │  ┌────────▼────────┐                                           │
 │  │  WriterManager  │    Output:                               │
 │  │                  │    • fs/*.csv.zst (VFS events)          │  │
-│  │                  │    • ds/*.csv.zst (block events)        │  │
+│  │                  │    • block/*.csv.zst (block events)     │  │
 │  │                  │    • cache/*.csv.zst (cache events)     │  │
 │  │                  │    • pagefault/*.csv.zst (page faults)  │  │
 │  │                  │    • filesystem_snapshot/*.csv.zst      │  │
