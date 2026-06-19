@@ -416,6 +416,10 @@ class IOTracer:
             else:
                 bytes_completed = str(ret)
             duration_ns = str(event.latency_ns) if event.latency_ns else ""
+        elif op_name in ("FSYNC", "FDATASYNC"):
+            # Durability latency: entry->return duration filled by the fsync
+            # kretprobe. No return value / byte count is captured for syncs.
+            duration_ns = str(event.latency_ns) if event.latency_ns else ""
 
         # Provenance metadata — populated for READ/WRITE/OPEN.
         dev_val = self._format_dev(event.dev) if getattr(event, "dev", 0) else ""

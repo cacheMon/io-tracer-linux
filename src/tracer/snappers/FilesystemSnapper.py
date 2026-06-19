@@ -25,10 +25,89 @@ Example:
 from ...utility.utils import format_csv_row, logger, compress_log, anonymize_path
 from ..WriterManager import WriteManager
 from datetime import datetime
+import ctypes
 import shutil
 import os
 import time
 import threading
+
+
+# --- Real file birth time via statx() -------------------------------------
+# Linux os.stat() never exposes st_birthtime, so the creation_time column used
+# to be a verbatim copy of mtime. statx(2) with STATX_BTIME returns the true
+# inode birth time on filesystems that record it (ext4, xfs, btrfs, ...). We
+# call libc's statx() through ctypes and fall back to mtime when the syscall,
+# libc symbol, or the per-file btime is unavailable.
+_AT_FDCWD = -100
+_AT_SYMLINK_NOFOLLOW = 0x100
+_STATX_BTIME = 0x00000800
+
+
+class _StatxTimestamp(ctypes.Structure):
+    _fields_ = [
+        ("tv_sec", ctypes.c_int64),
+        ("tv_nsec", ctypes.c_uint32),
+        ("__reserved", ctypes.c_int32),
+    ]
+
+
+class _Statx(ctypes.Structure):
+    # Layout per <linux/stat.h> struct statx. Only fields up to stx_btime are
+    # read; the remainder is reserved padding sized to the kernel struct.
+    _fields_ = [
+        ("stx_mask", ctypes.c_uint32),
+        ("stx_blksize", ctypes.c_uint32),
+        ("stx_attributes", ctypes.c_uint64),
+        ("stx_nlink", ctypes.c_uint32),
+        ("stx_uid", ctypes.c_uint32),
+        ("stx_gid", ctypes.c_uint32),
+        ("stx_mode", ctypes.c_uint16),
+        ("__spare0", ctypes.c_uint16),
+        ("stx_ino", ctypes.c_uint64),
+        ("stx_size", ctypes.c_uint64),
+        ("stx_blocks", ctypes.c_uint64),
+        ("stx_attributes_mask", ctypes.c_uint64),
+        ("stx_atime", _StatxTimestamp),
+        ("stx_btime", _StatxTimestamp),
+        ("stx_ctime", _StatxTimestamp),
+        ("stx_mtime", _StatxTimestamp),
+        ("stx_rdev_major", ctypes.c_uint32),
+        ("stx_rdev_minor", ctypes.c_uint32),
+        ("stx_dev_major", ctypes.c_uint32),
+        ("stx_dev_minor", ctypes.c_uint32),
+        ("__spare2", ctypes.c_uint64 * 14),
+    ]
+
+
+_statx_supported = True   # flips to False on first failure to avoid retry cost
+_libc = None
+
+
+def get_birth_time(path: str, fallback: float) -> float:
+    """Return the file's birth time (epoch seconds) via statx STATX_BTIME.
+
+    Falls back to ``fallback`` (typically mtime) when statx is unavailable or the
+    filesystem does not record a birth time for this file. The first hard
+    failure disables further attempts for the process lifetime.
+    """
+    global _statx_supported, _libc
+    if not _statx_supported:
+        return fallback
+    try:
+        if _libc is None:
+            _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        buf = _Statx()
+        rc = _libc.statx(_AT_FDCWD, os.fsencode(path), _AT_SYMLINK_NOFOLLOW,
+                         _STATX_BTIME, ctypes.byref(buf))
+        if rc != 0:
+            return fallback
+        if buf.stx_mask & _STATX_BTIME:
+            return buf.stx_btime.tv_sec + buf.stx_btime.tv_nsec / 1e9
+        return fallback
+    except (OSError, AttributeError):
+        # libc has no statx symbol (very old glibc) or it cannot be loaded.
+        _statx_supported = False
+        return fallback
 
 
 # Size value written for a file that disappeared since the previous snapshot.
@@ -187,7 +266,7 @@ class FilesystemSnapper:
                                 est = entry.stat(follow_symlinks=False)
                                 size = est.st_size
                                 mtime_ts = est.st_mtime
-                                ctime_ts = getattr(est, "st_birthtime", est.st_mtime)
+                                ctime_ts = get_birth_time(entry.path, est.st_mtime)
                                 atime_ts = est.st_atime
                                 new_state[entry.path] = (size, mtime_ts, ctime_ts, atime_ts)
 

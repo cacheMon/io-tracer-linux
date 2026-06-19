@@ -738,6 +738,11 @@ BPF_HASH(dio_staging, u64, u8, 10240);
  * duplicate event for the nested vfs_fsync -> vfs_fsync_range call. */
 BPF_HASH(fsync_inflight, u64, u64, 10240);
 
+/* Staged fsync/fdatasync event, completed by trace_vfs_fsync_ret with the
+ * entry->return latency (latency_ns). Mirrors the rw_staging pattern so the
+ * durability-latency column is populated instead of always empty. */
+BPF_HASH(fsync_staging, u64, struct data_t, 10240);
+
 #ifdef ENABLE_NETWORK
 /* Connection lifecycle context maps (low-overhead network subset) */
 BPF_HASH(accept_ctx, u64, u64);   /**< Accept start timestamp */
@@ -1607,16 +1612,28 @@ int trace_vfs_fsync(struct pt_regs *ctx, struct file *file, int datasync) {
   // second event for the same syscall. Cleared by the vfs_fsync kretprobe.
   fsync_inflight.update(&pid_tgid, &data.ts);
 
-  events.perf_submit(ctx, &data, sizeof(data));
+  // Defer submission to the kretprobe so the event carries the entry->return
+  // duration in latency_ns (durability latency), instead of emitting at entry
+  // with no timing. Mirrors the READ/WRITE rw_staging pattern.
+  fsync_staging.update(&pid_tgid, &data);
 
   return 0;
 }
 
 /**
- * @brief vfs_fsync() kretprobe — clears the nested-call suppression marker.
+ * @brief vfs_fsync() kretprobe — completes the staged fsync event with latency.
+ *
+ * Sets latency_ns to the entry->return duration, submits the event, and clears
+ * both the staging entry and the nested-call suppression marker.
  */
 int trace_vfs_fsync_ret(struct pt_regs *ctx) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
+  struct data_t *data = fsync_staging.lookup(&pid_tgid);
+  if (data) {
+    data->latency_ns = bpf_ktime_get_ns() - data->ts;
+    events.perf_submit(ctx, data, sizeof(*data));
+    fsync_staging.delete(&pid_tgid);
+  }
   fsync_inflight.delete(&pid_tgid);
   return 0;
 }
@@ -3545,6 +3562,17 @@ int trace_invalidate_mapping(struct pt_regs *ctx, struct address_space *mapping,
     }
   }
 
+  // Full-file invalidation passes end == (pgoff_t)-1, so the raw page count
+  // (end - start + 1) becomes a meaningless ~4.29e9 sentinel. Clamp to the
+  // number of pages the mapping actually has cached (an exact upper bound on
+  // what this call can drop) so the column stays summable downstream.
+  if (mapping) {
+    unsigned long nrpages = 0;
+    bpf_probe_read_kernel(&nrpages, sizeof(nrpages), &mapping->nrpages);
+    if (data.count > (u32)nrpages)
+      data.count = (u32)nrpages;
+  }
+
   data.cpu_id = bpf_get_smp_processor_id();
   cache_events.perf_submit(ctx, &data, sizeof(data));
   return 0;
@@ -3592,6 +3620,16 @@ int trace_truncate_pages(struct pt_regs *ctx, struct address_space *mapping,
     }
   }
 
+  // Full-file truncation makes (end_index - start_index + 1) a multi-billion
+  // page count; clamp to the pages actually cached in the mapping (see the
+  // invalidate_mapping_pages probe for rationale).
+  if (mapping) {
+    unsigned long nrpages = 0;
+    bpf_probe_read_kernel(&nrpages, sizeof(nrpages), &mapping->nrpages);
+    if (data.count > (u32)nrpages)
+      data.count = (u32)nrpages;
+  }
+
   data.cpu_id = bpf_get_smp_processor_id();
   cache_events.perf_submit(ctx, &data, sizeof(data));
   return 0;
@@ -3636,6 +3674,16 @@ int trace_cache_drop_folio(struct pt_regs *ctx, struct address_space *mapping,
       bpf_probe_read_kernel(&data.inode, sizeof(data.inode), &host->i_ino);
       populate_cache_metadata(&data, host);
     }
+  }
+
+  // Truncate-to-zero / full-file truncation yields a multi-billion page count
+  // from the byte-range math; clamp to the pages actually cached in the
+  // mapping (see the invalidate_mapping_pages probe for rationale).
+  if (mapping) {
+    unsigned long nrpages = 0;
+    bpf_probe_read_kernel(&nrpages, sizeof(nrpages), &mapping->nrpages);
+    if (data.count > (u32)nrpages)
+      data.count = (u32)nrpages;
   }
 
   data.cpu_id = bpf_get_smp_processor_id();
