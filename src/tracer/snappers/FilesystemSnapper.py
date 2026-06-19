@@ -96,8 +96,11 @@ def get_birth_time(path: str, fallback: float) -> float:
     try:
         if _libc is None:
             _libc = ctypes.CDLL("libc.so.6", use_errno=True)
-            # Pin the signature so the pointer/path args are not truncated to
-            # the default 32-bit int on a 64-bit platform.
+        # Pin the signature so the pointer/path args are not truncated to the
+        # default 32-bit int on a 64-bit platform. This is guarded
+        # independently of _libc initialization: is_pseudo_fs() may have created
+        # _libc first, so we must not gate statx pinning on _libc being None.
+        if not getattr(_libc.statx, "_iotracer_pinned", False):
             _libc.statx.argtypes = [
                 ctypes.c_int,            # dirfd
                 ctypes.c_char_p,         # pathname
@@ -106,6 +109,7 @@ def get_birth_time(path: str, fallback: float) -> float:
                 ctypes.POINTER(_Statx),  # statxbuf
             ]
             _libc.statx.restype = ctypes.c_int
+            _libc.statx._iotracer_pinned = True
         buf = _Statx()
         rc = _libc.statx(_AT_FDCWD, os.fsencode(path), _AT_SYMLINK_NOFOLLOW,
                          _STATX_BTIME, ctypes.byref(buf))
