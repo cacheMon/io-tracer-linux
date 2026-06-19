@@ -5,7 +5,7 @@ This module provides the WriteManager class which handles:
 - Creating output directory structure
 - Buffering trace events for different subsystems
 - Writing events to CSV files
-- Compressing output files with Zstandard (.zst)
+- Compressing output files with Zstandard (.zst), or gzip (.gz) as a fallback
 - Optionally uploading files to cloud storage
 
 The manager uses adaptive buffering to handle high event rates and
@@ -32,7 +32,7 @@ from .ObjectStorageManager import ObjectStorageManager
 from . import schema
 from ..utility.utils import (
     logger, capture_machine_id,
-    compress_file_zstd, zstandard_available, ZSTD_LEVEL,
+    compress_file, zstandard_available, ZSTD_LEVEL, GZIP_LEVEL,
 )
 import threading
 from collections import deque
@@ -625,13 +625,13 @@ class WriteManager:
             self._fs_snap_handle.close()
             self._fs_snap_handle = None
 
-            # Compress with Zstandard. If zstandard is unavailable, keep the
-            # uncompressed part rather than losing it.
+            # Compress the part, preferring Zstandard and falling back to gzip.
             if os.path.exists(part_filepath):
                 # Don't log or count each part - we'll log when snapshot is complete
-                if compress_file_zstd(part_filepath, part_filepath + ".zst"):
+                compressed = compress_file(part_filepath)
+                if compressed is not None and compressed != part_filepath:
                     os.remove(part_filepath)
-                    part_output = part_filepath + ".zst"
+                    part_output = compressed
                 else:
                     part_output = part_filepath
 
@@ -685,9 +685,10 @@ class WriteManager:
                 self.fs_snapshot_session_active = False
                 return
 
-            # Find the last part file. It is normally compressed (.csv.zst), but
-            # when zstandard is unavailable it is left uncompressed (.csv); detect
-            # whichever actually exists so the completion rename stays correct.
+            # Find the last part file. It is normally Zstandard-compressed
+            # (.csv.zst), but with gzip fallback it is .csv.gz, and if no codec
+            # was available it stays uncompressed (.csv); detect whichever
+            # actually exists so the completion rename stays correct.
             last_part_str = f"{total_parts:04d}"
             snapshot_dir = f"{self.output_dir}/filesystem_snapshot"
             base_name = (
@@ -696,9 +697,10 @@ class WriteManager:
                 f"{self.fs_snapshot_device_id}"
             )
             suffix = ".csv.zst"
-            if (not os.path.exists(f"{snapshot_dir}/{base_name}{suffix}")
-                    and os.path.exists(f"{snapshot_dir}/{base_name}.csv")):
-                suffix = ".csv"
+            for candidate in (".csv.zst", ".csv.gz", ".csv"):
+                if os.path.exists(f"{snapshot_dir}/{base_name}{candidate}"):
+                    suffix = candidate
+                    break
             old_filepath = f"{snapshot_dir}/{base_name}{suffix}"
 
             # Construct new filename with completion marker
@@ -1053,23 +1055,26 @@ class WriteManager:
 
     def compress_log(self, input_file: str):
         """
-        Compress a log file with Zstandard and optionally upload.
+        Compress a log file and optionally upload it.
+
+        Prefers Zstandard (.zst) and falls back to gzip (.gz) when the optional
+        ``zstandard`` library is unavailable, so trace logs are always
+        compressed rather than uploaded raw.
 
         Args:
             input_file: Path to the file to compress
         """
         try:
             src = input_file
-            dst = input_file + ".zst"
 
             # Check if file exists (may already be compressed for multi-part files)
             if not os.path.exists(src):
                 return
 
-            # Fall back to the uncompressed file when zstandard is unavailable
+            compressed = compress_file(src)
+            # If compression somehow failed, fall back to the uncompressed file
             # so trace data is still uploaded rather than lost.
-            compressed = compress_file_zstd(src, dst)
-            upload_target = dst if compressed else src
+            upload_target = compressed if compressed is not None else src
 
             if self.automatic_upload:
                 self.created_files += 1
@@ -1077,14 +1082,18 @@ class WriteManager:
                 # Upload each log individually, preserving its subdirectory
                 # (fs, ds, cache, process, ...) on the backend.
                 self.upload_manager.append_object(upload_target)
-            if compressed:
+            if compressed is not None and compressed != src:
                 os.remove(src)
         except Exception as e:
             logger("error", f"Failed compressing log {input_file}: {e}")
             
     def compress_dir(self, input_dir: str):
         """
-        Compress a directory to tar.zst and optionally upload.
+        Compress a directory to a tar bundle and optionally upload.
+
+        Prefers Zstandard (.tar.zst) and falls back to gzip (.tar.gz) when the
+        optional ``zstandard`` library is unavailable, so the bundle is still
+        compressed rather than left as a plain tar.
 
         Args:
             input_dir: Path to the directory to compress
@@ -1093,8 +1102,6 @@ class WriteManager:
             src = input_dir
             base = input_dir.rstrip("/").rstrip("\\")
 
-            # Fall back to a plain (uncompressed) tar when zstandard is missing
-            # so the bundle is still produced rather than lost.
             zstandard = zstandard_available()
             if zstandard is not None:
                 dst = base + ".tar.zst"
@@ -1104,8 +1111,9 @@ class WriteManager:
                         with tarfile.open(mode="w|", fileobj=compressor) as tar:
                             tar.add(src, arcname=os.path.basename(src))
             else:
-                dst = base + ".tar"
-                with tarfile.open(dst, mode="w") as tar:
+                # gzip fallback — always available in the standard library.
+                dst = base + ".tar.gz"
+                with tarfile.open(dst, mode="w:gz", compresslevel=GZIP_LEVEL) as tar:
                     tar.add(src, arcname=os.path.basename(src))
 
             if self.automatic_upload:

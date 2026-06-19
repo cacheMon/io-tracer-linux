@@ -83,7 +83,7 @@ filesystem_snapshot_part0003_20260214_120000_ABC123DEF456_complete_parts3.csv.zs
 
 ## Compression
 
-Files are compressed using **Zstandard** (`.zst`) for reliable and efficient compression.
+Files are compressed using **Zstandard** (`.zst`) for reliable and efficient compression. When the optional `zstandard` library is unavailable, the tracer falls back to **gzip** (`.gz`) from the Python standard library so snapshot parts are still compressed.
 
 ## Implementation Details
 
@@ -108,9 +108,9 @@ The `filesystem_snapshot()` method now calls `mark_fs_snapshot_complete()` after
 
 ### Utils Changes
 
-Uses the existing `compress_file_zstd()` helper that:
-- Compresses files using Zstandard
-- Removes the original uncompressed file after compression
+Uses the `compress_file()` helper that:
+- Compresses files using Zstandard, falling back to gzip (`.gz`) when `zstandard` is unavailable
+- Returns the compressed output path so the caller can remove the original uncompressed file
 
 ## Buffer Flushing
 

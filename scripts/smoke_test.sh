@@ -91,6 +91,8 @@ run_one() {
     local hdr
     if [[ "$fsfile" == *.zst ]]; then
       hdr="$(zstd -dc "$fsfile" 2>/dev/null | head -1)"
+    elif [[ "$fsfile" == *.gz ]]; then
+      hdr="$(gzip -dc "$fsfile" 2>/dev/null | head -1)"
     else
       hdr="$(head -1 "$fsfile")"
     fi

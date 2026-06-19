@@ -60,9 +60,9 @@ sudo pacman -S python-psutil python-requests python-zstandard
 ```
 
 `zstandard` is used to compress trace logs (`.zst`). If it is missing the
-tracer still runs and keeps traces uncompressed, but installing it is
-recommended. To run the test suite you'll also need `pytest`
-(`pip install pytest`).
+tracer still runs and falls back to gzip (`.gz`) using the Python standard
+library, but installing `zstandard` is recommended for faster, smaller output.
+To run the test suite you'll also need `pytest` (`pip install pytest`).
 
 ## Usage
 ```
