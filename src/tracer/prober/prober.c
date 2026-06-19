@@ -1155,7 +1155,12 @@ static __always_inline void build_dentry_path(struct dentry *dentry,
     d = parent;
   }
 
+  /* sc->build is per-CPU scratch reused across invocations, and the whole
+   * FILENAME_MAX_LEN window is copied to the caller below. Zero it first so a
+   * shorter path cannot leak the tail of a previous (longer) one to userspace.
+   * Only the copied window needs clearing; the upper half is verifier slack. */
   char *out = sc->build;
+  __builtin_memset(out, 0, FILENAME_MAX_LEN);
   int off = 0;
 #pragma unroll
   for (int i = DPATH_MAX_DEPTH - 1; i >= 0; i--) {
