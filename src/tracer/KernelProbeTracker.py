@@ -87,23 +87,37 @@ class KernelProbeTracker:
             sys.exit(1)
             return False
 
+    # Number of concurrently in-flight probed-function instances a kretprobe can
+    # track. The kernel default is small (≈NR_CPUS), so for hot functions like
+    # vfs_read/vfs_write the return handler is silently missed once concurrency
+    # exceeds it ("nmissed"). Each miss leaves a staged entry uncollected; with
+    # LRU staging maps that just costs an event, but a large maxactive keeps the
+    # miss rate (and lost events) low under load.
+    KRETPROBE_MAXACTIVE = 4096
+
     def add_kretprobe(self, event: str, kprobe: str) -> bool:
         """
         Attach a kretprobe (kernel function return probe).
-        
+
         Args:
             event: Kernel function name to probe (e.g., "vfs_read")
             kprobe: Name of the BPF function to call when probe triggers
-            
+
         Returns:
             bool: True if attachment succeeded, False otherwise
-            
+
         Raises:
             SystemExit: If probe attachment fails
         """
         try:
             # logger("info", f"Attaching kprobe {event} to {kprobe}")
-            k = self.b.attach_kretprobe(event=event, fn_name=kprobe)
+            try:
+                k = self.b.attach_kretprobe(
+                    event=event, fn_name=kprobe, maxactive=self.KRETPROBE_MAXACTIVE
+                )
+            except TypeError:
+                # Older bcc without the maxactive kwarg: fall back to the default.
+                k = self.b.attach_kretprobe(event=event, fn_name=kprobe)
             self.kretprobes.append((event, k))
             return True
         except Exception as e:

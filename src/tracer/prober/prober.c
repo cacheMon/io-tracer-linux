@@ -620,12 +620,15 @@ BPF_PERCPU_ARRAY(block_stats, u64, 3);
 BPF_HASH(tracer_config, u32, u32, 1);    /**< Key 0 = tracer PID to exclude */
 
 /* Direct I/O direction staged at entry (1 = write), consumed by the
- * iomap_dio_rw/__blockdev_direct_IO kretprobe. */
-BPF_HASH(dio_staging, u64, u8, 10240);
+ * iomap_dio_rw/__blockdev_direct_IO kretprobe. LRU so a missed kretprobe
+ * return (see rw_staging) evicts the oldest stale entry instead of wedging
+ * the map. */
+BPF_TABLE("lru_hash", u64, u8, dio_staging, 10240);
 
 /* vfs_fsync entry timestamp, used by trace_vfs_fsync_range to suppress the
- * duplicate event for the nested vfs_fsync -> vfs_fsync_range call. */
-BPF_HASH(fsync_inflight, u64, u64, 10240);
+ * duplicate event for the nested vfs_fsync -> vfs_fsync_range call. LRU so a
+ * missed kretprobe return cannot leak entries until the map is full. */
+BPF_TABLE("lru_hash", u64, u64, fsync_inflight, 10240);
 
 /* io_uring request tracking map. LRU because completions that bypass the
  * probed completion path (batched completions on modern kernels) would
@@ -647,21 +650,30 @@ struct open_path_t {
   s32 dfd;                     /**< openat dirfd arg (AT_FDCWD for cwd-relative) */
 };
 
+/* All of the *_staging maps below pair an entry probe (which inserts) with a
+ * kretprobe (which looks up, submits, and deletes). A kretprobe return can be
+ * silently missed when in-flight instances of a hot function exceed maxactive,
+ * which would leave the entry staged forever. A plain BPF_HASH rejects every
+ * new key once full (-E2BIG), permanently stopping the corresponding events
+ * (read/write being the highest-volume, this manifested as the fs request log
+ * dying a few minutes into a trace). LRU instead evicts the oldest stale entry
+ * so events keep flowing. Mirrors io_uring_submit_map / the block maps. */
+
 /* Staged path from trace_do_sys_openat2_entry, consumed by trace_vfs_open */
-BPF_HASH(open_path_staging, u64, struct open_path_t, 4096);
+BPF_TABLE("lru_hash", u64, struct open_path_t, open_path_staging, 4096);
 
 /* Staged event data from trace_vfs_open, completed by trace_sys_openat_ret */
-BPF_HASH(open_staging, u64, struct data_t, 4096);
+BPF_TABLE("lru_hash", u64, struct data_t, open_staging, 4096);
 
 /* Staged MMAP event from do_mmap entry, completed by the do_mmap kretprobe. */
-BPF_HASH(mmap_staging, u64, struct data_t, 4096);
+BPF_TABLE("lru_hash", u64, struct data_t, mmap_staging, 4096);
 
 /* Staged READ/WRITE event from the vfs_read/vfs_write entry probe, completed by
  * the matching kretprobe which fills in the return value and latency. */
-BPF_HASH(rw_staging, u64, struct data_t, 10240);
+BPF_TABLE("lru_hash", u64, struct data_t, rw_staging, 10240);
 
 /* Staged mremap args from sys_mremap entry, consumed by the kretprobe. */
-BPF_HASH(mremap_staging, u64, struct mremap_args, 4096);
+BPF_TABLE("lru_hash", u64, struct mremap_args, mremap_staging, 4096);
 
 /* ============================================================================
  * PERF OUTPUT BUFFERS
