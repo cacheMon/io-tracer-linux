@@ -3693,15 +3693,9 @@ int trace_cache_drop_folio(struct pt_regs *ctx, struct address_space *mapping,
     }
   }
 
-  // Truncate-to-zero / full-file truncation yields a multi-billion page count
-  // from the byte-range math; clamp to the pages actually cached in the
-  // mapping (see the invalidate_mapping_pages probe for rationale).
-  if (mapping) {
-    unsigned long nrpages = 0;
-    bpf_probe_read_kernel(&nrpages, sizeof(nrpages), &mapping->nrpages);
-    if (data.count > (u32)nrpages)
-      data.count = (u32)nrpages;
-  }
+  // Note: unlike invalidate_mapping_pages / truncate_inode_pages_range, this
+  // probe derives no count from a byte range — populate_cache_metadata always
+  // leaves data.count == 1 (single folio), so no page-count clamp is needed.
 
   data.cpu_id = bpf_get_smp_processor_id();
   cache_events.perf_submit(ctx, &data, sizeof(data));

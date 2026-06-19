@@ -96,10 +96,26 @@ def get_birth_time(path: str, fallback: float) -> float:
     try:
         if _libc is None:
             _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            # Pin the signature so the pointer/path args are not truncated to
+            # the default 32-bit int on a 64-bit platform.
+            _libc.statx.argtypes = [
+                ctypes.c_int,            # dirfd
+                ctypes.c_char_p,         # pathname
+                ctypes.c_int,            # flags
+                ctypes.c_uint,           # mask
+                ctypes.POINTER(_Statx),  # statxbuf
+            ]
+            _libc.statx.restype = ctypes.c_int
         buf = _Statx()
         rc = _libc.statx(_AT_FDCWD, os.fsencode(path), _AT_SYMLINK_NOFOLLOW,
                          _STATX_BTIME, ctypes.byref(buf))
         if rc != 0:
+            # ENOSYS (syscall absent) or EPERM (blocked by seccomp) will never
+            # succeed; disable for the process lifetime to avoid a failing
+            # syscall on every file during the directory walk.
+            err = ctypes.get_errno()
+            if err in (1, 38):  # EPERM, ENOSYS
+                _statx_supported = False
             return fallback
         if buf.stx_mask & _STATX_BTIME:
             return buf.stx_btime.tv_sec + buf.stx_btime.tv_nsec / 1e9
