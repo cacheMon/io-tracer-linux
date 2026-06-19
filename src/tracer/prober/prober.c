@@ -1101,19 +1101,40 @@ static int get_file_path_from_dentry(struct dentry *dentry, char *buf,
  * relative to the file's own mount root), and truncates to the last
  * DPATH_MAX_DEPTH components on very deep paths. FILENAME_MAX_LEN is a power of
  * two so masking the write offset keeps the verifier happy.
+ *
+ * The path is assembled in a per-CPU scratch buffer that is twice
+ * FILENAME_MAX_LEN, then copied into the caller's FILENAME_MAX_LEN buffer. Each
+ * component is read with bpf_probe_read_kernel_str() at a variable offset (the
+ * running write position, masked into 0..FILENAME_MAX_LEN-1) and a variable
+ * length (the remaining space). The verifier reasons about the offset and the
+ * length independently, so for an N-byte buffer it must assume a write of up to
+ * N bytes can begin at offset N-1 — an apparent 2N-byte span. Sizing the
+ * scratch to 2*FILENAME_MAX_LEN makes that worst case provably in-bounds; at
+ * run time offset + length never exceeds FILENAME_MAX_LEN, so the upper half is
+ * only ever slack for the verifier. A 256-byte stack buffer cannot satisfy this
+ * (the independent maxima sum past its end), which is why the assembly happens
+ * off-stack in the scratch map.
  */
 #define DPATH_MAX_DEPTH 12
 #define DPATH_MASK (FILENAME_MAX_LEN - 1)
+#define DPATH_BUILD_SIZE (2 * FILENAME_MAX_LEN)
 
-/* Per-CPU scratch for the component-pointer chain — kept off the BPF stack,
- * which is only 512 bytes and already mostly consumed by struct data_t. */
-struct dpath_scratch { const unsigned char *names[DPATH_MAX_DEPTH]; };
+/* Per-CPU scratch for the component-pointer chain and the assembly buffer —
+ * both kept off the BPF stack, which is only 512 bytes and already mostly
+ * consumed by struct data_t. */
+struct dpath_scratch {
+  const unsigned char *names[DPATH_MAX_DEPTH];
+  char build[DPATH_BUILD_SIZE];
+};
 BPF_PERCPU_ARRAY(dpath_scratch_map, struct dpath_scratch, 1);
 
 static __always_inline void build_dentry_path(struct dentry *dentry,
                                               char *buf, int buf_size) {
   buf[0] = '\0';
   if (!dentry) return;
+  /* The assembly buffer is masked into a FILENAME_MAX_LEN window and copied out
+   * at that width; a smaller caller buffer would overflow on the copy. */
+  if (buf_size < FILENAME_MAX_LEN) return;
 
   u32 zero = 0;
   struct dpath_scratch *sc = dpath_scratch_map.lookup(&zero);
@@ -1134,6 +1155,12 @@ static __always_inline void build_dentry_path(struct dentry *dentry,
     d = parent;
   }
 
+  /* sc->build is per-CPU scratch reused across invocations, and the whole
+   * FILENAME_MAX_LEN window is copied to the caller below. Zero it first so a
+   * shorter path cannot leak the tail of a previous (longer) one to userspace.
+   * Only the copied window needs clearing; the upper half is verifier slack. */
+  char *out = sc->build;
+  __builtin_memset(out, 0, FILENAME_MAX_LEN);
   int off = 0;
 #pragma unroll
   for (int i = DPATH_MAX_DEPTH - 1; i >= 0; i--) {
@@ -1141,18 +1168,23 @@ static __always_inline void build_dentry_path(struct dentry *dentry,
     const unsigned char *np = sc->names[i];
     if (!np) continue;
 
-    if (off < buf_size - 1) {            /* component separator */
-      buf[off & DPATH_MASK] = '/';
+    if (off < FILENAME_MAX_LEN - 1) {    /* component separator */
+      out[off & DPATH_MASK] = '/';
       off++;
     }
-    int pos = off & DPATH_MASK;          /* 0..buf_size-1 */
-    int cap = buf_size - pos;            /* pos + cap == buf_size, so in-bounds */
+    int pos = off & DPATH_MASK;          /* 0..FILENAME_MAX_LEN-1 */
+    int cap = FILENAME_MAX_LEN - pos;    /* pos + cap == FILENAME_MAX_LEN */
     if (cap > 1) {
-      long w = bpf_probe_read_kernel_str(&buf[pos], cap, np);
+      long w = bpf_probe_read_kernel_str(&out[pos], cap, np);
       if (w > 1) off = pos + (int)(w - 1);   /* advance past name, exclude NUL */
     }
   }
-  buf[off & DPATH_MASK] = '\0';
+  out[off & DPATH_MASK] = '\0';
+
+  /* Copy the assembled path (the FILENAME_MAX_LEN window) into the caller's
+   * buffer; out[off] is already NUL-terminated within that window. */
+  __builtin_memcpy(buf, out, FILENAME_MAX_LEN);
+  buf[FILENAME_MAX_LEN - 1] = '\0';
 }
 
 /**
