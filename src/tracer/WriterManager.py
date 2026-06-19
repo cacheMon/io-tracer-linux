@@ -5,7 +5,7 @@ This module provides the WriteManager class which handles:
 - Creating output directory structure
 - Buffering trace events for different subsystems
 - Writing events to CSV files
-- Compressing output files with Zstandard (.zst)
+- Compressing output files with Zstandard (.zst), or gzip (.gz) as a fallback
 - Optionally uploading files to cloud storage
 
 The manager uses adaptive buffering to handle high event rates and
@@ -32,7 +32,7 @@ from .ObjectStorageManager import ObjectStorageManager
 from . import schema
 from ..utility.utils import (
     logger, capture_machine_id,
-    compress_file_zstd, zstandard_available, ZSTD_LEVEL,
+    compress_file, zstandard_available, ZSTD_LEVEL, GZIP_LEVEL,
 )
 import threading
 from collections import deque
@@ -90,6 +90,11 @@ class WriteManager:
         self.output_process_file = f"{self.output_dir}/process/process_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_fs_snapshot_file = f"{self.output_dir}/filesystem_snapshot/filesystem_snapshot_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_pagefault_file = f"{self.output_dir}/pagefault/pagefault_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
+        # Network streams (low-overhead subset: connection lifecycle, socket
+        # options, drops). Files stay empty unless --network is enabled.
+        self.output_nw_conn_file = f"{self.output_dir}/nw_conn/nw_conn_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
+        self.output_nw_sockopt_file = f"{self.output_dir}/nw_sockopt/nw_sockopt_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
+        self.output_nw_drop_file = f"{self.output_dir}/nw_drop/nw_drop_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
 
         # Create output directories
         os.makedirs(f"{self.output_dir}/system_spec", exist_ok=True)
@@ -99,6 +104,9 @@ class WriteManager:
         os.makedirs(f"{self.output_dir}/process", exist_ok=True)
         os.makedirs(f"{self.output_dir}/filesystem_snapshot", exist_ok=True)
         os.makedirs(f"{self.output_dir}/pagefault", exist_ok=True)
+        os.makedirs(f"{self.output_dir}/nw_conn", exist_ok=True)
+        os.makedirs(f"{self.output_dir}/nw_sockopt", exist_ok=True)
+        os.makedirs(f"{self.output_dir}/nw_drop", exist_ok=True)
 
         self.upload_manager = upload_manager
         self.automatic_upload = automatic_upload
@@ -110,7 +118,10 @@ class WriteManager:
         self.process_buffer = deque()
         self.fs_snap_buffer = deque()
         self.pagefault_buffer = deque()
-        
+        self.nw_conn_buffer = deque()
+        self.nw_sockopt_buffer = deque()
+        self.nw_drop_buffer = deque()
+
         # Event rate tracking
         self.event_timestamps = {
             'vfs': deque(maxlen=1000),
@@ -119,6 +130,9 @@ class WriteManager:
             'fs_state': deque(maxlen=1000),
             'proc_state': deque(maxlen=1000),
             'pagefault': deque(maxlen=1000),
+            'nw_conn': deque(maxlen=1000),
+            'nw_sockopt': deque(maxlen=1000),
+            'nw_drop': deque(maxlen=1000),
         }
         
         # Dynamic thresholds (min, max). Raised roughly 10x from the original
@@ -154,6 +168,11 @@ class WriteManager:
         self.process_max_events = 80000  # Large enough to fit entire hourly snapshot
         self.fs_snap_max_events = 80000
         self.pagefault_max_events = 80000
+        # Network streams are comparatively low-volume (no per-packet path), so a
+        # fixed threshold is sufficient; they are not adaptively resized.
+        self.nw_conn_max_events = 80000
+        self.nw_sockopt_max_events = 80000
+        self.nw_drop_max_events = 80000
 
         # Per-stream locks. Buffer flushes are triggered both from the
         # perf-callback (polling) thread via append_*_log -> flush_*_only and
@@ -167,6 +186,9 @@ class WriteManager:
             'process':   threading.Lock(),
             'fs_snap':   threading.Lock(),
             'pagefault': threading.Lock(),
+            'nw_conn':    threading.Lock(),
+            'nw_sockopt': threading.Lock(),
+            'nw_drop':    threading.Lock(),
         }
 
         # File handles for each output
@@ -176,6 +198,9 @@ class WriteManager:
         self._process_handle = None
         self._pagefault_handle = None
         self._fs_snap_handle = None
+        self._nw_conn_handle = None
+        self._nw_sockopt_handle = None
+        self._nw_drop_handle = None
 
         # Registry of the continuous event streams that support generic
         # rotation. Snapshots (process, fs_snap) are intentionally excluded:
@@ -187,6 +212,9 @@ class WriteManager:
             'block':     {'subdir': 'ds',        'prefix': 'ds',        'buf': 'block_buffer',     'handle': '_block_handle',     'file': 'output_block_file',     'log': 'Block'},
             'cache':     {'subdir': 'cache',     'prefix': 'cache',     'buf': 'cache_buffer',     'handle': '_cache_handle',     'file': 'output_cache_file',     'log': 'Cache'},
             'pagefault': {'subdir': 'pagefault', 'prefix': 'pagefault', 'buf': 'pagefault_buffer', 'handle': '_pagefault_handle', 'file': 'output_pagefault_file', 'log': 'PageFault'},
+            'nw_conn':    {'subdir': 'nw_conn',    'prefix': 'nw_conn',    'buf': 'nw_conn_buffer',    'handle': '_nw_conn_handle',    'file': 'output_nw_conn_file',    'log': 'NetConn'},
+            'nw_sockopt': {'subdir': 'nw_sockopt', 'prefix': 'nw_sockopt', 'buf': 'nw_sockopt_buffer', 'handle': '_nw_sockopt_handle', 'file': 'output_nw_sockopt_file', 'log': 'NetSockopt'},
+            'nw_drop':    {'subdir': 'nw_drop',    'prefix': 'nw_drop',    'buf': 'nw_drop_buffer',    'handle': '_nw_drop_handle',    'file': 'output_nw_drop_file',    'log': 'NetDrop'},
         }
 
         # Time/size based rotation so a slow stream's log doesn't wait until
@@ -219,6 +247,8 @@ class WriteManager:
     _SCHEMA_KEY = {
         'vfs': 'fs', 'block': 'ds', 'cache': 'cache', 'pagefault': 'pagefault',
         'process': 'process', 'fs_snap': 'filesystem_snapshot',
+        'nw_conn': 'nw_conn',
+        'nw_sockopt': 'nw_sockopt', 'nw_drop': 'nw_drop',
     }
 
     def _open_log_file(self, path: str, wm_key: str, write_header: bool = True):
@@ -506,6 +536,36 @@ class WriteManager:
         else:
             logger("error", "Invalid pagefault log output format. Expected a string.")
 
+    def append_conn_log(self, log_output: str):
+        """Add a network connection-lifecycle log entry."""
+        if isinstance(log_output, str):
+            self.nw_conn_buffer.append(log_output)
+            self.event_timestamps['nw_conn'].append(time.time())
+            if len(self.nw_conn_buffer) >= self.nw_conn_max_events:
+                self._rotate_stream('nw_conn')
+        else:
+            logger("error", "Invalid connection log output format. Expected a string.")
+
+    def append_sockopt_log(self, log_output: str):
+        """Add a socket-option log entry."""
+        if isinstance(log_output, str):
+            self.nw_sockopt_buffer.append(log_output)
+            self.event_timestamps['nw_sockopt'].append(time.time())
+            if len(self.nw_sockopt_buffer) >= self.nw_sockopt_max_events:
+                self._rotate_stream('nw_sockopt')
+        else:
+            logger("error", "Invalid sockopt log output format. Expected a string.")
+
+    def append_drop_log(self, log_output: str):
+        """Add a network drop/retransmit log entry."""
+        if isinstance(log_output, str):
+            self.nw_drop_buffer.append(log_output)
+            self.event_timestamps['nw_drop'].append(time.time())
+            if len(self.nw_drop_buffer) >= self.nw_drop_max_events:
+                self._rotate_stream('nw_drop')
+        else:
+            logger("error", "Invalid drop log output format. Expected a string.")
+
     def direct_write(self, output_path: str, spec_str: str):
         """
         Write a system specification file directly.
@@ -565,13 +625,13 @@ class WriteManager:
             self._fs_snap_handle.close()
             self._fs_snap_handle = None
 
-            # Compress with Zstandard. If zstandard is unavailable, keep the
-            # uncompressed part rather than losing it.
+            # Compress the part, preferring Zstandard and falling back to gzip.
             if os.path.exists(part_filepath):
                 # Don't log or count each part - we'll log when snapshot is complete
-                if compress_file_zstd(part_filepath, part_filepath + ".zst"):
+                compressed = compress_file(part_filepath)
+                if compressed is not None and compressed != part_filepath:
                     os.remove(part_filepath)
-                    part_output = part_filepath + ".zst"
+                    part_output = compressed
                 else:
                     part_output = part_filepath
 
@@ -625,9 +685,10 @@ class WriteManager:
                 self.fs_snapshot_session_active = False
                 return
 
-            # Find the last part file. It is normally compressed (.csv.zst), but
-            # when zstandard is unavailable it is left uncompressed (.csv); detect
-            # whichever actually exists so the completion rename stays correct.
+            # Find the last part file. It is normally Zstandard-compressed
+            # (.csv.zst), but with gzip fallback it is .csv.gz, and if no codec
+            # was available it stays uncompressed (.csv); detect whichever
+            # actually exists so the completion rename stays correct.
             last_part_str = f"{total_parts:04d}"
             snapshot_dir = f"{self.output_dir}/filesystem_snapshot"
             base_name = (
@@ -636,9 +697,10 @@ class WriteManager:
                 f"{self.fs_snapshot_device_id}"
             )
             suffix = ".csv.zst"
-            if (not os.path.exists(f"{snapshot_dir}/{base_name}{suffix}")
-                    and os.path.exists(f"{snapshot_dir}/{base_name}.csv")):
-                suffix = ".csv"
+            for candidate in (".csv.zst", ".csv.gz", ".csv"):
+                if os.path.exists(f"{snapshot_dir}/{base_name}{candidate}"):
+                    suffix = candidate
+                    break
             old_filepath = f"{snapshot_dir}/{base_name}{suffix}"
 
             # Construct new filename with completion marker
@@ -836,6 +898,9 @@ class WriteManager:
             self.fs_snap_buffer.clear()
         
         self.compress_log(self.output_pagefault_file)
+        self.compress_log(self.output_nw_conn_file)
+        self.compress_log(self.output_nw_sockopt_file)
+        self.compress_log(self.output_nw_drop_file)
 
         # In automatic_upload mode every compressed log has already been queued
         # for individual upload (preserving its subdirectory) and the background
@@ -847,16 +912,6 @@ class WriteManager:
         if not self.automatic_upload:
             self.compress_dir(self.output_dir)
 
-
-    def clear_events(self):
-        """Clear all event buffers."""
-        print("Clear initiated")
-        self.vfs_buffer.clear()
-        self.block_buffer.clear() 
-        self.cache_buffer.clear()
-        self.process_buffer.clear()
-        self.fs_snap_buffer.clear()
-        self.pagefault_buffer.clear()
 
     def _write_buffer_to_file(self, buffer, file_handle, buffer_name: str):
         """
@@ -934,6 +989,21 @@ class WriteManager:
                         self._pagefault_handle = self._open_log_file(self.output_pagefault_file, 'pagefault')
                     self._write_buffer_to_file(self.pagefault_buffer, self._pagefault_handle, "PageFault")
 
+        def write_network():
+            # Land any buffered network rows into their current files. Each stream
+            # is keyed in the generic _streams registry, so reuse it.
+            for key, label in (('nw_conn', 'NetConn'),
+                               ('nw_sockopt', 'NetSockopt'), ('nw_drop', 'NetDrop')):
+                s = self._streams[key]
+                with self._stream_locks[key]:
+                    buf = getattr(self, s['buf'])
+                    if buf:
+                        handle = getattr(self, s['handle'])
+                        if handle is None:
+                            handle = self._open_log_file(getattr(self, s['file']), key)
+                            setattr(self, s['handle'], handle)
+                        self._write_buffer_to_file(buf, handle, label)
+
         threads = []
         
         # Start parallel write threads for each buffer
@@ -967,31 +1037,44 @@ class WriteManager:
             threads.append(t7)
             t7.start()
 
+        if (self.nw_conn_buffer
+                or self.nw_sockopt_buffer or self.nw_drop_buffer):
+            t8 = threading.Thread(target=write_network)
+            threads.append(t8)
+            t8.start()
+
         # Wait for all threads to complete
         for thread in threads:
             thread.join()
 
-        self.clear_events()
+        # NOTE: do NOT clear_events() here. Each write_*() above already drained
+        # its buffer (popleft under the stream lock). A blanket buffer.clear()
+        # would additionally wipe rows appended by the lock-free append_*() path
+        # in the window between a stream's drain and the clear — silently losing
+        # events on every periodic flush. The drain is the only emptying needed.
 
     def compress_log(self, input_file: str):
         """
-        Compress a log file with Zstandard and optionally upload.
+        Compress a log file and optionally upload it.
+
+        Prefers Zstandard (.zst) and falls back to gzip (.gz) when the optional
+        ``zstandard`` library is unavailable, so trace logs are always
+        compressed rather than uploaded raw.
 
         Args:
             input_file: Path to the file to compress
         """
         try:
             src = input_file
-            dst = input_file + ".zst"
 
             # Check if file exists (may already be compressed for multi-part files)
             if not os.path.exists(src):
                 return
 
-            # Fall back to the uncompressed file when zstandard is unavailable
+            compressed = compress_file(src)
+            # If compression somehow failed, fall back to the uncompressed file
             # so trace data is still uploaded rather than lost.
-            compressed = compress_file_zstd(src, dst)
-            upload_target = dst if compressed else src
+            upload_target = compressed if compressed is not None else src
 
             if self.automatic_upload:
                 self.created_files += 1
@@ -999,14 +1082,18 @@ class WriteManager:
                 # Upload each log individually, preserving its subdirectory
                 # (fs, ds, cache, process, ...) on the backend.
                 self.upload_manager.append_object(upload_target)
-            if compressed:
+            if compressed is not None and compressed != src:
                 os.remove(src)
         except Exception as e:
             logger("error", f"Failed compressing log {input_file}: {e}")
             
     def compress_dir(self, input_dir: str):
         """
-        Compress a directory to tar.zst and optionally upload.
+        Compress a directory to a tar bundle and optionally upload.
+
+        Prefers Zstandard (.tar.zst) and falls back to gzip (.tar.gz) when the
+        optional ``zstandard`` library is unavailable, so the bundle is still
+        compressed rather than left as a plain tar.
 
         Args:
             input_dir: Path to the directory to compress
@@ -1015,8 +1102,6 @@ class WriteManager:
             src = input_dir
             base = input_dir.rstrip("/").rstrip("\\")
 
-            # Fall back to a plain (uncompressed) tar when zstandard is missing
-            # so the bundle is still produced rather than lost.
             zstandard = zstandard_available()
             if zstandard is not None:
                 dst = base + ".tar.zst"
@@ -1026,8 +1111,9 @@ class WriteManager:
                         with tarfile.open(mode="w|", fileobj=compressor) as tar:
                             tar.add(src, arcname=os.path.basename(src))
             else:
-                dst = base + ".tar"
-                with tarfile.open(dst, mode="w") as tar:
+                # gzip fallback — always available in the standard library.
+                dst = base + ".tar.gz"
+                with tarfile.open(dst, mode="w:gz", compresslevel=GZIP_LEVEL) as tar:
                     tar.add(src, arcname=os.path.basename(src))
 
             if self.automatic_upload:
@@ -1053,8 +1139,11 @@ class WriteManager:
             (self._process_handle, "Process State"),
             (self._fs_snap_handle, "Filesystem Snapshot"),
             (self._pagefault_handle, "PageFault"),
+            (self._nw_conn_handle, "NetConn"),
+            (self._nw_sockopt_handle, "NetSockopt"),
+            (self._nw_drop_handle, "NetDrop"),
         ]
-        
+
         for handle, name in handles:
             if handle:
                 try:
@@ -1063,10 +1152,13 @@ class WriteManager:
                     # logger("info", f"Closed {name} file handle")
                 except Exception as e:
                     logger("error", f"Error closing {name} handle: {e}")
-        
+
         self._vfs_handle = None
         self._block_handle = None
         self._cache_handle = None
         self._process_handle = None
         self._fs_snap_handle = None
         self._pagefault_handle = None
+        self._nw_conn_handle = None
+        self._nw_sockopt_handle = None
+        self._nw_drop_handle = None

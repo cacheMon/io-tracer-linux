@@ -97,20 +97,30 @@ class ProcessSnapper:
                 ts = timestamp
                 pid = proc.info['pid']
                 name = proc.info['name'] or ''
-                working_set_size = proc.info['memory_info'].rss / 1024 
-                virtual_mem = proc.info['memory_info'].vms / 1024
-                cmdline = ' '.join(proc.info['cmdline'] or [])
+                # psutil sets an individual attr to None (not raising) when only
+                # that field is unreadable. Read each defensively so a single
+                # missing field yields an empty cell instead of dropping the whole
+                # process row (name/cmdline/status would otherwise be lost too).
+                mem = proc.info.get('memory_info')
+                working_set_size = mem.rss / 1024 if mem else ''
+                virtual_mem = mem.vms / 1024 if mem else ''
+                cmdline = ' '.join(proc.info.get('cmdline') or [])
                 if self.anonymous:
                     cmdline = simple_hash(cmdline, length=12)
-                create_time = float(proc.info['create_time'])
-                status = proc.info.get('status','')
+                raw_create_time = proc.info.get('create_time')
+                create_time = float(raw_create_time) if raw_create_time is not None else None
+                status = proc.info.get('status', '') or ''
 
+                if create_time is not None:
+                    cpu_5s = self.sampler.cpu_percent_for_interval(pid, create_time, 5.0) or 0.0
+                    cpu_2m = self.sampler.cpu_percent_for_interval(pid, create_time, 120.0) or 0.0
+                    cpu_1h = self.sampler.cpu_percent_for_interval(pid, create_time, 3600.0) or 0.0
+                    create_time_str = datetime.fromtimestamp(create_time)
+                else:
+                    cpu_5s = cpu_2m = cpu_1h = 0.0
+                    create_time_str = ''
 
-                cpu_5s = self.sampler.cpu_percent_for_interval(pid, create_time, 5.0) or 0.0
-                cpu_2m = self.sampler.cpu_percent_for_interval(pid, create_time, 120.0) or 0.0
-                cpu_1h = self.sampler.cpu_percent_for_interval(pid, create_time, 3600.0) or 0.0
-
-                out = format_csv_row(ts, pid, name, cmdline, virtual_mem, working_set_size, datetime.fromtimestamp(create_time), cpu_5s, cpu_2m, cpu_1h, status, snapshot_mono_ns)
+                out = format_csv_row(ts, pid, name, cmdline, virtual_mem, working_set_size, create_time_str, cpu_5s, cpu_2m, cpu_1h, status, snapshot_mono_ns)
                 
                 self.wm.append_process_log(out)
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess) as e:

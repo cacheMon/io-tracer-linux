@@ -19,8 +19,10 @@ Example:
 """
 
 import csv
+import gzip
 import io
 import itertools
+import shutil
 import sys
 import threading
 from pathlib import Path
@@ -135,6 +137,33 @@ def hash_rel_path(rel: Path, keep_ext: bool = True, length: int = 12) -> Path:
     
     return Path(*hashed_parts)
 
+def anonymize_path(path, keep_ext: bool = True, length: int = 12) -> str:
+    """Anonymize a filesystem path by hashing EVERY component.
+
+    Hashes the basename and all directory components, preserving only a leading
+    root separator ("/") and (optionally) file extensions. Unlike
+    ``hash_rel_path`` — which keeps the first two components in cleartext — this
+    never leaves a component unhashed, so bare basenames (e.g. ``"id_rsa"``) and
+    short relative paths (e.g. ``"proj/key.pem"``) are still fully anonymized.
+    Directory structure (depth) is preserved.
+
+    Example:
+        >>> anonymize_path("/home/alice/.ssh/id_rsa")
+        '/<h>/<h>/<h>/<h>'
+        >>> anonymize_path("id_rsa")
+        '<h>'
+    """
+    parts = list(Path(path).parts)
+    if not parts:
+        return path
+    out = []
+    for i, comp in enumerate(parts):
+        if i == 0 and comp == os.sep:
+            out.append(comp)  # keep the leading "/" so absolute stays absolute
+        else:
+            out.append(hash_component(comp, keep_ext=keep_ext, length=length))
+    return str(Path(*out))
+
 def simple_hash(content: str, length: int = 12) -> str:
     """
     Create a simple SHA-256 hash of a string.
@@ -195,9 +224,14 @@ def logger(error_scale: str, string: str, timestamp: bool = False):
 # speed/ratio tradeoff for streaming large trace logs.
 ZSTD_LEVEL = 3
 
+# gzip compression level used for the standard-library fallback when the
+# optional ``zstandard`` package is unavailable. 6 is gzip's default — a
+# reasonable speed/ratio tradeoff for streaming large trace logs.
+GZIP_LEVEL = 6
+
 
 # Set once we've reported a missing ``zstandard`` install, so the
-# uncompressed fallback is announced a single time rather than once per file
+# gzip fallback is announced a single time rather than once per file
 # across a whole trace run. Guarded by a lock because the writer's parallel
 # stream threads can reach this concurrently.
 _zstandard_missing_warned = False
@@ -227,9 +261,9 @@ def zstandard_available():
     Return the ``zstandard`` module if installed, otherwise ``None``.
 
     Unlike :func:`require_zstandard` this never raises, letting callers fall
-    back to leaving trace files uncompressed when the optional dependency is
-    missing. The first time it is found missing a single warning is logged so
-    the per-file fallback doesn't flood the logs across a trace run.
+    back to gzip (standard library) when the optional dependency is missing.
+    The first time it is found missing a single warning is logged so the
+    per-file fallback doesn't flood the logs across a trace run.
     """
     global _zstandard_missing_warned
     try:
@@ -244,48 +278,84 @@ def zstandard_available():
                 logger(
                     "warning",
                     "The 'zstandard' library is not installed; trace files will be "
-                    "kept uncompressed. Install it with 'pip install zstandard' "
-                    "(or 'pip install -r requirements.txt') to enable compression.",
+                    "compressed with gzip (.gz) instead. Install it with "
+                    "'pip install zstandard' (or 'pip install -r requirements.txt') "
+                    "for faster, smaller Zstandard (.zst) output.",
                 )
         return None
     return zstandard
 
 
-def compress_file_zstd(src: str, dst: str, level: int = ZSTD_LEVEL) -> bool:
+def compressed_suffix() -> str:
+    """Return the file extension of the active log-compression codec.
+
+    ``.zst`` when the optional ``zstandard`` library is available, otherwise
+    ``.gz`` for the gzip standard-library fallback.
     """
-    Stream-compress a file to Zstandard.
+    return ".zst" if zstandard_available() is not None else ".gz"
+
+
+def compress_file(src: str, level: int | None = None) -> str | None:
+    """
+    Stream-compress a file with the best available codec.
+
+    Prefers Zstandard (``<src>.zst``); when the optional ``zstandard`` library
+    is unavailable, falls back to gzip (``<src>.gz``) from the standard library
+    so trace files are still compressed rather than left raw. The source file
+    is left in place — callers remove it after the compressed output has been
+    handed off (e.g. queued for upload).
 
     Args:
         src: Path to the source file
-        dst: Path to write the compressed (.zst) output
-        level: Zstandard compression level
+        level: Compression level; defaults to the codec's tuned level
+            (:data:`ZSTD_LEVEL` for Zstandard, :data:`GZIP_LEVEL` for gzip).
 
     Returns:
-        ``True`` if the file was compressed to ``dst``. If the optional
-        ``zstandard`` library is unavailable nothing is written and ``False``
-        is returned, so callers can fall back to the uncompressed source.
+        Path to the compressed output, or ``None`` if compression failed (so
+        callers can fall back to the uncompressed source).
     """
     zstandard = zstandard_available()
-    if zstandard is None:
-        return False
-    cctx = zstandard.ZstdCompressor(level=level)
-    with open(src, "rb") as f_in, open(dst, "wb") as f_out:
-        cctx.copy_stream(f_in, f_out)
-    return True
+    if zstandard is not None:
+        dst = src + ".zst"
+    else:
+        # gzip fallback — always available in the standard library.
+        dst = src + ".gz"
+
+    try:
+        if zstandard is not None:
+            cctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL if level is None else level)
+            with open(src, "rb") as f_in, open(dst, "wb") as f_out:
+                cctx.copy_stream(f_in, f_out)
+        else:
+            with open(src, "rb") as f_in, gzip.open(
+                dst, "wb", compresslevel=GZIP_LEVEL if level is None else level
+            ) as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        return dst
+    except Exception as e:
+        # Don't leave a half-written archive behind, and signal failure so the
+        # caller keeps the uncompressed source rather than losing trace data.
+        logger("error", f"Failed to compress {src}: {e}")
+        try:
+            if os.path.exists(dst):
+                os.remove(dst)
+        except OSError:
+            pass
+        return None
 
 
 def compress_log(input_file: str):
     """
-    Compress a log file using Zstandard.
+    Compress a log file, preferring Zstandard and falling back to gzip.
 
-    Creates ``input_file.zst`` and removes the original when compression
-    succeeds. If ``zstandard`` is unavailable the original file is left in
-    place uncompressed.
+    Creates ``input_file.zst`` (or ``input_file.gz`` when ``zstandard`` is
+    unavailable) and removes the original once compression succeeds.
 
     Args:
         input_file: Path to the file to compress
     """
-    if compress_file_zstd(input_file, input_file + ".zst"):
+    out = compress_file(input_file)
+    if out is not None and out != input_file:
         os.remove(input_file)
 
 def capture_machine_id() -> str:
@@ -477,6 +547,142 @@ def format_csv_row(*fields) -> str:
     writer = csv.writer(output, lineterminator='')
     writer.writerow(fields)
     return output.getvalue()
+
+
+# Thresholds for auto-enabling the higher-overhead tracing subsystems based on
+# host resources. The page-cache and network probes add CPU and DRAM overhead,
+# so they are only switched on automatically when the machine has headroom to
+# spare. Tune these in one place rather than scattering magic numbers.
+AUTO_TRACE_MIN_LOGICAL_CORES = 8      # cores needed to absorb extra probe work
+AUTO_TRACE_MIN_TOTAL_RAM_GB = 15.0    # total DRAM for the larger event buffers
+AUTO_TRACE_MIN_AVAIL_RAM_GB = 2.0     # free DRAM headroom at start-of-trace
+AUTO_TRACE_MIN_NET_SPEED_MBPS = 10    # a link fast enough (>=10 Mbps) to be worth tracing
+
+
+def detect_host_resources() -> dict:
+    """
+    Sample the host's CPU, DRAM and network capacity.
+
+    Uses psutil (already a runtime dependency). Returns a dict with keys
+    ``logical_cores``, ``total_ram_gb``, ``available_ram_gb`` and
+    ``max_net_speed_mbps``. Any field that cannot be determined is reported as
+    0 so callers can treat it as "not enough" rather than crashing.
+
+    The network figure is the fastest reported speed among up, non-loopback
+    interfaces; interfaces that report an unknown speed (0) are ignored.
+    """
+    resources = {
+        "logical_cores": 0,
+        "total_ram_gb": 0.0,
+        "available_ram_gb": 0.0,
+        "max_net_speed_mbps": 0,
+    }
+    try:
+        import psutil
+
+        # psutil can return None in some virtualized/containerized environments;
+        # fall back to the stdlib count before giving up.
+        resources["logical_cores"] = psutil.cpu_count(logical=True) or os.cpu_count() or 0
+
+        mem = psutil.virtual_memory()
+        resources["total_ram_gb"] = mem.total / (1024 ** 3)
+        resources["available_ram_gb"] = mem.available / (1024 ** 3)
+
+        speeds = [
+            stats.speed
+            for name, stats in psutil.net_if_stats().items()
+            if stats.isup and name != "lo" and stats.speed and stats.speed > 0
+        ]
+        resources["max_net_speed_mbps"] = max(speeds) if speeds else 0
+    except Exception:
+        # Leave the conservative zero defaults in place; the evaluator will
+        # then decline to auto-enable anything.
+        pass
+    return resources
+
+
+def evaluate_resource_tracing(
+    logical_cores: int,
+    total_ram_gb: float,
+    available_ram_gb: float,
+    max_net_speed_mbps: int,
+) -> dict:
+    """
+    Decide whether cache/network tracing is advisable for the given resources.
+
+    Pure function (no I/O) so it is easy to unit test. Page-cache tracing is
+    gated on CPU and DRAM; network tracing additionally requires a fast enough
+    link to be worthwhile. Returns a dict with boolean ``enable_cache`` /
+    ``enable_network`` plus the individual ``cpu_ok`` / ``ram_ok`` / ``net_ok``
+    checks for logging.
+    """
+    cpu_ok = (logical_cores or 0) >= AUTO_TRACE_MIN_LOGICAL_CORES
+    ram_ok = (
+        (total_ram_gb or 0) >= AUTO_TRACE_MIN_TOTAL_RAM_GB
+        and (available_ram_gb or 0) >= AUTO_TRACE_MIN_AVAIL_RAM_GB
+    )
+    net_ok = (max_net_speed_mbps or 0) >= AUTO_TRACE_MIN_NET_SPEED_MBPS
+    return {
+        "cpu_ok": cpu_ok,
+        "ram_ok": ram_ok,
+        "net_ok": net_ok,
+        "enable_cache": cpu_ok and ram_ok,
+        "enable_network": cpu_ok and ram_ok and net_ok,
+    }
+
+
+def auto_select_tracing(
+    trace_cache: bool, trace_network: bool, verbose: bool = False
+) -> tuple[bool, bool]:
+    """
+    Auto-enable cache/network tracing when the host has spare resources.
+
+    Explicit opt-ins are always honored: a flag already set to True is never
+    turned back off. A feature is only flipped on when the host clears the
+    resource thresholds (see ``evaluate_resource_tracing``).
+
+    Args:
+        trace_cache: whether page-cache tracing was explicitly requested
+        trace_network: whether network tracing was explicitly requested
+        verbose: when True, log the detected resources and the decision
+
+    Returns:
+        (trace_cache, trace_network) after applying the auto policy.
+    """
+    resources = detect_host_resources()
+    decision = evaluate_resource_tracing(
+        resources["logical_cores"],
+        resources["total_ram_gb"],
+        resources["available_ram_gb"],
+        resources["max_net_speed_mbps"],
+    )
+
+    auto_cache = trace_cache or decision["enable_cache"]
+    auto_network = trace_network or decision["enable_network"]
+
+    if verbose:
+        logger(
+            "info",
+            "Host resources: "
+            f"{resources['logical_cores']} logical cores, "
+            f"{resources['total_ram_gb']:.1f} GB RAM total / "
+            f"{resources['available_ram_gb']:.1f} GB available, "
+            f"{resources['max_net_speed_mbps']} Mbps fastest link "
+            f"(thresholds: >={AUTO_TRACE_MIN_LOGICAL_CORES} cores, "
+            f">={AUTO_TRACE_MIN_TOTAL_RAM_GB:.0f} GB total / "
+            f">={AUTO_TRACE_MIN_AVAIL_RAM_GB:.0f} GB free, "
+            f">={AUTO_TRACE_MIN_NET_SPEED_MBPS} Mbps).",
+        )
+        if auto_cache and not trace_cache:
+            logger("info", "Auto-enabled page-cache tracing (host has enough CPU and DRAM).")
+        if auto_network and not trace_network:
+            logger("info", "Auto-enabled network tracing (host has enough CPU, DRAM and network).")
+        if not auto_cache:
+            logger("info", "Page-cache tracing left off (insufficient CPU/DRAM headroom).")
+        if not auto_network:
+            logger("info", "Network tracing left off (insufficient CPU/DRAM/network headroom).")
+
+    return auto_cache, auto_network
 
 
 if __name__ == "__main__":

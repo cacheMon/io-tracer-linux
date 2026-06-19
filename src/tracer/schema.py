@@ -15,6 +15,7 @@ Bump ``SCHEMA_VERSION`` whenever a stream's columns change; consumers should rea
 it from ``manifest.json`` and adapt.
 """
 
+# Historical format evolution (for reference only — see the note below):
 # v1: original headerless CSVs, no manifest, per-stream clocks.
 # v2: CSV headers + manifest.json + a common ``mono_ns`` column on every stream.
 # v3: cross-OS aligned layout for ``fs`` and ``ds`` — a fixed shared column
@@ -22,7 +23,11 @@ it from ``manifest.json`` and adapt.
 #     Linux-only extras, lowercase canonical operation names, ``size_requested``
 #     renamed to ``size``, and a dedicated block ``flags`` column (rwbs sub-flags
 #     split out of ``operation``).
-SCHEMA_VERSION = 3
+# Schema version stamped into manifest.json. Reset to 1 by request; the column
+# layout remains the cross-OS aligned fs/ds format described below.
+# NOTE: this overrides the historical v1–v3 numbering above — the on-disk format
+# is the aligned layout (what the changelog calls v3), not the original v1 format.
+SCHEMA_VERSION = 1
 
 
 def _col(name, ctype, unit="", desc=""):
@@ -71,7 +76,7 @@ STREAMS = {
             _col("device", "string", "", "Backing device major:minor for READ/WRITE/OPEN (Windows: empty)."),
             _col("flags", "string", "", "Operation-specific flags; empty when none."),
             # --- Linux-only extras (columns 13+) --- #
-            _col("duration_ns", "u64", "nanoseconds", "READ/WRITE entry->return duration; empty otherwise."),
+            _col("duration_ns", "u64", "nanoseconds", "READ/WRITE/SENDFILE/FSYNC/FDATASYNC entry->return duration; empty otherwise."),
             _col("return_value", "s64", "", "Raw READ/WRITE return (bytes or -errno); empty otherwise."),
             _col("errno", "string", "", "Error name when READ/WRITE failed; empty otherwise."),
             _col("mmap_prot", "string", "", "MMAP PROT_* flags; empty for non-MMAP."),
@@ -142,6 +147,67 @@ STREAMS = {
             _col("device_id", "u32"),
         ],
     ),
+    "nw_conn": _stream(
+        "nw_conn", "nw_conn",
+        "Network connection-lifecycle events (socket/bind/listen/accept/connect/"
+        "shutdown/close). Low-overhead subset; per-packet send/recv is not traced.",
+        "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
+        [
+            _col("timestamp", "datetime"),
+            _col("event_type", "string", "", "Lifecycle event (SOCKET, BIND, LISTEN, ACCEPT, CONNECT, SHUTDOWN, CLOSE)."),
+            _col("pid", "u32"),
+            _col("tid", "u32"),
+            _col("command", "string"),
+            _col("domain", "string", "", "Address family (AF_INET, AF_INET6, ...)."),
+            _col("sock_type", "string", "", "Socket type (SOCK_STREAM, SOCK_DGRAM, ...)."),
+            _col("ipver", "string", "", "IP version (4 or 6); empty if unknown."),
+            _col("local_addr", "string", "", "Local IP address; empty if unavailable."),
+            _col("remote_addr", "string", "", "Remote IP address; empty if unavailable."),
+            _col("sport", "u16", "", "Local (source) port; empty if 0."),
+            _col("dport", "u16", "", "Remote (destination) port; empty if 0."),
+            _col("fd", "u32", "", "Socket file descriptor; empty if 0."),
+            _col("backlog", "u32", "", "listen() backlog; empty otherwise."),
+            _col("shutdown_how", "string", "", "shutdown() how (SHUT_RD/WR/RDWR); empty otherwise."),
+            _col("latency_ns", "u64", "nanoseconds", "Syscall entry->exit latency for accept/connect; empty otherwise."),
+            _col("return_value", "s32", "", "Syscall return value."),
+        ],
+    ),
+    "nw_sockopt": _stream(
+        "nw_sockopt", "nw_sockopt",
+        "Socket option events (setsockopt/getsockopt for SOL_SOCKET and IPPROTO_TCP).",
+        "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
+        [
+            _col("timestamp", "datetime"),
+            _col("event_type", "string", "", "SET or GET."),
+            _col("pid", "u32"),
+            _col("command", "string"),
+            _col("fd", "u32", "", "Socket file descriptor."),
+            _col("level", "string", "", "Option level (SOL_SOCKET, IPPROTO_TCP, ...)."),
+            _col("option_name", "string", "", "Option name (SO_REUSEADDR, TCP_NODELAY, ...)."),
+            _col("optval", "s64", "", "Integer option value (setsockopt only)."),
+            _col("return_value", "s32", "", "Syscall return value."),
+        ],
+    ),
+    "nw_drop": _stream(
+        "nw_drop", "nw_drop",
+        "Network drop/retransmit events (kfree_skb packet drops, tcp_retransmit_skb).",
+        "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
+        [
+            _col("timestamp", "datetime"),
+            _col("event_type", "string", "", "PACKET_DROP or RETRANSMIT."),
+            _col("pid", "u32"),
+            _col("command", "string"),
+            _col("proto", "string", "", "L4 protocol (TCP, UDP, ...); empty if unknown."),
+            _col("ipver", "string", "", "IP version (4 or 6); empty if unknown."),
+            _col("src_addr", "string", "", "Source IP address; empty if unavailable."),
+            _col("dst_addr", "string", "", "Destination IP address; empty if unavailable."),
+            _col("sport", "u16", "", "Source port; empty if 0."),
+            _col("dport", "u16", "", "Destination port; empty if 0."),
+            _col("skb_len", "u32", "bytes", "Packet length (kfree_skb only)."),
+            _col("drop_reason", "u32", "", "Kernel drop reason code (5.17+); 0 otherwise."),
+            _col("tcp_state", "string", "", "TCP state for retransmit events; empty otherwise."),
+        ],
+    ),
     "process": _stream(
         "process", "process",
         "Periodic process-state snapshots (userspace, from /proc via psutil).",
@@ -168,7 +234,7 @@ STREAMS = {
             _col("snapshot_timestamp", "datetime", "", "Time the snapshot was taken."),
             _col("file_path", "string", "", "Full path (hashed in anonymous mode)."),
             _col("size", "integer", "bytes"),
-            _col("creation_time", "datetime", "", "st_birthtime (falls back to st_mtime)."),
+            _col("creation_time", "datetime", "", "Birth time via statx STATX_BTIME (falls back to st_mtime when unavailable)."),
             _col("modification_time", "datetime", "", "st_mtime."),
             _col("access_time", "datetime", "", "st_atime."),
         ],

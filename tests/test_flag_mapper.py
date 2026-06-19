@@ -76,5 +76,36 @@ class OpTypeTests(unittest.TestCase):
         self.assertEqual(m.op_fs_types.get(1), "READ")
 
 
+class NetworkFlagTests(unittest.TestCase):
+    """Decoding helpers for the opt-in low-overhead network subset."""
+
+    def test_conn_event(self):
+        self.assertEqual(FlagMapper.format_conn_event(0), "SOCKET_CREATE")
+        self.assertEqual(FlagMapper.format_conn_event(4), "CONNECT")
+        self.assertEqual(FlagMapper.format_conn_event(99), "CONN(99)")
+
+    def test_proto_and_domain(self):
+        self.assertEqual(FlagMapper.format_proto(6), "TCP")
+        self.assertEqual(FlagMapper.format_proto(17), "UDP")
+        self.assertEqual(FlagMapper.format_proto(255), "PROTO(255)")
+        self.assertEqual(FlagMapper.format_domain(2), "AF_INET")
+        self.assertEqual(FlagMapper.format_domain(10), "AF_INET6")
+
+    def test_sock_type_and_shutdown(self):
+        self.assertEqual(FlagMapper.format_sock_type(1), "SOCK_STREAM")
+        self.assertEqual(FlagMapper.format_shutdown_how(2), "SHUT_RDWR")
+
+    def test_sockopt(self):
+        self.assertEqual(FlagMapper.format_sockopt(1, 2), "SO_REUSEADDR")
+        self.assertEqual(FlagMapper.format_sockopt(6, 1), "TCP_NODELAY")
+        self.assertEqual(FlagMapper.format_sockopt(6, 999), "OPT(6,999)")
+        self.assertEqual(FlagMapper.format_sockopt_event(0), "SET")
+
+    def test_drop_and_tcp_state(self):
+        self.assertEqual(FlagMapper.format_drop_event(0), "PACKET_DROP")
+        self.assertEqual(FlagMapper.format_drop_event(1), "TCP_RETRANSMIT")
+        self.assertEqual(FlagMapper.format_tcp_state(1), "ESTABLISHED")
+
+
 if __name__ == "__main__":
     unittest.main()

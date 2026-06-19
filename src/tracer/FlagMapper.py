@@ -799,3 +799,143 @@ class FlagMapper:
         if not magic:
             return ""
         return cls.fs_type_map.get(int(magic), f"FS(0x{int(magic):x})")
+
+    # ========================================================================
+    # NETWORK FLAG MAPS (low-overhead subset: connection lifecycle, socket
+    # options, drops). The per-packet send/recv path is not traced, so its
+    # direction/MSG_* maps are intentionally omitted.
+    # ========================================================================
+
+    network_proto_map = {
+        0: "HOPOPT", 1: "ICMP", 2: "IGMP", 6: "TCP", 17: "UDP",
+        41: "IPv6", 47: "GRE", 50: "ESP", 51: "AH", 58: "ICMPv6",
+        89: "OSPF", 103: "PIM", 132: "SCTP", 136: "UDPLite",
+    }
+
+    socket_domain_map = {
+        1: "AF_UNIX",
+        2: "AF_INET",
+        10: "AF_INET6",
+        16: "AF_NETLINK",
+        17: "AF_PACKET",
+    }
+
+    socket_type_map = {
+        1: "SOCK_STREAM",
+        2: "SOCK_DGRAM",
+        3: "SOCK_RAW",
+        5: "SOCK_SEQPACKET",
+    }
+
+    sockopt_level_map = {
+        1: "SOL_SOCKET",
+        6: "IPPROTO_TCP",
+    }
+
+    sockopt_map = {
+        # SOL_SOCKET level
+        (1, 7):  "SO_SNDBUF",
+        (1, 8):  "SO_RCVBUF",
+        (1, 2):  "SO_REUSEADDR",
+        (1, 15): "SO_REUSEPORT",
+        (1, 9):  "SO_KEEPALIVE",
+        (1, 5):  "SO_DONTROUTE",
+        (1, 6):  "SO_BROADCAST",
+        (1, 13): "SO_LINGER",
+        (1, 20): "SO_RCVTIMEO",
+        (1, 21): "SO_SNDTIMEO",
+        # IPPROTO_TCP level
+        (6, 1):  "TCP_NODELAY",
+        (6, 4):  "TCP_KEEPIDLE",
+        (6, 5):  "TCP_KEEPINTVL",
+        (6, 6):  "TCP_KEEPCNT",
+        (6, 12): "TCP_QUICKACK",
+        (6, 23): "TCP_DEFER_ACCEPT",
+        (6, 13): "TCP_CONGESTION",
+    }
+
+    shutdown_how_map = {
+        0: "SHUT_RD",
+        1: "SHUT_WR",
+        2: "SHUT_RDWR",
+    }
+
+    conn_event_type_map = {
+        0: "SOCKET_CREATE",
+        1: "BIND",
+        2: "LISTEN",
+        3: "ACCEPT",
+        4: "CONNECT",
+        5: "SHUTDOWN",
+        6: "CLOSE",
+    }
+
+    sockopt_event_type_map = {
+        0: "SET",
+        1: "GET",
+    }
+
+    drop_event_type_map = {
+        0: "PACKET_DROP",
+        1: "TCP_RETRANSMIT",
+    }
+
+    tcp_state_map = {
+        1: "ESTABLISHED",
+        2: "SYN_SENT",
+        3: "SYN_RECV",
+        4: "FIN_WAIT1",
+        5: "FIN_WAIT2",
+        6: "TIME_WAIT",
+        7: "CLOSE",
+        8: "CLOSE_WAIT",
+        9: "LAST_ACK",
+        10: "LISTEN",
+        11: "CLOSING",
+        12: "NEW_SYN_RECV",
+    }
+
+    @classmethod
+    def format_proto(cls, proto_num):
+        """Map protocol number to name."""
+        return cls.network_proto_map.get(proto_num, f"PROTO({proto_num})")
+
+    @classmethod
+    def format_domain(cls, domain):
+        """Map socket domain to name."""
+        return cls.socket_domain_map.get(domain, f"AF({domain})")
+
+    @classmethod
+    def format_sock_type(cls, stype):
+        """Map socket type to name."""
+        return cls.socket_type_map.get(stype, f"TYPE({stype})")
+
+    @classmethod
+    def format_sockopt(cls, level, optname):
+        """Map (level, optname) to option name string."""
+        return cls.sockopt_map.get((level, optname), f"OPT({level},{optname})")
+
+    @classmethod
+    def format_conn_event(cls, event_type):
+        """Map connection event type to name."""
+        return cls.conn_event_type_map.get(event_type, f"CONN({event_type})")
+
+    @classmethod
+    def format_sockopt_event(cls, event_type):
+        """Map sockopt event type to name."""
+        return cls.sockopt_event_type_map.get(event_type, f"SOCKOPT({event_type})")
+
+    @classmethod
+    def format_drop_event(cls, event_type):
+        """Map drop event type to name."""
+        return cls.drop_event_type_map.get(event_type, f"DROP({event_type})")
+
+    @classmethod
+    def format_tcp_state(cls, state):
+        """Map TCP state number to name."""
+        return cls.tcp_state_map.get(state, f"STATE({state})")
+
+    @classmethod
+    def format_shutdown_how(cls, how):
+        """Map shutdown 'how' to name."""
+        return cls.shutdown_how_map.get(how, f"HOW({how})")

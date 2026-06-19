@@ -4,6 +4,46 @@
 
 The filesystem snapshot feature now supports splitting large filesystem scans into multiple compressed parts to optimize memory usage.
 
+## Delta Snapshots
+
+To avoid re-uploading the entire filesystem inventory on every hourly pass, the
+snapper is **delta-based after the first run**:
+
+- The **first** snapshot of a session is a *full* inventory of every file.
+- **Every subsequent** snapshot is a *delta*: a file is recorded only if it was
+  **added** or **modified** (its size, `mtime`, or `ctime` changed) since the
+  previous completed snapshot. Access time (`atime`) is intentionally excluded
+  from the change check because it changes on every read.
+- A file that **disappeared** since the previous snapshot is recorded as a
+  *tombstone* row whose `size` is `-1` (`FilesystemSnapper.DELETED_SIZE`),
+  letting consumers distinguish removals from added/modified files (which always
+  carry a real, non-negative byte count).
+- A delta with **no changes** produces no rows, so nothing is flushed or
+  uploaded for that pass.
+
+### Baseline tracking
+
+The snapper keeps the most recent *completed* full scan in memory as the
+baseline for the next delta. An interrupted scan never advances the baseline,
+so after an interruption the next completed pass is diffed against the last
+good snapshot (and the first ever snapshot is always full).
+
+### Transient errors vs. real deletions
+
+Deletion detection distinguishes "the path is gone" from "we couldn't read it
+this pass". A file or directory that fails to `stat()`/`scandir()` with a
+*transient* error (e.g. `PermissionError`, an I/O error) has its previous state
+carried forward, so it is **not** falsely tombstoned. Only paths that are
+genuinely absent — `FileNotFoundError`/`NotADirectoryError`, or a path missing
+from a directory that *was* fully scanned — become tombstones. Removing an
+entire directory therefore still tombstones every file under it.
+
+### Reconstructing state from deltas
+
+To reconstruct the filesystem state at snapshot *k*: start from the full
+inventory (snapshot 0) and apply each delta `1..k` in order — added/modified
+rows overwrite the entry for that path, tombstone rows (`size == -1`) remove it.
+
 ## How It Works
 
 ### File Naming Convention
@@ -43,7 +83,7 @@ filesystem_snapshot_part0003_20260214_120000_ABC123DEF456_complete_parts3.csv.zs
 
 ## Compression
 
-Files are compressed using **Zstandard** (`.zst`) for reliable and efficient compression.
+Files are compressed using **Zstandard** (`.zst`) for reliable and efficient compression. When the optional `zstandard` library is unavailable, the tracer falls back to **gzip** (`.gz`) from the Python standard library so snapshot parts are still compressed.
 
 ## Implementation Details
 
@@ -68,9 +108,9 @@ The `filesystem_snapshot()` method now calls `mark_fs_snapshot_complete()` after
 
 ### Utils Changes
 
-Uses the existing `compress_file_zstd()` helper that:
-- Compresses files using Zstandard
-- Removes the original uncompressed file after compression
+Uses the `compress_file()` helper that:
+- Compresses files using Zstandard, falling back to gzip (`.gz`) when `zstandard` is unavailable
+- Returns the compressed output path so the caller can remove the original uncompressed file
 
 ## Buffer Flushing
 

@@ -46,6 +46,13 @@ def _zstd_read_text(path):
         return reader.read().decode()
 
 
+def _gz_read_text(path):
+    """Decompress a .gz file to text for round-trip assertions."""
+    import gzip
+    with gzip.open(path, "rb") as f:
+        return f.read().decode()
+
+
 from src.tracer.WriterManager import WriteManager
 
 
@@ -144,9 +151,9 @@ class PerFileUploadTests(unittest.TestCase):
 
 class ZstandardMissingFallbackTests(unittest.TestCase):
     """When the optional ``zstandard`` library is unavailable, the tracer must
-    keep (and upload) trace files uncompressed rather than losing data. These
-    tests force the missing-dependency path so they run regardless of whether
-    ``zstandard`` happens to be installed.
+    fall back to gzip (.gz / .tar.gz) — using the standard library — rather than
+    leaving trace files uncompressed. These tests force the missing-dependency
+    path so they run regardless of whether ``zstandard`` happens to be installed.
     """
 
     def setUp(self):
@@ -184,25 +191,29 @@ class ZstandardMissingFallbackTests(unittest.TestCase):
             f.write(text)
         return path
 
-    def test_compress_log_uploads_uncompressed_when_zstd_missing(self):
+    def test_compress_log_uploads_gzip_when_zstd_missing(self):
         src = self._make_log("process", "process_x.csv", "a,b,c\n1,2,3\n")
         self.wm.compress_log(src)
 
-        # The uncompressed .csv is uploaded and left on disk; no .zst created.
-        self.assertEqual(self.upload.uploaded, [src])
-        self.assertTrue(os.path.exists(src))
+        # The gzip-compressed .gz is uploaded; the original .csv is removed and
+        # no .zst is created.
+        gz = src + ".gz"
+        self.assertEqual(self.upload.uploaded, [gz])
+        self.assertTrue(os.path.exists(gz))
+        self.assertFalse(os.path.exists(src))
         self.assertFalse(os.path.exists(src + ".zst"))
-        with open(src) as f:
-            self.assertEqual(f.read(), "a,b,c\n1,2,3\n")
+        # Content round-trips through gzip.
+        self.assertEqual(_gz_read_text(gz), "a,b,c\n1,2,3\n")
 
-    def test_compress_dir_falls_back_to_plain_tar(self):
+    def test_compress_dir_falls_back_to_tar_gz(self):
         self.wm.automatic_upload = False
         self._make_log("process", "process_x.csv", "row\n")
         self.wm.compress_dir(self.output_dir)
 
-        # A plain .tar bundle is produced instead of .tar.zst.
-        self.assertTrue(os.path.exists(self.output_dir.rstrip("/") + ".tar"))
+        # A gzip-compressed .tar.gz bundle is produced instead of .tar.zst.
+        self.assertTrue(os.path.exists(self.output_dir.rstrip("/") + ".tar.gz"))
         self.assertFalse(os.path.exists(self.output_dir.rstrip("/") + ".tar.zst"))
+        self.assertFalse(os.path.exists(self.output_dir.rstrip("/") + ".tar"))
 
 
 class StaleLogRotationTests(unittest.TestCase):
@@ -343,6 +354,68 @@ class MultiPartSnapshotHeaderTests(unittest.TestCase):
         # Part 2 must NOT repeat the header; concatenation would corrupt the CSV.
         self.assertNotIn(header, second)
         self.assertEqual(second[0], "rowB,2")
+
+
+class NetworkStreamCompressionTests(unittest.TestCase):
+    """Network streams (nw_conn/nw_sockopt/nw_drop) must be compressed
+    and uploaded exactly like every other trace stream — both at shutdown
+    (force_flush) and on mid-trace rotation."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.output_dir = os.path.join(self.tmp, "trace")
+        self.upload = FakeUploadManager()
+        self.wm = SilentWriteManager(
+            output_dir=self.output_dir,
+            upload_manager=self.upload,
+            automatic_upload=True,
+        )
+
+    def tearDown(self):
+        import shutil
+        try:
+            self.wm.close_handles()
+        except Exception:
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_all_network_streams_registered_for_rotation(self):
+        # Every network stream must be in the generic rotation registry so a
+        # slow stream is compressed+uploaded mid-trace, not just at shutdown.
+        for key in ("nw_conn", "nw_sockopt", "nw_drop"):
+            self.assertIn(key, self.wm._streams, key)
+
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
+    def test_force_flush_compresses_network_streams(self):
+        self.wm.append_conn_log("ts,CONNECT,1,1,proc,AF_INET")
+        self.wm.append_sockopt_log("ts,SET,1,proc,3")
+        self.wm.append_drop_log("ts,PACKET_DROP,1,proc,TCP")
+
+        self.wm.force_flush()
+
+        # Each stream produced exactly one compressed upload under its own subdir.
+        self.assertEqual(len(self.upload.uploaded), 3)
+        subdirs = {os.path.basename(os.path.dirname(p)) for p in self.upload.uploaded}
+        for sub in ("nw_conn", "nw_sockopt", "nw_drop"):
+            self.assertIn(sub, subdirs, sub)
+        for p in self.upload.uploaded:
+            self.assertTrue(p.endswith(".csv.zst"), p)
+            self.assertTrue(os.path.exists(p))
+
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
+    def test_network_threshold_rotation_compresses(self):
+        # Dropping the threshold forces a mid-trace rotation, which must
+        # compress+upload the rotated file just like the continuous streams.
+        self.wm.nw_conn_max_events = 3
+        for i in range(7):
+            self.wm.append_conn_log(f"row{i}")
+
+        # 7 events at a threshold of 3 → 2 full rotations (2 uploads), with 1
+        # event left buffered (force_flush is not called here).
+        self.assertEqual(len(self.upload.uploaded), 2)
+        for p in self.upload.uploaded:
+            self.assertTrue(p.endswith(".csv.zst"), p)
+            self.assertEqual(os.path.basename(os.path.dirname(p)), "nw_conn")
 
 
 if __name__ == "__main__":

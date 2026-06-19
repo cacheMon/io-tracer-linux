@@ -18,12 +18,19 @@ Traces are stored in object storage with the following prefix structure:
 linux_trace_v4_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── fs/                    # VFS traces (also receives mirrored io_uring I/O)
 ├── ds/                    # Block device traces
-├── cache/                 # Page cache events
+├── cache/                 # Page cache events (opt-in: --cache)
 ├── pagefault/             # Page fault events
+├── nw_conn/               # Network connection lifecycle (opt-in: --network)
+├── nw_sockopt/            # Network socket-option events (opt-in: --network)
+├── nw_drop/               # Network drops/retransmits (opt-in: --network)
 ├── process/               # Process state snapshots
 ├── filesystem_snapshot/   # Filesystem metadata snapshots
 └── system_spec/           # System specification files
 ```
+
+Page-cache and network streams are **off by default** (enable with `--cache` /
+`--network`); when disabled their probes are never attached, so their
+directories stay empty.
 
 A self-describing `manifest.json` (schema version, per-stream columns, and clock
 diagnostics) is written at the session root and delivered inside the session archive.

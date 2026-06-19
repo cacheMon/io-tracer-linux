@@ -22,16 +22,17 @@ import os
 import ctypes
 import json
 import platform
+import socket
+import struct
 from bcc import BPF
 import time
 import sys
 from bisect import bisect_right
-from pathlib import Path
 from datetime import datetime
 
 from . import schema
 from .ObjectStorageManager import ObjectStorageManager
-from ..utility.utils import capture_machine_id, format_csv_row, logger, hash_filename_in_path, simple_hash, run_with_spinner
+from ..utility.utils import capture_machine_id, format_csv_row, logger, anonymize_path, inet6_from_event, simple_hash, run_with_spinner
 from .WriterManager import WriteManager
 from .FlagMapper import FlagMapper
 from .KernelProbeTracker import KernelProbeTracker
@@ -40,6 +41,16 @@ from .PathResolver import PathResolver
 from .snappers.FilesystemSnapper import FilesystemSnapper
 from .snappers.ProcessSnapper import ProcessSnapper
 from .snappers.SystemSnapper import SystemSnapper
+
+
+# VFS ops that never carry an I/O size; their `size` column is left empty per the
+# schema ("empty for non-I/O ops"). Every other op keeps its numeric size,
+# including a legitimate 0 (e.g. an EOF read or 0-byte write).
+_NON_IO_SIZE_OPS = frozenset({
+    "OPEN", "CLOSE", "GETATTR", "SETATTR", "CHDIR", "READDIR", "UNLINK",
+    "SYNC", "RENAME", "MKDIR", "RMDIR", "LINK", "SYMLINK",
+    "PROCESS_EXEC", "PROCESS_EXIT",
+})
 
 
 class IOTracer:
@@ -77,6 +88,8 @@ class IOTracer:
             duration:           int | None = None,
             cache_sample_rate:  int = 1,
             trace_bucket:       str | None = None,
+            trace_cache:        bool = False,
+            trace_network:      bool = False,
         ):
         """
         Initialize the IOTracer.
@@ -93,7 +106,12 @@ class IOTracer:
             verbose: Enable verbose output (default: False)
             duration: Trace duration in seconds (default: None for indefinite)
             cache_sample_rate: Sample rate for cache events (default: 1 = no sampling)
-            
+            trace_cache: Attach page-cache probes and stream cache events
+                (default: False — off to keep overhead minimal)
+            trace_network: Compile/attach the low-overhead network probe subset
+                (connection lifecycle, sockopt, drops) and stream their
+                events (default: False — off to keep overhead minimal)
+
         Raises:
             SystemExit: If page count or duration is invalid
             SystemExit: If BPF initialization fails
@@ -142,6 +160,8 @@ class IOTracer:
         self.duration           = duration
         self.anonymous          = anonymous
         self.is_uncompressed    = is_uncompressed
+        self.trace_cache        = trace_cache
+        self.trace_network      = trace_network
         self.path_resolver      = PathResolver()
         self.mmap_regions       = {}
         self.cmdline_cache      = {}  # pid -> cmdline, populated on first successful read
@@ -195,8 +215,13 @@ class IOTracer:
                     with open(tp_format, "r") as f:
                         if "cmd_flags" in f.read():
                             cflags.append("-DHAS_CMD_FLAGS")
+                # Compile the network probe subset only when requested. The
+                # connection/sockopt/drop probes auto-attach when compiled,
+                # so gating at compile time keeps overhead at zero when off.
+                if self.trace_network:
+                    cflags.append("-DENABLE_NETWORK")
                 self.b = BPF(src_file=bpf_file.encode(), cflags=cflags)
-                self.probe_tracker = KernelProbeTracker(self.b, developer_mode)
+                self.probe_tracker = KernelProbeTracker(self.b, developer_mode, trace_cache=self.trace_cache)
 
             run_with_spinner("Loading BPF program", _init_bpf)
         except Exception as e:
@@ -256,7 +281,7 @@ class IOTracer:
         try:
             filename = event.filename.decode()
             if self.anonymous:
-                filename = hash_filename_in_path(Path(filename))
+                filename = anonymize_path(filename)
             if op_name in ['MKDIR', 'RMDIR', 'CHDIR', 'READDIR'] and filename and not filename.endswith('/'):
                 filename += '/'
         except UnicodeDecodeError:
@@ -274,7 +299,11 @@ class IOTracer:
 
         inode_val = event.inode if event.inode != 0 else ""
         
-        size_val = event.size if event.size is not None else 0
+        # Empty only for non-I/O ops (schema: "empty for non-I/O ops"); I/O ops
+        # keep their numeric size INCLUDING a legitimate 0 (EOF read, 0-byte
+        # write, 0-range fsync). Gating on op type — not truthiness — avoids
+        # blanking real 0-byte I/O.
+        size_val = "" if op_name in _NON_IO_SIZE_OPS else event.size
         address_val = ""
         raw_address = event.address if hasattr(event, 'address') else 0
         if raw_address:
@@ -338,9 +367,9 @@ class IOTracer:
 
         if raw_address:
             if op_name == "MMAP":
-                self._track_mmap_region(event.pid, raw_address, size_val, filename)
+                self._track_mmap_region(event.pid, raw_address, event.size, filename)
             elif op_name == "MUNMAP":
-                resolved_filename = self._resolve_munmap_filename(event.pid, raw_address, size_val)
+                resolved_filename = self._resolve_munmap_filename(event.pid, raw_address, event.size)
                 if resolved_filename:
                     filename = resolved_filename
 
@@ -353,7 +382,7 @@ class IOTracer:
             old_addr_val = event.old_addr if hasattr(event, 'old_addr') else 0
             old_size_val = event.old_size if hasattr(event, 'old_size') else 0
             resolved_filename = self._handle_mremap(
-                event.pid, old_addr_val, old_size_val, raw_address, size_val
+                event.pid, old_addr_val, old_size_val, raw_address, event.size
             )
             if resolved_filename:
                 filename = resolved_filename
@@ -379,13 +408,17 @@ class IOTracer:
         errno_val = ""
         bytes_completed = ""
         duration_ns = ""
-        if op_name in ("READ", "WRITE"):
+        if op_name in ("READ", "WRITE", "SENDFILE"):
             ret = event.ret_val
             return_value = str(ret)
             if ret < 0:
                 errno_val = self.flag_mapper.format_errno(-ret)
             else:
                 bytes_completed = str(ret)
+            duration_ns = str(event.latency_ns) if event.latency_ns else ""
+        elif op_name in ("FSYNC", "FDATASYNC"):
+            # Durability latency: entry->return duration filled by the fsync
+            # kretprobe. No return value / byte count is captured for syncs.
             duration_ns = str(event.latency_ns) if event.latency_ns else ""
 
         # Provenance metadata — populated for READ/WRITE/OPEN.
@@ -680,8 +713,8 @@ class IOTracer:
             filename_old = event.filename_old.decode()
             filename_new = event.filename_new.decode()
             if self.anonymous:
-                filename_old = hash_filename_in_path(Path(filename_old))
-                filename_new = hash_filename_in_path(Path(filename_new))
+                filename_old = anonymize_path(filename_old)
+                filename_new = anonymize_path(filename_new)
         except UnicodeDecodeError:
             filename_old = ""
             filename_new = ""
@@ -769,7 +802,130 @@ class IOTracer:
 
         self.writer.append_cache_log(output)
 
-    def _print_event_block(self, cpu, data, size):        
+    def _print_event_conn(self, cpu, data, size):
+        """
+        Callback for connection-lifecycle events (low-overhead network subset).
+
+        Captures socket creation, bind, listen, accept, connect, shutdown, close.
+        """
+        e = self.b["net_conn_events"].event(data)
+        if e.pid == self._self_pid:
+            return
+        comm = e.comm.decode("utf-8", errors="replace").strip("\x00")
+        if self._should_filter_process(comm):
+            return
+
+        timestamp = self._ns_to_walltime(getattr(e, "ts_ns", 0))
+        event_type = FlagMapper.format_conn_event(e.event_type)
+        domain = FlagMapper.format_domain(e.domain) if e.domain else ""
+        sock_type = FlagMapper.format_sock_type(e.sock_type) if e.sock_type else ""
+        ipver = str(e.ipver) if e.ipver else ""
+
+        if e.ipver == 4:
+            # saddr_v4/daddr_v4 hold the raw network-order bytes from the kernel;
+            # ctypes already read them with native endianness, so pack back with
+            # native "I" (not "!I") to reproduce the original bytes for inet_ntop.
+            local_addr = socket.inet_ntop(socket.AF_INET, struct.pack("I", e.saddr_v4)) if e.saddr_v4 else ""
+            remote_addr = socket.inet_ntop(socket.AF_INET, struct.pack("I", e.daddr_v4)) if e.daddr_v4 else ""
+        elif e.ipver == 6:
+            local_addr = inet6_from_event(e.saddr_v6) if e.saddr_v6 else ""
+            remote_addr = inet6_from_event(e.daddr_v6) if e.daddr_v6 else ""
+        else:
+            local_addr = remote_addr = ""
+
+        output = format_csv_row(
+            timestamp,
+            event_type,
+            str(e.pid),
+            str(e.tid),
+            comm,
+            domain,
+            sock_type,
+            ipver,
+            local_addr,
+            remote_addr,
+            str(e.sport) if e.sport else "",
+            str(e.dport) if e.dport else "",
+            str(e.fd) if e.fd else "",
+            str(e.backlog) if e.backlog else "",
+            FlagMapper.format_shutdown_how(e.shutdown_how) if e.shutdown_how else "",
+            str(e.latency_ns) if e.latency_ns else "",
+            str(e.ret_val),
+            getattr(e, "ts_ns", 0),
+        )
+        self.writer.append_conn_log(output)
+
+    def _print_event_sockopt(self, cpu, data, size):
+        """
+        Callback for socket-option events (setsockopt/getsockopt).
+        """
+        e = self.b["net_sockopt_events"].event(data)
+        if e.pid == self._self_pid:
+            return
+        comm = e.comm.decode("utf-8", errors="replace").strip("\x00")
+        if self._should_filter_process(comm):
+            return
+
+        timestamp = self._ns_to_walltime(getattr(e, "ts_ns", 0))
+        output = format_csv_row(
+            timestamp,
+            FlagMapper.format_sockopt_event(e.event_type),
+            str(e.pid),
+            comm,
+            str(e.fd),
+            FlagMapper.sockopt_level_map.get(e.level, str(e.level)),
+            FlagMapper.format_sockopt(e.level, e.optname),
+            str(e.optval),
+            str(e.ret_val),
+            getattr(e, "ts_ns", 0),
+        )
+        self.writer.append_sockopt_log(output)
+
+    def _print_event_drop(self, cpu, data, size):
+        """
+        Callback for network drop/retransmission events.
+        """
+        e = self.b["net_drop_events"].event(data)
+        if e.pid == self._self_pid:
+            return
+        comm = e.comm.decode("utf-8", errors="replace").strip("\x00")
+        if self._should_filter_process(comm):
+            return
+
+        timestamp = self._ns_to_walltime(getattr(e, "ts_ns", 0))
+        proto = FlagMapper.format_proto(e.proto) if e.proto else ""
+        ipver = str(e.ipver) if e.ipver else ""
+
+        if e.ipver == 4:
+            # Native "I" pack (see _print_event_conn) reproduces the network-order
+            # bytes ctypes read from the kernel; "!I" would reverse them.
+            s_addr = socket.inet_ntop(socket.AF_INET, struct.pack("I", e.saddr_v4)) if e.saddr_v4 else ""
+            d_addr = socket.inet_ntop(socket.AF_INET, struct.pack("I", e.daddr_v4)) if e.daddr_v4 else ""
+        elif e.ipver == 6:
+            s_addr = inet6_from_event(e.saddr_v6) if e.saddr_v6 else ""
+            d_addr = inet6_from_event(e.daddr_v6) if e.daddr_v6 else ""
+        else:
+            s_addr = d_addr = ""
+
+        output = format_csv_row(
+            timestamp,
+            FlagMapper.format_drop_event(e.event_type),
+            str(e.pid),
+            comm,
+            proto,
+            ipver,
+            s_addr,
+            d_addr,
+            str(e.sport) if e.sport else "",
+            str(e.dport) if e.dport else "",
+            str(e.skb_len) if e.skb_len else "0",
+            str(e.drop_reason) if e.drop_reason else "0",
+            FlagMapper.format_tcp_state(e.state) if e.state else "",
+            getattr(e, "ts_ns", 0),
+        )
+        self.writer.append_drop_log(output)
+
+    def _print_event_block(self, cpu, data, size):
         """
         Callback for processing block device I/O events from the perf buffer.
         
@@ -922,7 +1078,7 @@ class IOTracer:
             if cached:
                 filename = cached
             if self.anonymous and filename:
-                filename = hash_filename_in_path(Path(filename))
+                filename = anonymize_path(filename)
 
         # Mirror completed file READ/WRITE into the main fs/VFS trace stream.
         self._mirror_io_uring_to_fs(e, comm, filename, ts, dev_val, fs_type_val)
@@ -1012,10 +1168,12 @@ class IOTracer:
         run_with_spinner("Flushing trace data", _flush)
 
     def _block_stats(self):
-        """Read the per-CPU ``block_stats`` map → {issued, completed, missed}.
+        """Read the per-CPU ``block_stats`` map → {issued, completed, missed, stale}.
 
         Returns an empty dict if the map is unavailable or all-zero. ``missed``
-        counts completions with no tracked issue ctx (LRU-evicted or pre-trace).
+        counts completions with no tracked issue ctx (LRU-evicted or pre-trace);
+        ``stale`` counts completions dropped because the matched issue ctx had an
+        implausible device latency ((dev, sector) key reused across a gap).
         """
         try:
             stats = self.b["block_stats"]
@@ -1023,6 +1181,7 @@ class IOTracer:
                 "issued":    int(sum(stats[ctypes.c_int(0)])),
                 "completed": int(sum(stats[ctypes.c_int(1)])),
                 "missed":    int(sum(stats[ctypes.c_int(2)])),
+                "stale":     int(sum(stats[ctypes.c_int(3)])),
             }
         except Exception:
             return {}
@@ -1038,12 +1197,14 @@ class IOTracer:
         s = self._block_stats()
         if not s:
             return
-        total_completions = s["completed"] + s["missed"]
+        stale = s.get("stale", 0)
+        total_completions = s["completed"] + s["missed"] + stale
         miss_pct = (s["missed"] / total_completions * 100) if total_completions else 0.0
         logger("info",
                f"Block diagnostics: {s['issued']} issued, {s['completed']} completed, "
                f"{s['missed']} completions without a tracked issue "
-               f"({miss_pct:.1f}% of completions). A high miss rate indicates the "
+               f"({miss_pct:.1f}% of completions), {stale} dropped as stale "
+               f"((dev,sector) key reuse). A high miss rate indicates the "
                f"issue map was evicted under load (dropped completions).")
 
     def _attached_probes(self):
@@ -1158,11 +1319,34 @@ class IOTracer:
             lost_cb=self._make_lost_cb("ds")
         )
 
-        # self.b["cache_events"].open_perf_buffer(
-        #     self._print_event_cache,
-        #     page_cnt=self.page_cnt,
-        #     lost_cb=self._make_lost_cb("cache")
-        # )
+        # Page-cache events are opt-in (--cache). The probes are only attached
+        # when enabled, so this buffer otherwise has no producer; opening it only
+        # when enabled avoids an idle reader.
+        if self.trace_cache:
+            self.b["cache_events"].open_perf_buffer(
+                self._print_event_cache,
+                page_cnt=self.page_cnt,
+                lost_cb=self._make_lost_cb("cache")
+            )
+
+        # Network events are opt-in (--network). The probes are compiled and the
+        # perf buffers only exist when -DENABLE_NETWORK was passed, so guard both
+        # the flag and the buffer lookup.
+        if self.trace_network:
+            for buf_name, callback, stream in (
+                ("net_conn_events", self._print_event_conn, "nw_conn"),
+                ("net_sockopt_events", self._print_event_sockopt, "nw_sockopt"),
+                ("net_drop_events", self._print_event_drop, "nw_drop"),
+            ):
+                try:
+                    self.b[buf_name].open_perf_buffer(
+                        callback,
+                        page_cnt=self.page_cnt,
+                        lost_cb=self._make_lost_cb(stream)
+                    )
+                except KeyError:
+                    if self.verbose:
+                        logger("warning", f"{buf_name} buffer not available")
 
         # Page fault events for mmap I/O tracking
         # try:

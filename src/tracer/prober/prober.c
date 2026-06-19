@@ -403,6 +403,98 @@ struct cache_data {
   u32 count;                /**< Number of pages (for batch operations) */
 };
 
+#ifdef ENABLE_NETWORK
+/* ============================================================================
+ * NETWORK I/O STRUCTURES (low-overhead subset)
+ * ============================================================================
+ * Connection-lifecycle, socket-option, and drop/retransmit events. The
+ * high-frequency per-packet TCP/UDP send/recv path is intentionally omitted to
+ * keep kernel-side overhead minimal.
+ */
+
+struct connect_ctx_t {
+  u64 start_ts; /**< Timestamp at entry */
+  u32 fd;       /**< Socket fd from sys_enter_connect */
+  u8  ipver;    /**< 4 or 6 */
+  u16 dport;    /**< Remote port (host byte order) */
+  u32 daddr_v4; /**< Remote IPv4 address */
+  u8  daddr_v6[16]; /**< Remote IPv6 address */
+};
+
+/* ---- Connection lifecycle event types ---- */
+enum conn_event_type {
+  CONN_SOCKET  = 0,
+  CONN_BIND    = 1,
+  CONN_LISTEN  = 2,
+  CONN_ACCEPT  = 3,
+  CONN_CONNECT = 4,
+  CONN_SHUTDOWN = 5,
+  CONN_CLOSE   = 6
+};
+
+/** @brief Connection lifecycle event data */
+struct conn_event_data {
+  u64 ts_ns;
+  u32 pid;
+  u32 tid;
+  char comm[TASK_COMM_LEN];
+  u8 event_type;    /**< conn_event_type enum */
+  u8 ipver;
+  u8 proto;
+  u16 domain;       /**< AF_INET, AF_INET6, etc. */
+  u16 sock_type;    /**< SOCK_STREAM, SOCK_DGRAM, etc. */
+  u16 sport;
+  u16 dport;
+  u32 saddr_v4;
+  u32 daddr_v4;
+  u8 saddr_v6[16];
+  u8 daddr_v6[16];
+  u32 fd;
+  u32 backlog;        /**< For listen(): listen backlog size */
+  u32 shutdown_how;   /**< For shutdown(): SHUT_RD/SHUT_WR/SHUT_RDWR */
+  s32 ret_val;
+  u64 latency_ns;
+};
+
+/** @brief Socket option event data */
+struct sockopt_event_data {
+  u64 ts_ns;
+  u32 pid;
+  char comm[TASK_COMM_LEN];
+  u8 event_type;    /**< 0 = SET, 1 = GET */
+  u32 fd;
+  u32 level;
+  u32 optname;
+  s64 optval;
+  s32 ret_val;
+};
+
+/* ---- Network drop/retransmit event types ---- */
+enum net_drop_type {
+  NET_DROP_PACKET    = 0,
+  NET_DROP_RETRANSMIT = 1
+};
+
+/** @brief Network drop/retransmission event data */
+struct net_drop_data {
+  u64 ts_ns;
+  u32 pid;
+  char comm[TASK_COMM_LEN];
+  u8 event_type;    /**< net_drop_type enum */
+  u8 ipver;
+  u8 proto;
+  u16 sport;
+  u16 dport;
+  u32 saddr_v4;
+  u32 daddr_v4;
+  u8 saddr_v6[16];
+  u8 daddr_v6[16];
+  u32 skb_len;
+  u32 drop_reason;
+  u32 state;        /**< TCP state for retransmit events */
+};
+#endif /* ENABLE_NETWORK */
+
 /* ============================================================================
  * IO_URING TRACING STRUCTURES
  * ============================================================================
@@ -610,11 +702,42 @@ BPF_ARRAY(block_req_id_gen, u64, 1);
 
 /* Block-tracing diagnostics counters (per-CPU, summed in userspace at exit):
  *   [0] requests issued, [1] requests completed (emitted),
- *   [2] completions with no matching issue ctx (LRU-evicted or pre-trace).
+ *   [2] completions with no matching issue ctx (LRU-evicted or pre-trace),
+ *   [3] completions dropped because the matched issue ctx was stale (implausible
+ *       device latency — see MAX_BLOCK_LATENCY_NS below).
  * A growing [2] relative to [1] indicates the issue map is being evicted under
  * load (i.e. completions are being dropped), which would explain block events
- * thinning out before the end of a long trace. */
-BPF_PERCPU_ARRAY(block_stats, u64, 3);
+ * thinning out before the end of a long trace. A growing [3] indicates (dev,
+ * sector) key reuse across a gap (a completion matched an unrelated, much older
+ * issue ctx). */
+BPF_PERCPU_ARRAY(block_stats, u64, 4);
+
+/* Plausibility ceilings for block latency. The (dev, sector) issue/insert maps
+ * are keyed by device+sector, which is NOT unique over time: a request that
+ * never reaches block_rq_complete (merged, requeued, or whose completion was
+ * missed) leaves a stale issue ctx in the LRU map, and a *later* request to the
+ * same (dev, sector) can then match it — yielding a latency of minutes-to-hours
+ * AND attributing the I/O to the wrong process (the stale ctx carries the old
+ * pid/tid/comm/ppid/req_id). Such matches are untrustworthy in their entirety,
+ * so completions whose device latency exceeds MAX_BLOCK_LATENCY_NS are dropped.
+ * Queue latency comes from a separate map and is only zeroed (rendered empty)
+ * rather than dropping the whole — otherwise-valid — completion.
+ * 60s is far above any real NVMe/SATA completion; raise if tracing media that
+ * can legitimately stall longer. */
+#define MAX_BLOCK_LATENCY_NS   (60ULL * 1000000000ULL)   /* 60 seconds */
+#define MAX_QUEUE_LATENCY_NS   (60ULL * 1000000000ULL)   /* 60 seconds */
+
+/* The absolute MAX_QUEUE_LATENCY_NS cap above only catches stale (dev, sector)
+ * insert matches larger than 60s; a stale insert_ts a few seconds old slips
+ * through and yields e.g. a 30s queue latency on a request the device serviced
+ * in microseconds. That is physically impossible — a queue deep enough to add
+ * seconds of wait implies a busy device, so service latency would be high too.
+ * Treat a multi-second queue wait that also dwarfs the device service latency
+ * as a stale match and zero it. The floor keeps the relative test away from the
+ * sub-millisecond noise (and the degenerate latency≈0 case), so only the clearly
+ * bogus seconds-long values are affected; real queueing on slow media is kept. */
+#define QUEUE_LATENCY_REL_FLOOR_NS  (1000000000ULL)   /* 1 second */
+#define QUEUE_LATENCY_REL_FACTOR    (1000ULL)         /* queue > 1000x service */
 
 /* Configuration map - stores tracer PID to exclude self-tracing */
 BPF_HASH(tracer_config, u32, u32, 1);    /**< Key 0 = tracer PID to exclude */
@@ -629,6 +752,19 @@ BPF_TABLE("lru_hash", u64, u8, dio_staging, 10240);
  * duplicate event for the nested vfs_fsync -> vfs_fsync_range call. LRU so a
  * missed kretprobe return cannot leak entries until the map is full. */
 BPF_TABLE("lru_hash", u64, u64, fsync_inflight, 10240);
+
+/* Staged fsync/fdatasync event, completed by trace_vfs_fsync_ret with the
+ * entry->return latency (latency_ns). Mirrors the rw_staging pattern so the
+ * durability-latency column is populated instead of always empty. */
+BPF_HASH(fsync_staging, u64, struct data_t, 10240);
+
+#ifdef ENABLE_NETWORK
+/* Connection lifecycle context maps (low-overhead network subset) */
+BPF_HASH(accept_ctx, u64, u64);   /**< Accept start timestamp */
+BPF_HASH(connect_ctx, u64, struct connect_ctx_t); /**< Connect start timestamp + fd */
+BPF_HASH(socket_create_ctx, u64, struct conn_event_data); /**< Socket create context */
+BPF_HASH(socket_fds, u64, u8);  /**< Track socket file descriptors (key: (pid<<32)|fd) */
+#endif /* ENABLE_NETWORK */
 
 /* io_uring request tracking map. LRU because completions that bypass the
  * probed completion path (batched completions on modern kernels) would
@@ -675,6 +811,11 @@ BPF_TABLE("lru_hash", u64, struct data_t, rw_staging, 10240);
 /* Staged mremap args from sys_mremap entry, consumed by the kretprobe. */
 BPF_TABLE("lru_hash", u64, struct mremap_args, mremap_staging, 4096);
 
+/* Staged sendfile event from the do_sendfile entry probe, completed by its
+ * kretprobe which records the actual transferred byte count (the entry ``count``
+ * is only the requested ceiling, frequently SSIZE_MAX). */
+BPF_HASH(sendfile_staging, u64, struct data_t, 4096);
+
 /* ============================================================================
  * PERF OUTPUT BUFFERS
  * ============================================================================
@@ -686,6 +827,11 @@ BPF_PERF_OUTPUT(events);            /**< VFS single-path events (data_t) */
 BPF_PERF_OUTPUT(events_dual);       /**< VFS dual-path events (data_dual_t) */
 BPF_PERF_OUTPUT(bl_events);         /**< Block layer events (block_event) */
 BPF_PERF_OUTPUT(cache_events);      /**< Page cache events (cache_data) */
+#ifdef ENABLE_NETWORK
+BPF_PERF_OUTPUT(net_conn_events);   /**< Connection lifecycle events (conn_event_data) */
+BPF_PERF_OUTPUT(net_sockopt_events);/**< Socket option events (sockopt_event_data) */
+BPF_PERF_OUTPUT(net_drop_events);   /**< Drop/retransmit events (net_drop_data) */
+#endif /* ENABLE_NETWORK */
 BPF_PERF_OUTPUT(pagefault_events);  /**< Memory-mapped page faults (pagefault_data) */
 BPF_PERF_OUTPUT(io_uring_events);   /**< io_uring events (io_uring_event_data) */
 
@@ -755,33 +901,28 @@ static __always_inline void get_file_source(struct file *file, u32 *dev,
 }
 
 /**
- * @brief Check if a file is a regular file (not virtual/pseudo filesystem)
+ * @brief True if a superblock magic belongs to a pseudo / virtual filesystem
+ *        that carries no durable storage I/O (procfs, sysfs, cgroup, tracefs,
+ *        debugfs, bpffs, sockets, pipes, ptys, ...).
  *
- * Filters out pseudo-filesystems (proc, sys, devtmpfs, etc.) to focus
- * tracing on real storage I/O. Uses filesystem magic numbers for detection.
+ * Single source of truth for the pseudo-fs denylist, used by both the regular-
+ * file checks (read/write/open) and the directory-iteration probe (readdir).
+ * Skipping these keeps the trace focused on real storage and removes the large
+ * readdir flood from /proc-walking monitors (htop/top/ps) and the tracer's own
+ * /proc polling — see analysis: ~27% of all VFS events were htop reading
+ * /proc/<pid>/task.
  *
- * @param file  Kernel file structure pointer
- * @return      true if regular file on real filesystem, false otherwise
+ * NOTE: tmpfs (and ramfs) are deliberately NOT treated as pseudo here — they
+ * hold real application data (/dev/shm shared memory, /tmp scratch) that is
+ * storage-relevant, so their read/write/mmap/readdir are captured like any real
+ * filesystem. (This is a deliberate change from the previous behavior, which
+ * dropped tmpfs in is_regular_file.) ramdisk-backed data is still I/O we care
+ * about; only the synthetic introspection/IPC filesystems below are dropped.
  */
-static bool is_regular_file(struct file *file) {
-  bool is_reg, is_virtual;
-  if (!file || !file->f_path.dentry || !file->f_path.dentry->d_inode ||
-      !file->f_path.dentry->d_sb) {
-    return false;
-  }
-  umode_t mode;
-  bpf_probe_read_kernel(&mode, sizeof(mode),
-                        &file->f_path.dentry->d_inode->i_mode);
-  is_reg = S_ISREG(mode);  /* Check if regular file (not dir/socket/pipe) */
-
-  struct super_block *sb = file->f_path.dentry->d_sb;
-  unsigned long magic = 0;
-  bpf_probe_read_kernel(&magic, sizeof(magic), &sb->s_magic);
-
+static __always_inline bool is_pseudo_fs_magic(unsigned long magic) {
   switch (magic) {
   case PROC_SUPER_MAGIC:
   case SYSFS_MAGIC:
-  case TMPFS_MAGIC:
   case SOCKFS_MAGIC:
   case DEBUGFS_MAGIC:
   case DEVPTS_SUPER_MAGIC:
@@ -796,14 +937,48 @@ static bool is_regular_file(struct file *file) {
   case TRACEFS_MAGIC:
   case 0x63677270:  /* CGROUP2_SUPER_MAGIC — cgroup v2 unified hierarchy */
   case 0xCAFE4A11:  /* BPF_FS_MAGIC — bpffs */
-  case 0x19800202:
-    is_virtual = true;
-    break;
+  case 0x19800202:  /* mqueue / eventpoll / aio-ring family */
+    return true;
   default:
-    is_virtual = false;
+    return false;
   }
+}
 
-  return !is_virtual && is_reg;
+/**
+ * @brief True if the file lives on a pseudo / virtual filesystem.
+ */
+static __always_inline bool is_pseudo_fs_file(struct file *file) {
+  if (!file) return false;
+  struct dentry *d = NULL;
+  bpf_probe_read_kernel(&d, sizeof(d), &file->f_path.dentry);
+  if (!d) return false;
+  struct super_block *sb = NULL;
+  bpf_probe_read_kernel(&sb, sizeof(sb), &d->d_sb);
+  if (!sb) return false;
+  unsigned long magic = 0;
+  bpf_probe_read_kernel(&magic, sizeof(magic), &sb->s_magic);
+  return is_pseudo_fs_magic(magic);
+}
+
+/**
+ * @brief Check if a file is a regular file on a real (non-pseudo) filesystem.
+ *
+ * Filters out pseudo-filesystems (proc, sys, devtmpfs, etc.) to focus
+ * tracing on real storage I/O. Uses filesystem magic numbers for detection.
+ *
+ * @param file  Kernel file structure pointer
+ * @return      true if regular file on real filesystem, false otherwise
+ */
+static bool is_regular_file(struct file *file) {
+  if (!file || !file->f_path.dentry || !file->f_path.dentry->d_inode ||
+      !file->f_path.dentry->d_sb) {
+    return false;
+  }
+  umode_t mode;
+  bpf_probe_read_kernel(&mode, sizeof(mode),
+                        &file->f_path.dentry->d_inode->i_mode);
+  if (!S_ISREG(mode)) return false;  /* not dir/socket/pipe/etc. */
+  return !is_pseudo_fs_file(file);
 }
 
 static bool is_regular_file_from_path(const struct path *path) {
@@ -825,30 +1000,7 @@ static bool is_regular_file_from_path(const struct path *path) {
 
   unsigned long magic = 0;
   bpf_probe_read_kernel(&magic, sizeof(magic), &sb->s_magic);
-
-  switch (magic) {
-  case PROC_SUPER_MAGIC:
-  case SYSFS_MAGIC:
-  case TMPFS_MAGIC:
-  case SOCKFS_MAGIC:
-  case DEBUGFS_MAGIC:
-  case DEVPTS_SUPER_MAGIC:
-  case DEVTMPFS_MAGIC:
-  case PIPEFS_MAGIC:
-  case CGROUP_SUPER_MAGIC:
-  case SELINUX_MAGIC:
-  case FUTEXFS_SUPER_MAGIC:
-  case INOTIFYFS_SUPER_MAGIC:
-  case XENFS_SUPER_MAGIC:
-  case RPCAUTH_GSSMAGIC:
-  case TRACEFS_MAGIC:
-  case 0x63677270:  /* CGROUP2_SUPER_MAGIC — cgroup v2 unified hierarchy */
-  case 0xCAFE4A11:  /* BPF_FS_MAGIC — bpffs */
-  case 0x19800202:
-    return false;
-  default:
-    return true;
-  }
+  return !is_pseudo_fs_magic(magic);
 }
 
 /**
@@ -948,6 +1100,103 @@ static int get_file_path_from_dentry(struct dentry *dentry, char *buf,
   }
 
   return 0;
+}
+
+/* Bounded reconstruction of a path by walking the dentry's d_parent chain.
+ *
+ * The kernel stores only the basename in d_name; bpf_d_path() would give the
+ * full path but is restricted to an attach-point allowlist that excludes the
+ * probes that need it (readdir/unlink/rename/...). So we walk up to
+ * DPATH_MAX_DEPTH parents and emit the deepest components as "/c1/c2/.../leaf".
+ *
+ * Limitations (documented for consumers): does NOT cross mount points (path is
+ * relative to the file's own mount root), and truncates to the last
+ * DPATH_MAX_DEPTH components on very deep paths. FILENAME_MAX_LEN is a power of
+ * two so masking the write offset keeps the verifier happy.
+ *
+ * The path is assembled in a per-CPU scratch buffer that is twice
+ * FILENAME_MAX_LEN, then copied into the caller's FILENAME_MAX_LEN buffer. Each
+ * component is read with bpf_probe_read_kernel_str() at a variable offset (the
+ * running write position, masked into 0..FILENAME_MAX_LEN-1) and a variable
+ * length (the remaining space). The verifier reasons about the offset and the
+ * length independently, so for an N-byte buffer it must assume a write of up to
+ * N bytes can begin at offset N-1 — an apparent 2N-byte span. Sizing the
+ * scratch to 2*FILENAME_MAX_LEN makes that worst case provably in-bounds; at
+ * run time offset + length never exceeds FILENAME_MAX_LEN, so the upper half is
+ * only ever slack for the verifier. A 256-byte stack buffer cannot satisfy this
+ * (the independent maxima sum past its end), which is why the assembly happens
+ * off-stack in the scratch map.
+ */
+#define DPATH_MAX_DEPTH 12
+#define DPATH_MASK (FILENAME_MAX_LEN - 1)
+#define DPATH_BUILD_SIZE (2 * FILENAME_MAX_LEN)
+
+/* Per-CPU scratch for the component-pointer chain and the assembly buffer —
+ * both kept off the BPF stack, which is only 512 bytes and already mostly
+ * consumed by struct data_t. */
+struct dpath_scratch {
+  const unsigned char *names[DPATH_MAX_DEPTH];
+  char build[DPATH_BUILD_SIZE];
+};
+BPF_PERCPU_ARRAY(dpath_scratch_map, struct dpath_scratch, 1);
+
+static __always_inline void build_dentry_path(struct dentry *dentry,
+                                              char *buf, int buf_size) {
+  buf[0] = '\0';
+  if (!dentry) return;
+  /* The assembly buffer is masked into a FILENAME_MAX_LEN window and copied out
+   * at that width; a smaller caller buffer would overflow on the copy. */
+  if (buf_size < FILENAME_MAX_LEN) return;
+
+  u32 zero = 0;
+  struct dpath_scratch *sc = dpath_scratch_map.lookup(&zero);
+  if (!sc) return;
+
+  int n = 0;
+  struct dentry *d = dentry;
+
+#pragma unroll
+  for (int i = 0; i < DPATH_MAX_DEPTH; i++) {
+    struct dentry *parent = NULL;
+    const unsigned char *np = NULL;
+    bpf_probe_read_kernel(&parent, sizeof(parent), &d->d_parent);
+    bpf_probe_read_kernel(&np, sizeof(np), &d->d_name.name);
+    sc->names[i] = np;
+    n = i + 1;
+    if (!parent || parent == d) break;   /* reached the (mount) root */
+    d = parent;
+  }
+
+  /* sc->build is per-CPU scratch reused across invocations, and the whole
+   * FILENAME_MAX_LEN window is copied to the caller below. Zero it first so a
+   * shorter path cannot leak the tail of a previous (longer) one to userspace.
+   * Only the copied window needs clearing; the upper half is verifier slack. */
+  char *out = sc->build;
+  __builtin_memset(out, 0, FILENAME_MAX_LEN);
+  int off = 0;
+#pragma unroll
+  for (int i = DPATH_MAX_DEPTH - 1; i >= 0; i--) {
+    if (i >= n) continue;
+    const unsigned char *np = sc->names[i];
+    if (!np) continue;
+
+    if (off < FILENAME_MAX_LEN - 1) {    /* component separator */
+      out[off & DPATH_MASK] = '/';
+      off++;
+    }
+    int pos = off & DPATH_MASK;          /* 0..FILENAME_MAX_LEN-1 */
+    int cap = FILENAME_MAX_LEN - pos;    /* pos + cap == FILENAME_MAX_LEN */
+    if (cap > 1) {
+      long w = bpf_probe_read_kernel_str(&out[pos], cap, np);
+      if (w > 1) off = pos + (int)(w - 1);   /* advance past name, exclude NUL */
+    }
+  }
+  out[off & DPATH_MASK] = '\0';
+
+  /* Copy the assembled path (the FILENAME_MAX_LEN window) into the caller's
+   * buffer; out[off] is already NUL-terminated within that window. */
+  __builtin_memcpy(buf, out, FILENAME_MAX_LEN);
+  buf[FILENAME_MAX_LEN - 1] = '\0';
 }
 
 /**
@@ -1419,16 +1668,28 @@ int trace_vfs_fsync(struct pt_regs *ctx, struct file *file, int datasync) {
   // second event for the same syscall. Cleared by the vfs_fsync kretprobe.
   fsync_inflight.update(&pid_tgid, &data.ts);
 
-  events.perf_submit(ctx, &data, sizeof(data));
+  // Defer submission to the kretprobe so the event carries the entry->return
+  // duration in latency_ns (durability latency), instead of emitting at entry
+  // with no timing. Mirrors the READ/WRITE rw_staging pattern.
+  fsync_staging.update(&pid_tgid, &data);
 
   return 0;
 }
 
 /**
- * @brief vfs_fsync() kretprobe — clears the nested-call suppression marker.
+ * @brief vfs_fsync() kretprobe — completes the staged fsync event with latency.
+ *
+ * Sets latency_ns to the entry->return duration, submits the event, and clears
+ * both the staging entry and the nested-call suppression marker.
  */
 int trace_vfs_fsync_ret(struct pt_regs *ctx) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
+  struct data_t *data = fsync_staging.lookup(&pid_tgid);
+  if (data) {
+    data->latency_ns = bpf_ktime_get_ns() - data->ts;
+    events.perf_submit(ctx, data, sizeof(*data));
+    fsync_staging.delete(&pid_tgid);
+  }
   fsync_inflight.delete(&pid_tgid);
   return 0;
 }
@@ -1480,9 +1741,11 @@ int trace_vfs_fsync_range(struct pt_regs *ctx, struct file *file, loff_t start,
   }
 
   if (end == LLONG_MAX) {
-    range_size = file_size - start;
+    // file_size stays 0 if file/f_inode was unreadable; guard against a
+    // negative (start > file_size) result that would wrap to a huge u64 size.
+    range_size = (file_size > start) ? file_size - start : 0;
   } else {
-    range_size = end - start;
+    range_size = (end > start) ? end - start : 0;
   }
 
   struct data_t data = {};
@@ -1892,8 +2155,13 @@ int trace_vfs_setattr(struct pt_regs *ctx) {
     return 0;
   }
 
-  /* notify_change: arg1 = mnt_idmap*, arg2 = dentry*, arg3 = iattr* */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+  /* >=5.12: notify_change(struct mnt_idmap/user_namespace *, dentry *, iattr *) */
   struct dentry *dentry = (struct dentry *)PT_REGS_PARM2(ctx);
+#else
+  /* <5.12: notify_change(struct dentry *, struct iattr *, ...) — dentry is PARM1 */
+  struct dentry *dentry = (struct dentry *)PT_REGS_PARM1(ctx);
+#endif
   if (!dentry) {
     return 0;
   }
@@ -1974,6 +2242,15 @@ int trace_readdir(struct pt_regs *ctx, struct file *file,
     return 0;
   }
 
+  /* Skip directory reads on pseudo filesystems (/proc, /sys, cgroup, ...).
+   * Unlike read/write/open (which go through is_regular_file), readdir operates
+   * on a directory and so was never filtered — and it dominated event volume:
+   * /proc-walking monitors (htop/top/ps reading /proc/<pid>/task) accounted for
+   * ~27% of all VFS events, none of it real storage I/O. */
+  if (is_pseudo_fs_file(file)) {
+    return 0;
+  }
+
   struct data_t data = {};
   data.pid = pid;
   data.ts = bpf_ktime_get_ns();
@@ -1981,7 +2258,11 @@ int trace_readdir(struct pt_regs *ctx, struct file *file,
   data.op = OP_READDIR;
   data.inode = get_file_inode(file);
   data.size = 0;
-  get_file_path(file, data.filename, sizeof(data.filename));
+  /* readdir only ever had the basename; reconstruct the directory path by
+   * walking d_parent so directory-traversal activity is attributable. */
+  struct dentry *rd_dentry = NULL;
+  bpf_probe_read_kernel(&rd_dentry, sizeof(rd_dentry), &file->f_path.dentry);
+  build_dentry_path(rd_dentry, data.filename, sizeof(data.filename));
   bpf_probe_read_kernel(&data.flags, sizeof(data.flags), &file->f_flags);
 
   events.perf_submit(ctx, &data, sizeof(data));
@@ -2508,14 +2789,42 @@ int trace_sendfile(struct pt_regs *ctx, int out_fd, int in_fd, loff_t *offset,
 
   struct data_t data = {};
   data.pid = pid;
+  data.tid = (u32)pid_tgid;
   data.ts = bpf_ktime_get_ns();
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
   data.op = OP_SENDFILE;
   data.inode = 0;
-  data.size = count;
+  data.size = 0;   /* set to actual transferred bytes at return; never the
+                      requested `count` ceiling (often SSIZE_MAX) */
   data.flags = 0;
 
-  events.perf_submit(ctx, &data, sizeof(data));
+  // Defer submission to the kretprobe, which records the real transferred byte
+  // count and the entry->return duration.
+  sendfile_staging.update(&pid_tgid, &data);
+  return 0;
+}
+
+/**
+ * @brief Trace sendfile() return — record actual bytes transferred and latency.
+ *
+ * The entry ``count`` is only the caller's requested ceiling (often SSIZE_MAX),
+ * so it is never used as ``size``; we record the syscall return (actual bytes
+ * moved, 0 on error/EOF) instead. We emit on ALL returns — like the vfs_read/
+ * vfs_write kretprobes — so failed and zero-byte sendfiles are captured and the
+ * userspace SENDFILE branch can format errno from the negative return_value.
+ */
+int trace_sendfile_ret(struct pt_regs *ctx) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  struct data_t *data = sendfile_staging.lookup(&pid_tgid);
+  if (!data) {
+    return 0;
+  }
+  long ret = PT_REGS_RC(ctx);
+  data->ret_val = (s64)ret;
+  data->latency_ns = bpf_ktime_get_ns() - data->ts;
+  data->size = (ret > 0) ? (u64)ret : 0;   /* actual bytes; 0 on error/EOF */
+  events.perf_submit(ctx, data, sizeof(*data));
+  sendfile_staging.delete(&pid_tgid);
   return 0;
 }
 
@@ -2644,11 +2953,36 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
   u64 end_ts = bpf_ktime_get_ns();
   u64 latency = end_ts - ictx->ts;
 
-  // Calculate queue time (time from insert to issue)
+  // Guard against (dev, sector) key reuse: if the device latency is implausibly
+  // large, this completion matched a stale issue ctx left behind by an earlier
+  // request that never completed. The latency AND the pid/comm/req_id carried by
+  // ictx are all untrustworthy, so drop the record entirely (counting it) rather
+  // than emit a multi-hour latency attributed to the wrong process.
+  if (latency > MAX_BLOCK_LATENCY_NS) {
+    u32 stat_stale = 3;
+    u64 *stale = block_stats.lookup(&stat_stale);
+    if (stale)
+      *stale += 1;
+    block_start_times.delete(&key);
+    block_insert_times.delete(&key);
+    return 0;
+  }
+
+  // Calculate queue time (time from insert to issue). The insert map shares the
+  // same non-unique (dev, sector) key, so an implausible value means the matched
+  // insert_ts is stale; zero it (rendered empty downstream) instead of dropping
+  // the otherwise-valid completion.
   u64 queue_time = 0;
   u64 *insert_ts = block_insert_times.lookup(&key);
   if (insert_ts && ictx->ts >= *insert_ts) {
     queue_time = ictx->ts - *insert_ts;
+    // Stale insert match: absolute (> 60s) or relative (a seconds-long queue
+    // wait that dwarfs the device service latency — physically impossible, see
+    // QUEUE_LATENCY_REL_* above). Either way the insert_ts is untrustworthy.
+    if (queue_time > MAX_QUEUE_LATENCY_NS ||
+        (queue_time > QUEUE_LATENCY_REL_FLOOR_NS &&
+         queue_time > QUEUE_LATENCY_REL_FACTOR * latency))
+      queue_time = 0;
   }
 
   struct block_event event = {};
@@ -3289,6 +3623,17 @@ int trace_invalidate_mapping(struct pt_regs *ctx, struct address_space *mapping,
     }
   }
 
+  // Full-file invalidation passes end == (pgoff_t)-1, so the raw page count
+  // (end - start + 1) becomes a meaningless ~4.29e9 sentinel. Clamp to the
+  // number of pages the mapping actually has cached (an exact upper bound on
+  // what this call can drop) so the column stays summable downstream.
+  if (mapping) {
+    unsigned long nrpages = 0;
+    bpf_probe_read_kernel(&nrpages, sizeof(nrpages), &mapping->nrpages);
+    if (data.count > (u32)nrpages)
+      data.count = (u32)nrpages;
+  }
+
   data.cpu_id = bpf_get_smp_processor_id();
   cache_events.perf_submit(ctx, &data, sizeof(data));
   return 0;
@@ -3336,6 +3681,16 @@ int trace_truncate_pages(struct pt_regs *ctx, struct address_space *mapping,
     }
   }
 
+  // Full-file truncation makes (end_index - start_index + 1) a multi-billion
+  // page count; clamp to the pages actually cached in the mapping (see the
+  // invalidate_mapping_pages probe for rationale).
+  if (mapping) {
+    unsigned long nrpages = 0;
+    bpf_probe_read_kernel(&nrpages, sizeof(nrpages), &mapping->nrpages);
+    if (data.count > (u32)nrpages)
+      data.count = (u32)nrpages;
+  }
+
   data.cpu_id = bpf_get_smp_processor_id();
   cache_events.perf_submit(ctx, &data, sizeof(data));
   return 0;
@@ -3381,6 +3736,10 @@ int trace_cache_drop_folio(struct pt_regs *ctx, struct address_space *mapping,
       populate_cache_metadata(&data, host);
     }
   }
+
+  // Note: unlike invalidate_mapping_pages / truncate_inode_pages_range, this
+  // probe derives no count from a byte range — populate_cache_metadata always
+  // leaves data.count == 1 (single folio), so no page-count clamp is needed.
 
   data.cpu_id = bpf_get_smp_processor_id();
   cache_events.perf_submit(ctx, &data, sizeof(data));
@@ -4300,3 +4659,516 @@ TRACEPOINT_PROBE(io_uring, io_uring_complete) {
   return 0;
 }
 #endif /* disabled io_uring tracepoints */
+
+#ifdef ENABLE_NETWORK
+/* ============================================================================
+ * NETWORK PROBES (low-overhead subset)
+ * ============================================================================
+ * Connection lifecycle, socket-option, and drop/retransmit probes. Compiled
+ * and attached only when -DENABLE_NETWORK is passed (the --network CLI flag).
+ * The per-packet TCP/UDP send/recv path is intentionally
+ * excluded to keep kernel-side overhead minimal.
+ */
+
+/* ---- Connection lifecycle helpers ---- */
+
+/**
+ * @brief Resolve struct sock * from a file descriptor via the task's fd table.
+ * Returns NULL on any failure.
+ */
+static __always_inline struct sock *get_sock_from_fd(u32 fd) {
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+  if (!task) return NULL;
+
+  struct files_struct *files = NULL;
+  bpf_probe_read_kernel(&files, sizeof(files), &task->files);
+  if (!files) return NULL;
+
+  struct fdtable *fdt = NULL;
+  bpf_probe_read_kernel(&fdt, sizeof(fdt), &files->fdt);
+  if (!fdt) return NULL;
+
+  /* Bound fd against the table size before indexing. fd comes from a
+   * user-supplied syscall arg and can be arbitrarily large; without this the
+   * computed &fd_array[fd] could point outside the table (a wild but possibly
+   * mapped address) and yield a bogus socket pointer. */
+  unsigned int max_fds = 0;
+  bpf_probe_read_kernel(&max_fds, sizeof(max_fds), &fdt->max_fds);
+  if (fd >= max_fds) return NULL;
+
+  struct file **fd_array = NULL;
+  bpf_probe_read_kernel(&fd_array, sizeof(fd_array), &fdt->fd);
+  if (!fd_array) return NULL;
+
+  struct file *filep = NULL;
+  bpf_probe_read_kernel(&filep, sizeof(filep), &fd_array[fd]);
+  if (!filep) return NULL;
+
+  /* file->private_data == struct socket * for socket fds */
+  struct socket *sock = NULL;
+  bpf_probe_read_kernel(&sock, sizeof(sock), &filep->private_data);
+  if (!sock) return NULL;
+
+  struct sock *sk = NULL;
+  bpf_probe_read_kernel(&sk, sizeof(sk), &sock->sk);
+  return sk;
+}
+
+/**
+ * @brief Fill address/port fields in conn_event_data from a struct sock *.
+ * Handles IPv4 and IPv6; no-ops for other families.
+ */
+static __always_inline void fill_conn_addr_from_sock(struct conn_event_data *e,
+                                                     struct sock *sk) {
+  if (!sk) return;
+  u16 family = 0;
+  bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
+
+  if (family == AF_INET) {
+    e->ipver = 4;
+    struct inet_sock *inet = (struct inet_sock *)sk;
+    bpf_probe_read_kernel(&e->saddr_v4, sizeof(e->saddr_v4), &inet->inet_saddr);
+    bpf_probe_read_kernel(&e->daddr_v4, sizeof(e->daddr_v4), &inet->inet_daddr);
+    u16 sport = 0, dport = 0;
+    bpf_probe_read_kernel(&sport, sizeof(sport), &inet->inet_sport);
+    bpf_probe_read_kernel(&dport, sizeof(dport), &inet->inet_dport);
+    e->sport = bpf_ntohs(sport);
+    e->dport = bpf_ntohs(dport);
+  } else if (family == AF_INET6) {
+    e->ipver = 6;
+    unsigned __int128 saddr6 = 0, daddr6 = 0;
+    u16 sport = 0, dport = 0;
+    bpf_probe_read_kernel(&saddr6, sizeof(saddr6),
+                          &sk->__sk_common.skc_v6_rcv_saddr.in6_u);
+    bpf_probe_read_kernel(&daddr6, sizeof(daddr6),
+                          &sk->__sk_common.skc_v6_daddr.in6_u);
+    bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
+    bpf_probe_read_kernel(&dport, sizeof(dport), &sk->__sk_common.skc_dport);
+    __builtin_memcpy(e->saddr_v6, &saddr6, 16);
+    __builtin_memcpy(e->daddr_v6, &daddr6, 16);
+    e->sport = sport;
+    e->dport = bpf_ntohs(dport);
+  }
+}
+
+/** @brief Helper to fill common conn_event_data fields */
+static __always_inline void fill_conn_common(struct conn_event_data *e, u8 event_type) {
+  e->ts_ns = bpf_ktime_get_ns();
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  e->pid = pid_tgid >> 32;
+  e->tid = (u32)pid_tgid;
+  bpf_get_current_comm(&e->comm, sizeof(e->comm));
+  e->event_type = event_type;
+}
+
+/* socket() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_socket) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_SOCKET);
+  e.domain = (u16)args->family;
+  e.sock_type = (u16)(args->type & 0xFF); /* mask out SOCK_NONBLOCK|SOCK_CLOEXEC */
+  e.proto = (u8)args->protocol;
+  socket_create_ctx.update(&tid, &e);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_socket) {
+  u64 tid = bpf_get_current_pid_tgid();
+  struct conn_event_data *e = socket_create_ctx.lookup(&tid);
+  if (!e) return 0;
+
+  e->ret_val = (s32)args->ret;
+  e->fd = args->ret >= 0 ? (u32)args->ret : 0;
+  net_conn_events.perf_submit(args, e, sizeof(*e));
+  socket_create_ctx.delete(&tid);
+
+  /* Track this socket fd for close() filtering */
+  if (args->ret >= 0) {
+    u64 pid_fd = (tid & 0xFFFFFFFF00000000ULL) | (u32)args->ret;
+    u8 marker = 1;
+    socket_fds.update(&pid_fd, &marker);
+  }
+  return 0;
+}
+
+/* bind() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_bind) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_BIND);
+  e.fd = (u32)args->fd;
+
+  /* Read socket address family */
+  u16 family = 0;
+  bpf_probe_read_user(&family, sizeof(family), args->umyaddr);
+
+  if (family == AF_INET) {
+    e.ipver = 4;
+    struct sockaddr_in sa = {};
+    bpf_probe_read_user(&sa, sizeof(sa), args->umyaddr);
+    e.saddr_v4 = sa.sin_addr.s_addr;
+    e.sport = bpf_ntohs(sa.sin_port);
+  } else if (family == AF_INET6) {
+    e.ipver = 6;
+    struct sockaddr_in6 sa6 = {};
+    bpf_probe_read_user(&sa6, sizeof(sa6), args->umyaddr);
+    __builtin_memcpy(e.saddr_v6, &sa6.sin6_addr, 16);
+    e.sport = bpf_ntohs(sa6.sin6_port);
+  }
+  e.domain = family;
+
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+/* listen() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_listen) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_LISTEN);
+  e.fd = (u32)args->fd;
+  e.backlog = (u32)args->backlog;
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+/* accept4() syscall - entry stores timestamp */
+TRACEPOINT_PROBE(syscalls, sys_enter_accept4) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  u64 ts = bpf_ktime_get_ns();
+  accept_ctx.update(&tid, &ts);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_accept4) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u64 *start_ts = accept_ctx.lookup(&tid);
+  if (!start_ts) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_ACCEPT);
+  e.latency_ns = bpf_ktime_get_ns() - *start_ts;
+  e.ret_val = (s32)args->ret;
+  e.fd = args->ret >= 0 ? (u32)args->ret : 0;
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+  accept_ctx.delete(&tid);
+
+  /* Track this socket fd for close() filtering */
+  if (args->ret >= 0) {
+    u64 pid_fd = (tid & 0xFFFFFFFF00000000ULL) | (u32)args->ret;
+    u8 marker = 1;
+    socket_fds.update(&pid_fd, &marker);
+  }
+  return 0;
+}
+
+/* connect() syscall - entry stores timestamp + remote addr */
+TRACEPOINT_PROBE(syscalls, sys_enter_connect) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  struct connect_ctx_t cctx = {};
+  cctx.start_ts = bpf_ktime_get_ns();
+  cctx.fd = (u32)args->fd;
+
+  /* Capture remote address from the user-supplied sockaddr */
+  if (args->uservaddr && args->addrlen >= 2) {
+    u16 family = 0;
+    bpf_probe_read_user(&family, sizeof(family), args->uservaddr);
+    if (family == AF_INET && args->addrlen >= sizeof(struct sockaddr_in)) {
+      struct sockaddr_in sa = {};
+      bpf_probe_read_user(&sa, sizeof(sa), args->uservaddr);
+      cctx.ipver    = 4;
+      cctx.daddr_v4 = sa.sin_addr.s_addr;
+      cctx.dport    = bpf_ntohs(sa.sin_port);
+    } else if (family == AF_INET6 && args->addrlen >= sizeof(struct sockaddr_in6)) {
+      struct sockaddr_in6 sa6 = {};
+      bpf_probe_read_user(&sa6, sizeof(sa6), args->uservaddr);
+      cctx.ipver = 6;
+      __builtin_memcpy(cctx.daddr_v6, &sa6.sin6_addr, 16);
+      cctx.dport = bpf_ntohs(sa6.sin6_port);
+    }
+  }
+
+  connect_ctx.update(&tid, &cctx);
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_exit_connect) {
+  u64 tid = bpf_get_current_pid_tgid();
+  struct connect_ctx_t *cctx = connect_ctx.lookup(&tid);
+  if (!cctx) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_CONNECT);
+  e.latency_ns = bpf_ktime_get_ns() - cctx->start_ts;
+  e.fd  = cctx->fd;
+  e.ret_val = (s32)args->ret;
+
+  /* Copy remote addr captured at entry */
+  e.ipver    = cctx->ipver;
+  e.dport    = cctx->dport;
+  e.daddr_v4 = cctx->daddr_v4;
+  __builtin_memcpy(e.daddr_v6, cctx->daddr_v6, 16);
+
+  /* Resolve local addr from the socket (available after connect attempt) */
+  struct sock *sk = get_sock_from_fd(cctx->fd);
+  if (sk && e.ipver == 4) {
+    struct inet_sock *inet = (struct inet_sock *)sk;
+    bpf_probe_read_kernel(&e.saddr_v4, sizeof(e.saddr_v4), &inet->inet_saddr);
+    u16 sport = 0;
+    bpf_probe_read_kernel(&sport, sizeof(sport), &inet->inet_sport);
+    e.sport = bpf_ntohs(sport);
+  } else if (sk && e.ipver == 6) {
+    unsigned __int128 saddr6 = 0;
+    bpf_probe_read_kernel(&saddr6, sizeof(saddr6),
+                          &sk->__sk_common.skc_v6_rcv_saddr.in6_u);
+    __builtin_memcpy(e.saddr_v6, &saddr6, 16);
+    u16 sport = 0;
+    bpf_probe_read_kernel(&sport, sizeof(sport), &sk->__sk_common.skc_num);
+    e.sport = sport;
+  }
+
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+  connect_ctx.delete(&tid);
+  return 0;
+}
+
+/* shutdown() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_shutdown) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_SHUTDOWN);
+  e.fd = (u32)args->fd;
+  e.shutdown_how = (u32)args->how;
+
+  struct sock *sk = get_sock_from_fd((u32)args->fd);
+  fill_conn_addr_from_sock(&e, sk);
+
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+/* close() syscall */
+TRACEPOINT_PROBE(syscalls, sys_enter_close) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  /* Only emit close event if this fd was tracked as a socket */
+  u64 pid_fd = (tid & 0xFFFFFFFF00000000ULL) | (u32)args->fd;
+  u8 *tracked = socket_fds.lookup(&pid_fd);
+  if (!tracked) return 0;
+
+  struct conn_event_data e = {};
+  fill_conn_common(&e, CONN_CLOSE);
+  e.fd = (u32)args->fd;
+
+  struct sock *sk = get_sock_from_fd((u32)args->fd);
+  fill_conn_addr_from_sock(&e, sk);
+
+  net_conn_events.perf_submit(args, &e, sizeof(e));
+
+  /* Remove from tracking map */
+  socket_fds.delete(&pid_fd);
+  return 0;
+}
+
+/* ---- Socket configuration probes ---- */
+
+TRACEPOINT_PROBE(syscalls, sys_enter_setsockopt) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  int level = args->level;
+  int optname = args->optname;
+
+  /* Filter: only SOL_SOCKET (1) and IPPROTO_TCP (6) */
+  if (level != 1 && level != 6) return 0;
+
+  struct sockopt_event_data e = {};
+  e.ts_ns = bpf_ktime_get_ns();
+  e.pid = pid;
+  bpf_get_current_comm(&e.comm, sizeof(e.comm));
+  e.event_type = 0; /* SET */
+  e.fd = (u32)args->fd;
+  e.level = (u32)level;
+  e.optname = (u32)optname;
+
+  /* Read integer option value (first 4 or 8 bytes). Use constant read sizes —
+   * a dynamic length can fail the BPF verifier on older kernels. */
+  if (args->optval && args->optlen >= 4) {
+    s64 val = 0;
+    if (args->optlen >= 8) {
+      bpf_probe_read_user(&val, 8, args->optval);
+    } else {
+      bpf_probe_read_user(&val, 4, args->optval);
+    }
+    e.optval = val;
+  }
+
+  net_sockopt_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+TRACEPOINT_PROBE(syscalls, sys_enter_getsockopt) {
+  u64 tid = bpf_get_current_pid_tgid();
+  u32 pid = tid >> 32;
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) return 0;
+
+  int level = args->level;
+  if (level != 1 && level != 6) return 0;
+
+  struct sockopt_event_data e = {};
+  e.ts_ns = bpf_ktime_get_ns();
+  e.pid = pid;
+  bpf_get_current_comm(&e.comm, sizeof(e.comm));
+  e.event_type = 1; /* GET */
+  e.fd = (u32)args->fd;
+  e.level = (u32)level;
+  e.optname = (u32)args->optname;
+
+  net_sockopt_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+/* ---- Network drops & retransmissions ---- */
+
+/* TCP retransmission tracepoint (stable, available since ~4.16) */
+TRACEPOINT_PROBE(tcp, tcp_retransmit_skb) {
+  struct net_drop_data e = {};
+  e.ts_ns = bpf_ktime_get_ns();
+  e.pid = bpf_get_current_pid_tgid() >> 32;
+  bpf_get_current_comm(&e.comm, sizeof(e.comm));
+  e.event_type = NET_DROP_RETRANSMIT;
+  e.proto = 6; /* TCP */
+
+  /* tcp:tcp_retransmit_skb tracepoint provides addr fields directly */
+  e.sport = args->sport;
+  e.dport = args->dport;
+  __builtin_memcpy(&e.saddr_v4, args->saddr, sizeof(e.saddr_v4));
+  __builtin_memcpy(&e.daddr_v4, args->daddr, sizeof(e.daddr_v4));
+
+  /* IPv6 addresses if available */
+  bpf_probe_read_kernel(&e.saddr_v6, sizeof(e.saddr_v6), args->saddr_v6);
+  bpf_probe_read_kernel(&e.daddr_v6, sizeof(e.daddr_v6), args->daddr_v6);
+
+  e.state = args->state;
+  e.ipver = (e.saddr_v4 != 0 || e.daddr_v4 != 0) ? 4 : 6;
+
+  net_drop_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+
+/* kfree_skb - Packet drops */
+TRACEPOINT_PROBE(skb, kfree_skb) {
+  struct net_drop_data e = {};
+  e.ts_ns = bpf_ktime_get_ns();
+  e.pid = bpf_get_current_pid_tgid() >> 32;
+  bpf_get_current_comm(&e.comm, sizeof(e.comm));
+  e.event_type = NET_DROP_PACKET;
+
+  /* Get SKB pointer and extract network info */
+  struct sk_buff *skb = (struct sk_buff *)args->skbaddr;
+  if (!skb) return 0;
+
+  /* Only handle IP packets. Without checking the L3 ethertype, non-IP drops
+   * (ARP, PPPoE, custom L2, ...) would be parsed as IP and emit garbage rows
+   * whenever the guessed offset happens to look like an IP header. */
+  u16 eth_proto = 0;
+  bpf_probe_read_kernel(&eth_proto, sizeof(eth_proto), &skb->protocol);
+  eth_proto = bpf_ntohs(eth_proto);
+  if (eth_proto != 0x0800 && eth_proto != 0x86dd) return 0;  /* not IPv4/IPv6 */
+
+  /* Read drop reason (kernel 5.17+ has this field) */
+  bpf_probe_read_kernel(&e.drop_reason, sizeof(e.drop_reason), &args->reason);
+
+  /* Read packet length */
+  bpf_probe_read_kernel(&e.skb_len, sizeof(e.skb_len), &skb->len);
+
+  /* Try to extract IP header info */
+  unsigned char *head;
+  u16 network_header, transport_header;
+
+  bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+  bpf_probe_read_kernel(&network_header, sizeof(network_header), &skb->network_header);
+  bpf_probe_read_kernel(&transport_header, sizeof(transport_header), &skb->transport_header);
+
+  /* Bail if the network header offset is unset (e.g. drop before L3 parsing). */
+  if (!head || network_header == (u16)~0) return 0;
+
+  unsigned char *ip_header = head + network_header;
+  e.ipver = (eth_proto == 0x0800) ? 4 : 6;
+
+  if (eth_proto == 0x0800) {
+    /* IPv4 header offsets: saddr at +12, daddr at +16, protocol at +9 */
+    bpf_probe_read_kernel(&e.proto, sizeof(e.proto), ip_header + 9);
+    bpf_probe_read_kernel(&e.saddr_v4, sizeof(e.saddr_v4), ip_header + 12);
+    bpf_probe_read_kernel(&e.daddr_v4, sizeof(e.daddr_v4), ip_header + 16);
+
+    /* Extract ports if TCP/UDP */
+    if (e.proto == 6 || e.proto == 17) {  /* TCP or UDP */
+      unsigned char *l4_header = head + transport_header;
+      u16 sport_be, dport_be;
+      bpf_probe_read_kernel(&sport_be, sizeof(sport_be), l4_header);
+      bpf_probe_read_kernel(&dport_be, sizeof(dport_be), l4_header + 2);
+      e.sport = __builtin_bswap16(sport_be);
+      e.dport = __builtin_bswap16(dport_be);
+    }
+  } else {
+    /* IPv6 header offsets: next_header at +6, saddr at +8, daddr at +24 */
+    bpf_probe_read_kernel(&e.proto, sizeof(e.proto), ip_header + 6);
+    bpf_probe_read_kernel(&e.saddr_v6, sizeof(e.saddr_v6), ip_header + 8);
+    bpf_probe_read_kernel(&e.daddr_v6, sizeof(e.daddr_v6), ip_header + 24);
+
+    /* Extract ports if TCP/UDP */
+    if (e.proto == 6 || e.proto == 17) {
+      unsigned char *l4_header = head + transport_header;
+      u16 sport_be, dport_be;
+      bpf_probe_read_kernel(&sport_be, sizeof(sport_be), l4_header);
+      bpf_probe_read_kernel(&dport_be, sizeof(dport_be), l4_header + 2);
+      e.sport = __builtin_bswap16(sport_be);
+      e.dport = __builtin_bswap16(dport_be);
+    }
+  }
+
+  net_drop_events.perf_submit(args, &e, sizeof(e));
+  return 0;
+}
+#endif /* ENABLE_NETWORK */
