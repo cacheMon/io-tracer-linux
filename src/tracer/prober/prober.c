@@ -727,6 +727,18 @@ BPF_PERCPU_ARRAY(block_stats, u64, 4);
 #define MAX_BLOCK_LATENCY_NS   (60ULL * 1000000000ULL)   /* 60 seconds */
 #define MAX_QUEUE_LATENCY_NS   (60ULL * 1000000000ULL)   /* 60 seconds */
 
+/* The absolute MAX_QUEUE_LATENCY_NS cap above only catches stale (dev, sector)
+ * insert matches larger than 60s; a stale insert_ts a few seconds old slips
+ * through and yields e.g. a 30s queue latency on a request the device serviced
+ * in microseconds. That is physically impossible — a queue deep enough to add
+ * seconds of wait implies a busy device, so service latency would be high too.
+ * Treat a multi-second queue wait that also dwarfs the device service latency
+ * as a stale match and zero it. The floor keeps the relative test away from the
+ * sub-millisecond noise (and the degenerate latency≈0 case), so only the clearly
+ * bogus seconds-long values are affected; real queueing on slow media is kept. */
+#define QUEUE_LATENCY_REL_FLOOR_NS  (1000000000ULL)   /* 1 second */
+#define QUEUE_LATENCY_REL_FACTOR    (1000ULL)         /* queue > 1000x service */
+
 /* Configuration map - stores tracer PID to exclude self-tracing */
 BPF_HASH(tracer_config, u32, u32, 1);    /**< Key 0 = tracer PID to exclude */
 
@@ -2920,7 +2932,12 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
   u64 *insert_ts = block_insert_times.lookup(&key);
   if (insert_ts && ictx->ts >= *insert_ts) {
     queue_time = ictx->ts - *insert_ts;
-    if (queue_time > MAX_QUEUE_LATENCY_NS)
+    // Stale insert match: absolute (> 60s) or relative (a seconds-long queue
+    // wait that dwarfs the device service latency — physically impossible, see
+    // QUEUE_LATENCY_REL_* above). Either way the insert_ts is untrustworthy.
+    if (queue_time > MAX_QUEUE_LATENCY_NS ||
+        (queue_time > QUEUE_LATENCY_REL_FLOOR_NS &&
+         queue_time > QUEUE_LATENCY_REL_FACTOR * latency))
       queue_time = 0;
   }
 
