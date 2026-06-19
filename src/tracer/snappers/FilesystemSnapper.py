@@ -126,6 +126,97 @@ def get_birth_time(path: str, fallback: float) -> float:
         return fallback
 
 
+# --- Pseudo-filesystem skipping via statfs() ------------------------------
+# The live eBPF prober already drops procfs/sysfs/cgroup/... events at source
+# (see prober.c is_pseudo_fs_magic). The periodic filesystem snapshot walks the
+# tree from "/" in user space and, without the same filter, descends into
+# /proc and /sys -- which dominate the inventory (e.g. /proc is the majority of
+# rows and /proc/kcore reports a multi-petabyte sparse size that is meaningless
+# for a storage census). We mirror the prober's denylist here by reading the
+# superblock magic via statfs(2) so both paths share one definition of what a
+# pseudo filesystem is.
+#
+# tmpfs and ramfs are deliberately NOT treated as pseudo (they hold real
+# application data in /dev/shm and /tmp), matching the prober's NOTE.
+_PSEUDO_FS_MAGICS = frozenset({
+    0x9fa0,       # PROC_SUPER_MAGIC  -- /proc
+    0x62656572,   # SYSFS_MAGIC       -- /sys
+    0x9fa2,       # SOCKFS_MAGIC
+    0x64626720,   # DEBUGFS_MAGIC
+    0x1cd1,       # DEVPTS_SUPER_MAGIC
+    0x74656d70,   # DEVTMPFS_MAGIC    -- /dev
+    0x50495045,   # PIPEFS_MAGIC
+    0x27e0eb,     # CGROUP_SUPER_MAGIC
+    0xf97cff8c,   # SELINUX_MAGIC
+    0xBAD1DEA,    # FUTEXFS_SUPER_MAGIC
+    0x2BAD1DEA,   # INOTIFYFS_SUPER_MAGIC
+    0xabba1974,   # XENFS_SUPER_MAGIC
+    0x67596969,   # RPCAUTH_GSSMAGIC
+    0x74726163,   # TRACEFS_MAGIC
+    0x63677270,   # CGROUP2_SUPER_MAGIC
+    0xCAFE4A11,   # BPF_FS_MAGIC
+    0x19800202,   # mqueue / eventpoll / aio-ring family
+})
+
+
+class _Statfs(ctypes.Structure):
+    # Layout of glibc `struct statfs` on 64-bit Linux. Only f_type (the first
+    # word, carrying the superblock magic) is read; the rest is declared so the
+    # buffer is correctly sized for the syscall to write into.
+    _fields_ = [
+        ("f_type", ctypes.c_int64),
+        ("f_bsize", ctypes.c_int64),
+        ("f_blocks", ctypes.c_uint64),
+        ("f_bfree", ctypes.c_uint64),
+        ("f_bavail", ctypes.c_uint64),
+        ("f_files", ctypes.c_uint64),
+        ("f_ffree", ctypes.c_uint64),
+        ("f_fsid", ctypes.c_int32 * 2),
+        ("f_namelen", ctypes.c_int64),
+        ("f_frsize", ctypes.c_int64),
+        ("f_flags", ctypes.c_int64),
+        ("f_spare", ctypes.c_int64 * 4),
+    ]
+
+
+_statfs_supported = True   # flips to False on first hard failure
+
+
+def is_pseudo_fs(path: str) -> bool:
+    """Return True if ``path`` lives on a pseudo/virtual filesystem.
+
+    Reads the superblock magic via statfs(2) and matches it against the same
+    denylist the eBPF prober uses. Fails open (returns False) when statfs is
+    unavailable or errors, so an undeterminable filesystem is still inventoried
+    rather than silently dropped -- we would rather over-include than lose real
+    storage from the census.
+    """
+    global _statfs_supported, _libc
+    if not _statfs_supported:
+        return False
+    try:
+        if _libc is None:
+            _libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # statfs is resolved lazily; pin its signature once available.
+        if not getattr(_libc.statfs, "_iotracer_pinned", False):
+            _libc.statfs.argtypes = [ctypes.c_char_p, ctypes.POINTER(_Statfs)]
+            _libc.statfs.restype = ctypes.c_int
+            _libc.statfs._iotracer_pinned = True
+        buf = _Statfs()
+        rc = _libc.statfs(os.fsencode(path), ctypes.byref(buf))
+        if rc != 0:
+            err = ctypes.get_errno()
+            if err == 38:  # ENOSYS -- statfs absent, never retry
+                _statfs_supported = False
+            return False
+        # Mask to 32 bits: the kernel stores the magic in a signed word and
+        # several magics (e.g. SELINUX 0xf97cff8c) have the high bit set.
+        return (buf.f_type & 0xFFFFFFFF) in _PSEUDO_FS_MAGICS
+    except (OSError, AttributeError):
+        _statfs_supported = False
+        return False
+
+
 # Size value written for a file that disappeared since the previous snapshot.
 # In delta snapshots a deleted file is emitted as a tombstone row carrying this
 # sentinel so consumers can distinguish removals from added/modified files
@@ -182,8 +273,10 @@ class FilesystemSnapper:
         Perform a filesystem snapshot by walking the directory tree.
 
         Recursively scans directories up to max_depth, recording information
-        about each file found. Skips special filesystems and already-visited
-        inodes to avoid duplicates.
+        about each file found. Pseudo filesystems (procfs, sysfs, cgroup, ...)
+        are skipped at their mount points via statfs() so the inventory stays
+        focused on durable storage, mirroring the eBPF prober's denylist.
+        Already-visited inodes are skipped to avoid duplicates.
 
         The first snapshot records every file (a full inventory). Every snapshot
         after that is a delta: a file is recorded only if it is new or its
@@ -253,7 +346,7 @@ class FilesystemSnapper:
                 if p.startswith(prefix):
                     new_state.setdefault(p, meta)
 
-        def scan_dir(path: str, depth: int = 0):
+        def scan_dir(path: str, depth: int = 0, parent_dev=None):
             """Inner function for recursive directory scanning."""
             if self.interrupt or (max_depth is not None and depth > max_depth):
                 return
@@ -265,6 +358,15 @@ class FilesystemSnapper:
                 # longer exists, let its files fall through to tombstones.
                 if is_delta and is_transient(e):
                     carry_over_subtree(path)
+                return
+
+            # At every mount boundary (the device id differs from the parent,
+            # or this is the root of the walk) check whether we have crossed
+            # into a pseudo filesystem -- /proc, /sys, cgroup, etc. -- and if so
+            # skip the whole subtree. These carry no durable storage and would
+            # otherwise dominate the inventory. Gating on the device change keeps
+            # this to one statfs() per mount rather than one per directory.
+            if st.st_dev != parent_dev and is_pseudo_fs(path):
                 return
 
             key = (st.st_dev, st.st_ino)
@@ -295,7 +397,7 @@ class FilesystemSnapper:
 
                                 emit(entry.path, size, mtime_ts, ctime_ts, atime_ts)
                             elif entry.is_dir(follow_symlinks=False):
-                                scan_dir(entry.path, depth + 1)
+                                scan_dir(entry.path, depth + 1, st.st_dev)
                         except Exception as e:
                             # Couldn't read this entry. On a transient failure
                             # keep its previous state so a file we merely failed
