@@ -18,9 +18,7 @@ Example:
     hashed = simple_hash("sensitive_data")
 """
 
-import csv
 import gzip
-import io
 import itertools
 import shutil
 import sys
@@ -532,21 +530,45 @@ def run_with_spinner(label: str, fn):
 def format_csv_row(*fields) -> str:
     """
     Format fields as a CSV row without trailing newline.
-    
+
+    Hot path: called once per traced event (millions of times per trace), so it
+    avoids the per-row ``io.StringIO`` + ``csv.writer`` allocation the stdlib
+    ``csv`` module would incur. The quoting rules reproduce Python's csv default
+    dialect exactly (``QUOTE_MINIMAL``): a field is quoted only when it contains
+    the delimiter ``,``, the quote char ``"``, or a line break (``\\n``/``\\r``),
+    embedded quotes are doubled, and ``None`` becomes an empty field.
+
     Args:
         *fields: Variable number of field values
-        
+
     Returns:
         str: Comma-separated values with proper escaping
-        
+
     Example:
         >>> format_csv_row("name", "value,with,commas")
         'name,"value,with,commas"'
     """
-    output = io.StringIO()
-    writer = csv.writer(output, lineterminator='')
-    writer.writerow(fields)
-    return output.getvalue()
+    parts = []
+    append = parts.append
+    for f in fields:
+        if f is None:
+            append("")
+        elif type(f) is str:
+            # QUOTE_MINIMAL: only quote when a special char is present.
+            if ('"' in f) or ("," in f) or ("\n" in f) or ("\r" in f):
+                append('"' + f.replace('"', '""') + '"')
+            else:
+                append(f)
+        else:
+            # Non-str (int/float/bool): str() never yields a CSV-special char,
+            # so it can be appended without the quoting scan. Matches csv, which
+            # str()s non-string fields.
+            append(str(f))
+    # csv quotes a lone empty field as "" so a one-empty-field row stays
+    # distinguishable from a zero-field (empty) row on read-back.
+    if len(parts) == 1 and parts[0] == "":
+        return '""'
+    return ",".join(parts)
 
 
 # Thresholds for auto-enabling the higher-overhead tracing subsystems based on
