@@ -215,4 +215,4 @@ The io_uring tracepoint probes (`io_uring:io_uring_submit_sqe`, `io_uring:io_uri
 
 2. If the format includes `req`, `opcode`, `user_data`, and `flags` fields, change `#if 0` to `#if 1` around line 4218 in `prober.c`.
 
-**Output File:** none — io_uring READ/WRITE I/O is mirrored into the fs/VFS trace at `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/fs/fs_*.csv.zst`. There is no standalone `io_uring/` stream.
+**Output File:** none — io_uring READ/WRITE I/O is mirrored into the fs/VFS trace at `linux_v1/{MACHINE_ID}/{TIMESTAMP}/fs/fs_*.csv.zst`. There is no standalone `io_uring/` stream.

@@ -5,10 +5,12 @@ subset**: connection lifecycle, socket option changes, and packet
 drops/retransmissions. The high-frequency per-packet TCP/UDP send/receive path
 is **not** traced, which keeps kernel-side overhead minimal.
 
-**Opt-in:** Network tracing is **off by default**. Enable it with `--network`.
-The probes are only *compiled into* the eBPF program (via `-DENABLE_NETWORK`) and
-auto-attached when this flag is set, so there is zero added overhead when it is
-off.
+**Enable policy:** Network tracing **auto-enables on a capable host** — one with
+>=8 logical cores, >=16 GB RAM, and a >=10 Mbps link — where the overhead is
+affordable; on smaller hosts it stays off. The `--network` flag **forces** it on
+regardless of host resources (always honored). The probes are *compiled into* the
+eBPF program (via `-DENABLE_NETWORK`) and auto-attached whenever network tracing
+is enabled, so there is zero added overhead when it is off.
 
 All probes are syscall/event **tracepoints** (stable across kernel versions):
 
@@ -27,9 +29,9 @@ nanoseconds.
 **Output Files:** Like every other trace stream, network streams are
 Zstandard-compressed on disk and on upload:
 
-- `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/nw_conn/nw_conn_*.csv.zst`
-- `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/nw_sockopt/nw_sockopt_*.csv.zst`
-- `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/nw_drop/nw_drop_*.csv.zst`
+- `linux_v1/{MACHINE_ID}/{TIMESTAMP}/nw_conn/nw_conn_*.csv.zst`
+- `linux_v1/{MACHINE_ID}/{TIMESTAMP}/nw_sockopt/nw_sockopt_*.csv.zst`
+- `linux_v1/{MACHINE_ID}/{TIMESTAMP}/nw_drop/nw_drop_*.csv.zst`
 
 (They are left uncompressed only when the optional `zstandard` library is
 unavailable — the same fallback that applies to all streams.)

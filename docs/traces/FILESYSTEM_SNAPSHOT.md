@@ -15,12 +15,12 @@
 
 | # | Field | Type | Description |
 |---|-------|------|-------------|
-| 1 | Snapshot Timestamp | `datetime` | Time when this snapshot was taken (`YYYY-MM-DD HH:MM:SS`) |
-| 2 | File Path | `string` | Full file path (or hashed path in anonymous mode) |
-| 3 | Size | `integer` | File size in bytes |
-| 4 | Creation Time | `datetime` | File creation time (`st_birthtime`); falls back to `st_mtime` if unavailable |
-| 5 | Modification Time | `datetime` | Last data modification time (`st_mtime`) |
-| 6 | Access Time | `datetime` | Last access time (`st_atime`) |
+| 1 | snapshot_timestamp | `datetime` | Time when this snapshot was taken (`YYYY-MM-DD HH:MM:SS`) |
+| 2 | file_path | `string` | Full file path (or hashed path in anonymous mode) |
+| 3 | size | `integer` | File size in bytes |
+| 4 | creation_time | `datetime` | File creation time (`st_birthtime`); falls back to `st_mtime` if unavailable |
+| 5 | modification_time | `datetime` | Last data modification time (`st_mtime`) |
+| 6 | access_time | `datetime` | Last access time (`st_atime`) |
 | 7 | mono_ns | `u64` | Snapshot time in `CLOCK_MONOTONIC` nanoseconds (`time.monotonic_ns()`, captured once per snapshot) — the common cross-stream correlation clock; add the manifest's `clock.mono_to_real_offset_ns` to recover wall-clock ns. |
 
 ## Excluded Filesystems
@@ -40,7 +40,7 @@ Files on virtual/pseudo filesystems are automatically excluded by skipping diffe
 
 When anonymization is enabled (`-a`/`--anonimize`), file paths are hashed using a deterministic hash function (12-character hash). Directory structure is preserved but individual path components are replaced with hashes. File extensions are kept for analysis purposes.
 
-**Output File:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/filesystem_snapshot/filesystem_snapshot_part####_TIMESTAMP_DEVICEID*.csv.zst`
+**Output File:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/filesystem_snapshot/filesystem_snapshot_part####_TIMESTAMP_DEVICEID*.csv.zst`
 
 ## Multi-Part Files
 

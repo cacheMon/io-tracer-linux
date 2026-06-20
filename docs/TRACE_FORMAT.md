@@ -12,14 +12,14 @@ below mirror that module. Bump `SCHEMA_VERSION` there whenever columns change.
 Traces are uploaded to object storage with the following prefix structure:
 
 ```
-linux_trace_v4_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
+linux_v1/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── fs/                    # VFS (Virtual File System) traces
 ├── block/                 # Block device traces
-├── cache/                 # Page cache events (opt-in: --cache)
+├── cache/                 # Page cache events (auto-enabled on capable hosts; force with --cache)
 ├── pagefault/             # Memory-mapped page fault events
-├── nw_conn/               # Network connection lifecycle (opt-in: --network)
-├── nw_sockopt/            # Network socket-option events (opt-in: --network)
-├── nw_drop/               # Network drops/retransmits (opt-in: --network)
+├── nw_conn/               # Network connection lifecycle (auto-enabled on capable hosts; force with --network)
+├── nw_sockopt/            # Network socket-option events (auto-enabled on capable hosts; force with --network)
+├── nw_drop/               # Network drops/retransmits (auto-enabled on capable hosts; force with --network)
 ├── process/               # Process state snapshots
 ├── filesystem_snapshot/   # Filesystem metadata snapshots
 └── system_spec/           # System specification files
@@ -53,7 +53,7 @@ than hard-coding column positions.
 
 ## 1. VFS (Virtual File System) Traces
 
-**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/fs/fs_*.csv.zst`
+**Location:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/fs/fs_*.csv.zst`
 
 **Description:** Captures all file system operations at the VFS layer, including reads, writes, opens, closes, and metadata operations. Also receives io_uring READ/WRITE rows mirrored from the io_uring instrumentation.
 
@@ -78,7 +78,7 @@ For operations captured and examples, see [VFS_EVENTS.md](traces/VFS_EVENTS.md).
 
 ## 2. Block Device Traces
 
-**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/block/block_*.csv.zst`
+**Location:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/block/block_*.csv.zst`
 
 **Description:** Captures block layer I/O operations with latency measurements from issue to completion.
 
@@ -102,7 +102,7 @@ For operations captured and examples, see [BLOCK_IO_EVENTS.md](traces/BLOCK_IO_E
 
 ## 3. Cache Events
 
-**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/cache/cache_*.csv.zst`
+**Location:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/cache/cache_*.csv.zst`
 
 **Description:** Captures page cache operations including hits, misses, dirty pages, writeback, and evictions.
 
@@ -118,7 +118,7 @@ For event types and examples, see [PAGE_CACHE_EVENTS.md](traces/PAGE_CACHE_EVENT
 
 ## 4. Page Fault Events
 
-**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/pagefault/pagefault_*.csv.zst`
+**Location:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/pagefault/pagefault_*.csv.zst`
 
 **Description:** Captures file-backed page faults from memory-mapped I/O operations. Tracks which memory accesses trigger disk reads (major faults) vs cache hits (minor faults).
 
@@ -132,12 +132,15 @@ For fault types and examples, see [PAGE_FAULT_EVENTS.md](traces/PAGE_FAULT_EVENT
 
 ---
 
-## 4b. Network Events (opt-in: `--network`)
+## 4b. Network Events (auto-enabled on capable hosts; force with `--network`)
 
-**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/nw_conn|nw_sockopt|nw_drop/*.csv.zst`
+**Location:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/nw_conn|nw_sockopt|nw_drop/*.csv.zst`
 
 **Description:** Low-overhead network subset — connection lifecycle,
-socket options, and drops/retransmits. **Off by default**; enable with `--network`.
+socket options, and drops/retransmits. **Auto-enabled on a capable host**
+(>=8 logical cores AND >=16 GB RAM AND a >=10 Mbps link, where the overhead is
+affordable); on smaller hosts it stays off. The `--network` flag forces it on
+regardless of host resources (always honored).
 The high-frequency per-packet TCP/UDP send/recv path is intentionally not traced.
 
 ### CSV Headers
@@ -157,7 +160,7 @@ For field details and event types, see [NETWORK_EVENTS.md](traces/NETWORK_EVENTS
 
 ## 5. Process Snapshots
 
-**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/process/process_*.csv.zst`
+**Location:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/process/process_*.csv.zst`
 
 **Description:** Periodic snapshots of all running processes (captured every 5 minutes by default).
 
@@ -173,7 +176,7 @@ For field details and examples, see [PROCESS_SNAPSHOT.md](traces/PROCESS_SNAPSHO
 
 ## 6. Filesystem Snapshots
 
-**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/filesystem_snapshot/filesystem_snapshot_*.csv.zst`
+**Location:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/filesystem_snapshot/filesystem_snapshot_*.csv.zst`
 
 **Description:** Periodic directory tree snapshots showing file metadata (captured hourly by default). Large scans are split into multiple parts — see [MULTIPART_FILESYSTEM_SNAPSHOT.md](MULTIPART_FILESYSTEM_SNAPSHOT.md).
 
@@ -189,7 +192,7 @@ For field details and examples, see [FILESYSTEM_SNAPSHOT.md](traces/FILESYSTEM_S
 
 ## 7. System Specification Files
 
-**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/system_spec/`
+**Location:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/system_spec/`
 
 These are JSON files capturing system hardware and configuration at trace start:
 
@@ -243,10 +246,10 @@ For field details, see [SYSTEM_SNAPSHOT.md](traces/SYSTEM_SNAPSHOT.md).
 - Final archives: `.csv.zst` format
 
 ### File Rotation
-Continuous streams (VFS, block, cache, page fault) are rotated and compressed when any
+Continuous streams (VFS, block, cache, page fault, nw_conn, nw_sockopt, nw_drop) are rotated and compressed when any
 of the following is reached (see `WriteManager` in `src/tracer/WriterManager.py`):
 - **Event count:** ~80,000–100,000 buffered events (adaptively raised under load)
-- **File age:** 20 minutes since the current file was opened
+- **File age:** 5 minutes since the current file was opened
 - **File size:** 100 MB uncompressed on disk
 
 Snapshots (process, filesystem) are written as whole units rather than rotated mid-session.

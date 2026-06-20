@@ -17,16 +17,16 @@
 
 | # | Field | Type | Description |
 |---|-------|------|-------------|
-| 1 | Timestamp | `datetime` | Event timestamp (`YYYY-MM-DD HH:MM:SS.ffffff`) |
-| 2 | PID | `u32` | Process ID that triggered the event |
-| 3 | Command | `string` | Process name (max 16 characters) |
-| 4 | Event Type | `string` | Cache event type (see table below) |
-| 5 | Inode | `u64` | File inode number; empty if `0` |
-| 6 | Page Index | `u64` | Page offset within file (file offset / PAGE_SIZE); empty if `0` |
-| 7 | Size | `u32` | File size in pages (from `inode->i_size >> 12`) |
-| 8 | CPU ID | `u32` | CPU where event occurred |
-| 9 | Device ID | `u32` | Device ID from the file's superblock |
-| 10 | Count | `u32` | Number of pages affected by the operation (1 for single-page, N for bulk) |
+| 1 | timestamp | `datetime` | Event timestamp (`YYYY-MM-DD HH:MM:SS.ffffff`) |
+| 2 | pid | `u32` | Process ID that triggered the event |
+| 3 | command | `string` | Process name (max 16 characters) |
+| 4 | event_type | `string` | Cache event type (see table below) |
+| 5 | inode | `u64` | File inode number; empty if `0` |
+| 6 | page_index | `u64` | Page offset within file (file offset / PAGE_SIZE); empty if `0` |
+| 7 | size_pages | `u32` | File size in pages (from `inode->i_size >> 12`) |
+| 8 | cpu_id | `u32` | CPU where event occurred |
+| 9 | device_id | `u32` | Device ID from the file's superblock |
+| 10 | count | `u32` | Number of pages affected by the operation (1 for single-page, N for bulk) |
 | 11 | mono_ns | `u64` | Record time in `CLOCK_MONOTONIC` nanoseconds (kernel `bpf_ktime_get_ns()`) — the common cross-stream correlation clock; add the manifest's `clock.mono_to_real_offset_ns` to recover wall-clock ns. |
 
 ## Event Types
@@ -44,7 +44,7 @@
 | 8 | `READAHEAD` | Pages prefetched into cache by readahead |
 | 9 | `RECLAIM` | Pages reclaimed under memory pressure (kswapd/direct reclaim) |
 
-**Output File:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/cache/cache_*.csv.zst`
+**Output File:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/cache/cache_*.csv.zst` (or `.csv.gz` when zstd is unavailable and the gzip fallback is used)
 
 **Important Limitation — Filename Resolution:**
 The filename is **not captured** for cache events due to eBPF constraints. Cache events provide only: folio/page → address_space → inode. Resolving inode → filename requires traversing `inode->i_dentry` (a linked list of hard links), which is impractical in eBPF. Use inode numbers to correlate with VFS events or filesystem snapshots.

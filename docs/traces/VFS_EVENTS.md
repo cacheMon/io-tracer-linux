@@ -166,25 +166,25 @@ The path captured is relative to the mount namespace of the probed process. In c
 
 | # | Field | Type | Description |
 |---|-------|------|-------------|
-| 1 | Timestamp | `datetime` | Event timestamp (`YYYY-MM-DD HH:MM:SS.ffffff`), derived from the kernel's per-event `bpf_ktime_get_ns()` (CLOCK_MONOTONIC) converted to wall-clock. This is the time the event actually occurred, so rows are correctly ordered when sorted by this column even though the per-CPU perf buffers deliver them in batches. |
-| 2 | Operation | `string` | VFS operation type (see table below) |
-| 3 | PID | `u32` | Process ID |
-| 4 | Command | `string` | Process name (max 16 characters) |
-| 5 | Filename | `string` | File path; for dual-path operations (`RENAME`, `LINK`, `SYMLINK`) formatted as `old_path -> new_path`. For `OPEN`, the path is resolved to absolute via `/proc/<pid>/fd`; if that races (fd already closed) and the captured path was relative, it is resolved against the openat `dirfd` / process cwd as a fallback |
-| 6 | Size (requested) | `u64` | **Requested** I/O size in bytes — the `count` argument to `read`/`write` (or operation size for others); `0` for non-I/O operations. The **actual** bytes transferred are in column 17 (`bytes_completed`), which can be smaller (short read/write). |
-| 7 | Inode | `u64` | File inode number; empty if `0` |
-| 8 | Flags | `string` | Operation-specific flags for non-MMAP operations (see tables below); empty when the operation has no defined flag value to render |
-| 9 | Offset | `u64` | File offset for positioned I/O; empty if `0` |
-| 10 | TID | `u32` | Thread ID for multi-threaded correlation; empty if `0` |
-| 11 | mmap_prot | `string` | MMAP protection flags (`PROT_*`, pipe-separated); empty for non-MMAP operations |
-| 12 | mmap_flags | `string` | MMAP mapping flags (`MAP_*`, pipe-separated); empty for non-MMAP operations |
-| 13 | address | `string` | Mapping start address as hex (`0x...`) for `MMAP` and `MUNMAP`; for `MREMAP` formatted as `old_address -> new_address`; empty for other operations |
-| 14 | cmdline | `string` | Full command line (`argv` joined by spaces) of the process that triggered the event; empty if unresolvable (see below) |
-| 15 | return_value | `s64` | Raw syscall return value for `READ`/`WRITE` (bytes moved if `>= 0`, negative `errno` on failure); empty for other operations |
-| 16 | errno | `string` | Error name (e.g. `EAGAIN`) when a `READ`/`WRITE` failed (`return_value < 0`); empty on success or for other operations |
-| 17 | bytes_completed (actual) | `u64` | **Actual** bytes read/written for `READ`/`WRITE` (`return_value` when `>= 0`); compare against column 6 (`Size (requested)`) to detect short I/O. Empty on failure or for other operations |
-| 18 | duration_ns | `u64` | Operation duration in nanoseconds (entry → return) for `READ`/`WRITE`; empty for other operations |
-| 19 | device | `string` | Backing device of the file as `major:minor` (from `super_block->s_dev`); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
+| 1 | timestamp | `datetime` | Event timestamp (`YYYY-MM-DD HH:MM:SS.ffffff`), derived from the kernel's per-event `bpf_ktime_get_ns()` (CLOCK_MONOTONIC) converted to wall-clock. This is the time the event actually occurred, so rows are correctly ordered when sorted by this column even though the per-CPU perf buffers deliver them in batches. |
+| 2 | operation | `string` | VFS operation type (see table below) |
+| 3 | pid | `u32` | Process ID |
+| 4 | tid | `u32` | Thread ID for multi-threaded correlation; empty if `0` |
+| 5 | command | `string` | Process name (max 16 characters) |
+| 6 | filename | `string` | File path; for dual-path operations (`RENAME`, `LINK`, `SYMLINK`) formatted as `old_path -> new_path`. For `OPEN`, the path is resolved to absolute via `/proc/<pid>/fd`; if that races (fd already closed) and the captured path was relative, it is resolved against the openat `dirfd` / process cwd as a fallback |
+| 7 | size | `u64` | **Requested** I/O size in bytes — the `count` argument to `read`/`write` (or operation size for others); `0` for non-I/O operations. The **actual** bytes transferred are in column 9 (`bytes_completed`), which can be smaller (short read/write). |
+| 8 | offset | `u64` | File offset for positioned I/O; empty if `0` |
+| 9 | bytes_completed | `u64` | **Actual** bytes read/written for `READ`/`WRITE` (`return_value` when `>= 0`); compare against column 7 (`size`) to detect short I/O. Empty on failure or for other operations |
+| 10 | inode | `u64` | File inode number; empty if `0` |
+| 11 | device | `string` | Backing device of the file as `major:minor` (from `super_block->s_dev`); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
+| 12 | flags | `string` | Operation-specific flags for non-MMAP operations (see tables below); empty when the operation has no defined flag value to render |
+| 13 | duration_ns | `u64` | Operation duration in nanoseconds (entry → return) for `READ`/`WRITE`; empty for other operations |
+| 14 | return_value | `s64` | Raw syscall return value for `READ`/`WRITE` (bytes moved if `>= 0`, negative `errno` on failure); empty for other operations |
+| 15 | errno | `string` | Error name (e.g. `EAGAIN`) when a `READ`/`WRITE` failed (`return_value < 0`); empty on success or for other operations |
+| 16 | mmap_prot | `string` | MMAP protection flags (`PROT_*`, pipe-separated); empty for non-MMAP operations |
+| 17 | mmap_flags | `string` | MMAP mapping flags (`MAP_*`, pipe-separated); empty for non-MMAP operations |
+| 18 | address | `string` | Mapping start address as hex (`0x...`) for `MMAP` and `MUNMAP`; for `MREMAP` formatted as `old_address -> new_address`; empty for other operations |
+| 19 | cmdline | `string` | Full command line (`argv` joined by spaces) of the process that triggered the event; empty if unresolvable (see below) |
 | 20 | ppid | `u32` | Parent process ID (`real_parent->tgid`); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
 | 21 | container_id | `u64` | cgroup v2 id of the process (container identifier); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
 | 22 | fs_type | `string` | Source filesystem name derived from the superblock magic (e.g. `EXT2/3/4`, `XFS`, `BTRFS`, `OVERLAYFS`, `NFS`), letting physical-disk I/O be distinguished from network/overlay sources; populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
@@ -231,7 +231,7 @@ If a process completes entirely within a single perf-buffer batch (spawned and e
 For `PROCESS_EXEC` events, if the `filename` field is empty (the eBPF probe did not capture a path), `argv[0]` from `cmdline` is used as the filename. This provides best-effort attribution of the executed binary when kernel-side resolution fails (e.g. kernel-internal `execve` calls that bypass `do_sys_openat2`).
 
 #### `comm` vs `cmdline`
-The `command` field (column 4) is the short process name captured in-kernel by eBPF (`task->comm`, max 16 chars). The `cmdline` field is the full argument vector read from `/proc` in userspace. For processes that use `prctl(PR_SET_NAME, ...)` to rename themselves, `comm` may differ from `argv[0]`.
+The `command` field (column 5) is the short process name captured in-kernel by eBPF (`task->comm`, max 16 chars). The `cmdline` field is the full argument vector read from `/proc` in userspace. For processes that use `prctl(PR_SET_NAME, ...)` to rename themselves, `comm` may differ from `argv[0]`.
 
 
 
@@ -462,4 +462,4 @@ In some cases, the filename field may be empty. This occurs when the kernel data
 - Check the inode field — if it's non-zero, the file exists but the path couldn't be resolved
 - Correlate with the operation type and process command to determine if the empty filename is expected
 
-**Output File:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/fs/fs_*.csv.zst`
+**Output File:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/fs/fs_*.csv.zst`

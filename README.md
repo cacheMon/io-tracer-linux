@@ -7,8 +7,10 @@ Visit [IO Tracer documentations](https://cachemon.github.io/iotracerdocs/) for m
 
 ### One-line installation
 ```bash
-curl -sSL https://raw.githubusercontent.com/cacheMon/io-tracer/refs/heads/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/cacheMon/io-tracer-linux/main/install.sh | sudo bash
 ```
+The installer clones the repo, installs BCC + the Python dependencies, and sets
+up the `iotrc` command. Re-run it any time to update to the latest version.
 
 ### Manual Installation
 
@@ -16,8 +18,8 @@ curl -sSL https://raw.githubusercontent.com/cacheMon/io-tracer/refs/heads/main/i
 1. Clone the repo
 
 ```bash
-git clone https://github.com/cacheMon/io-tracer.git
-cd io-tracer
+git clone https://github.com/cacheMon/io-tracer-linux.git
+cd io-tracer-linux
 ```
 
 2. Install BCC
@@ -66,7 +68,7 @@ To run the test suite you'll also need `pytest` (`pip install pytest`).
 
 ## Usage
 ```
-usage: sudo iotrc [-h] [-v] [-a] [--computer-id] [--reward] [--no-upload] {dev} ...
+usage: sudo iotrc [-h] [-v] [-a] [--cache] [--network] [--computer-id] [--reward] [--no-upload] {dev} ...
 
 Trace IO syscalls
 
