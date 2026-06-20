@@ -48,6 +48,52 @@ class FormatCsvRowTests(unittest.TestCase):
     def test_integers_are_stringified(self):
         self.assertEqual(format_csv_row(1, 2, 3), "1,2,3")
 
+    # The function is a hand-rolled hot path; these guard exact parity with the
+    # stdlib csv default dialect (QUOTE_MINIMAL) it replaced.
+    def test_none_is_empty_field(self):
+        # csv renders None as an empty field (not the string "None").
+        self.assertEqual(format_csv_row("a", None, "b"), "a,,b")
+
+    def test_lone_empty_field_is_quoted(self):
+        # A single empty field is written as "" so it stays distinguishable from
+        # a zero-field (empty) row; multiple empty fields are not quoted.
+        self.assertEqual(format_csv_row(""), '""')
+        self.assertEqual(format_csv_row(None), '""')
+        self.assertEqual(format_csv_row("", ""), ",")
+        self.assertEqual(format_csv_row(), "")
+
+    def test_quotes_fields_with_newline_or_cr(self):
+        self.assertEqual(format_csv_row("a\nb"), '"a\nb"')
+        self.assertEqual(format_csv_row("a\rb"), '"a\rb"')
+
+    def test_matches_stdlib_csv_fuzz(self):
+        import io as _io
+        import csv as _csv
+        import random as _random
+        import string as _string
+
+        def _ref(*fields):
+            out = _io.StringIO()
+            _csv.writer(out, lineterminator="").writerow(fields)
+            return out.getvalue()
+
+        _random.seed(1234)
+        alpha = _string.printable + 'é—\t,"\n\r'
+        for _ in range(20000):
+            fields = []
+            for _ in range(_random.randint(0, 6)):
+                r = _random.random()
+                if r < 0.2:
+                    fields.append(_random.randint(-10**9, 10**9))
+                elif r < 0.27:
+                    fields.append(None)
+                elif r < 0.34:
+                    fields.append("")
+                else:
+                    fields.append("".join(_random.choice(alpha)
+                                          for _ in range(_random.randint(0, 10))))
+            self.assertEqual(format_csv_row(*fields), _ref(*fields), msg=repr(fields))
+
 
 class HashTests(unittest.TestCase):
     def test_simple_hash_is_deterministic(self):
