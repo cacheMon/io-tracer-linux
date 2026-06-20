@@ -9,7 +9,7 @@
 > short or cache-served run — reads hitting the page cache, dirty-page
 > writeback not yet flushed — little or no I/O reaches the device, so the
 > lazily-created `ds/` folder may not appear at all. Block I/O shows up once
-> there is real device activity: cache misses, `fsync`, write-back, or direct
+> there is real device activity: cache misses, `fsync`, writeback, or direct
 > I/O. The tracer logs a `Block diagnostics: 0 block I/O events captured …`
 > line at shutdown when this happens, to distinguish it from a failed stream.
 
