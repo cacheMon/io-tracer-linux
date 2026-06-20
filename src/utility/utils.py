@@ -576,7 +576,7 @@ def format_csv_row(*fields) -> str:
 # so they are only switched on automatically when the machine has headroom to
 # spare. Tune these in one place rather than scattering magic numbers.
 AUTO_TRACE_MIN_LOGICAL_CORES = 8      # cores needed to absorb extra probe work
-AUTO_TRACE_MIN_TOTAL_RAM_GB = 15.0    # total DRAM for the larger event buffers
+AUTO_TRACE_MIN_TOTAL_RAM_GB = 16.0    # total DRAM for the larger event buffers
 AUTO_TRACE_MIN_AVAIL_RAM_GB = 2.0     # free DRAM headroom at start-of-trace
 AUTO_TRACE_MIN_NET_SPEED_MBPS = 10    # a link fast enough (>=10 Mbps) to be worth tracing
 
@@ -657,15 +657,16 @@ def auto_select_tracing(
     trace_cache: bool, trace_network: bool, verbose: bool = False
 ) -> tuple[bool, bool]:
     """
-    Auto-enable the low-overhead network probes when the host has spare
-    resources. Page-cache tracing is NOT auto-enabled: it is by far the
-    highest-volume stream (every page add/dirty/writeback/evict) and on a busy
-    box costs ~1 full CPU core, so it stays opt-in via ``--cache``. Network
-    events are orders of magnitude rarer and remain auto-enabled on a capable,
-    fast-linked host.
+    Auto-enable cache/network tracing when the host has spare resources.
+
+    Page-cache tracing is the highest-volume stream (every page add/dirty/
+    writeback/evict) and costs ~1 CPU core on a busy box, so it is auto-enabled
+    only on a capable host — at least ``AUTO_TRACE_MIN_LOGICAL_CORES`` cores
+    (8) and ``AUTO_TRACE_MIN_TOTAL_RAM_GB`` GB RAM (16) — where that overhead is
+    affordable. Network tracing additionally requires a fast enough link.
 
     Explicit opt-ins are always honored: a flag already set to True is never
-    turned back off.
+    turned back off; this only switches a subsystem on, never off.
 
     Args:
         trace_cache: whether page-cache tracing was explicitly requested
@@ -683,8 +684,9 @@ def auto_select_tracing(
         resources["max_net_speed_mbps"],
     )
 
-    # Cache is opt-in only (high overhead); never auto-enabled from resources.
-    auto_cache = trace_cache
+    # Auto-enable cache on a capable host (>=8 cores and >=16 GB RAM); network
+    # additionally requires a fast link. Explicit flags are never turned off.
+    auto_cache = trace_cache or decision["enable_cache"]
     auto_network = trace_network or decision["enable_network"]
 
     if verbose:
@@ -704,10 +706,12 @@ def auto_select_tracing(
             logger("info", "Auto-enabled network tracing (host has enough CPU, DRAM and network).")
         if not auto_network:
             logger("info", "Network tracing left off (insufficient CPU/DRAM/network headroom).")
-        if auto_cache:
+        if auto_cache and not trace_cache:
+            logger("info", "Auto-enabled page-cache tracing (host has >=8 cores and >=16 GB RAM).")
+        elif auto_cache:
             logger("info", "Page-cache tracing enabled (--cache).")
         else:
-            logger("info", "Page-cache tracing left off (high overhead; opt-in via --cache).")
+            logger("info", "Page-cache tracing left off (insufficient CPU/DRAM headroom for the highest-volume stream).")
 
     return auto_cache, auto_network
 
