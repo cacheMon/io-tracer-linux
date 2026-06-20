@@ -1167,11 +1167,14 @@ class IOTracer:
 
         run_with_spinner("Flushing trace data", _flush)
 
-    def _block_stats(self):
+    def _block_stats(self, collapse_zero: bool = True):
         """Read the per-CPU ``block_stats`` map → {issued, completed, missed, stale}.
 
-        Returns an empty dict if the map is unavailable or all-zero. ``missed``
-        counts completions with no tracked issue ctx (LRU-evicted or pre-trace);
+        Returns an empty dict if the map is unavailable, or — when
+        ``collapse_zero`` is True (the default) — if every counter is zero.
+        Pass ``collapse_zero=False`` to tell "no block I/O happened" (all-zero
+        but map present) apart from "map unavailable". ``missed`` counts
+        completions with no tracked issue ctx (LRU-evicted or pre-trace);
         ``stale`` counts completions dropped because the matched issue ctx had an
         implausible device latency ((dev, sector) key reused across a gap).
         """
@@ -1185,13 +1188,20 @@ class IOTracer:
             }
         except Exception:
             return {}
-        return out if any(out.values()) else {}
+        if collapse_zero and not any(out.values()):
+            return {}
+        return out
 
     def _log_block_diagnostics(self):
         """Log a summary of block-tracing health from ``block_stats``.
 
-        Completions with no matching issue ctx (``missed``) split into two kinds
-        with different remedies:
+        Reads the map without zero-collapsing so the "zero physical block I/O"
+        case is reported explicitly rather than silently skipped: an absent
+        ``ds/`` stream is expected on short or cache-served runs, and saying so
+        keeps it from looking like block tracing failed.
+
+        For runs that did produce block I/O, completions with no matching issue
+        ctx (``missed``) split into two kinds with different remedies:
 
         * **structural** — completions whose issue was never seen by the trace
           (in-flight before tracing started, or via a path that does not fire
@@ -1203,10 +1213,22 @@ class IOTracer:
           ``block_start_times`` map reduces the eviction part.
 
         Reporting the split avoids blaming all misses on eviction (the previous
-        behavior), which over-stated how much a bigger map can recover.
+        behavior), which over-stated how much a bigger map can recover. A high
+        miss rate means the issue map was evicted under load — the likely
+        explanation if block events appear to stop before a long trace ends.
         """
-        s = self._block_stats()
+        s = self._block_stats(collapse_zero=False)
         if not s:
+            # Map genuinely unavailable (e.g. block tracepoints never loaded).
+            return
+        if not any(s.values()):
+            logger("info",
+                   "Block diagnostics: 0 block I/O events captured, so no ds/ "
+                   "stream was written. This is expected on short or cache-served "
+                   "runs — reads are served from the page cache and dirty-page "
+                   "writeback may not have flushed, so no physical block I/O "
+                   "reaches the device. The ds/ stream only appears once real "
+                   "device I/O occurs (cache misses, fsync, writeback, direct I/O).")
             return
         stale = s.get("stale", 0)
         missed = s["missed"]

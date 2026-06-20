@@ -4,6 +4,15 @@
 
 **Kernel Probes:** Attached via block layer instrumentation in the eBPF program.
 
+> **A missing or empty `ds/` stream is usually expected, not a bug.** Block
+> events are only produced by *physical* device I/O (`block_rq_complete`). On a
+> short or cache-served run — reads hitting the page cache, dirty-page
+> writeback not yet flushed — little or no I/O reaches the device, so the
+> lazily-created `ds/` folder may not appear at all. Block I/O shows up once
+> there is real device activity: cache misses, `fsync`, writeback, or direct
+> I/O. The tracer logs a `Block diagnostics: 0 block I/O events captured …`
+> line at shutdown when this happens, to distinguish it from a failed stream.
+
 > **Cross-OS aligned.** The on-disk column order is the aligned
 > layout in [TRACE_FORMAT.md](../TRACE_FORMAT.md#2-block-device-traces)
 > (shared prefix `timestamp,operation,pid,tid,command,sector,size,latency_ms,device,flags`
