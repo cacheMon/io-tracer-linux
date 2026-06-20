@@ -16,8 +16,9 @@ Subcommands:
 Options:
     -v, --verbose             Print verbose output
     -a, --anonimize           Enable anonymization of process and file names
-    --cache                   Enable page-cache event tracing (higher overhead).
-                              Auto-enabled when the host has enough CPU and DRAM.
+    --cache                   Enable page-cache event tracing. High overhead
+                              (~1 CPU core on a busy host); opt-in only, never
+                              auto-enabled.
     --network                 Enable network event tracing — connection
                               lifecycle, sockopt, drops. Auto-enabled when
                               the host has enough CPU, DRAM and network.
@@ -84,7 +85,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Trace IO syscalls')
     parser.add_argument('-v', '--verbose', action='store_true', help='Print verbose output')
     parser.add_argument('-a', '--anonimize', action='store_true', help='Enable anonymization of process and file names')
-    parser.add_argument('--cache', action='store_true', help='Force-enable page-cache event tracing (higher overhead; otherwise auto-enabled when the host has enough CPU and DRAM)')
+    parser.add_argument('--cache', action='store_true', help='Enable page-cache event tracing (high overhead, ~1 CPU core on a busy host; opt-in only, never auto-enabled)')
     parser.add_argument('--network', action='store_true', help='Force-enable network event tracing: connection lifecycle, sockopt, drops (otherwise auto-enabled when the host has enough CPU, DRAM and network)')
     parser.add_argument('--computer-id', action='store_true', help='Print this machine ID and exit')
     parser.add_argument('--reward', action='store_true', help='Show your reward code (unlocked after uploading traces)')

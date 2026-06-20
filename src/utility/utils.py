@@ -635,11 +635,15 @@ def auto_select_tracing(
     trace_cache: bool, trace_network: bool, verbose: bool = False
 ) -> tuple[bool, bool]:
     """
-    Auto-enable cache/network tracing when the host has spare resources.
+    Auto-enable the low-overhead network probes when the host has spare
+    resources. Page-cache tracing is NOT auto-enabled: it is by far the
+    highest-volume stream (every page add/dirty/writeback/evict) and on a busy
+    box costs ~1 full CPU core, so it stays opt-in via ``--cache``. Network
+    events are orders of magnitude rarer and remain auto-enabled on a capable,
+    fast-linked host.
 
     Explicit opt-ins are always honored: a flag already set to True is never
-    turned back off. A feature is only flipped on when the host clears the
-    resource thresholds (see ``evaluate_resource_tracing``).
+    turned back off.
 
     Args:
         trace_cache: whether page-cache tracing was explicitly requested
@@ -657,7 +661,8 @@ def auto_select_tracing(
         resources["max_net_speed_mbps"],
     )
 
-    auto_cache = trace_cache or decision["enable_cache"]
+    # Cache is opt-in only (high overhead); never auto-enabled from resources.
+    auto_cache = trace_cache
     auto_network = trace_network or decision["enable_network"]
 
     if verbose:
@@ -673,14 +678,14 @@ def auto_select_tracing(
             f">={AUTO_TRACE_MIN_AVAIL_RAM_GB:.0f} GB free, "
             f">={AUTO_TRACE_MIN_NET_SPEED_MBPS} Mbps).",
         )
-        if auto_cache and not trace_cache:
-            logger("info", "Auto-enabled page-cache tracing (host has enough CPU and DRAM).")
         if auto_network and not trace_network:
             logger("info", "Auto-enabled network tracing (host has enough CPU, DRAM and network).")
-        if not auto_cache:
-            logger("info", "Page-cache tracing left off (insufficient CPU/DRAM headroom).")
         if not auto_network:
             logger("info", "Network tracing left off (insufficient CPU/DRAM/network headroom).")
+        if auto_cache:
+            logger("info", "Page-cache tracing enabled (--cache).")
+        else:
+            logger("info", "Page-cache tracing left off (high overhead; opt-in via --cache).")
 
     return auto_cache, auto_network
 
