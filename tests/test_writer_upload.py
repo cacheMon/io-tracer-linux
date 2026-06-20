@@ -278,10 +278,48 @@ class StaleLogRotationTests(unittest.TestCase):
 
     def test_missing_or_empty_file_is_skipped(self):
         self.wm.max_file_age = 0  # treat everything as old
-        # No file written yet, and an empty one for another stream.
+        # No file written yet, and an empty one for another stream. With no
+        # buffered rows either, there is genuinely nothing to rotate.
         open(self.wm.output_cache_file, "w").close()
         self.wm._maybe_rotate_stale_logs()
         self.assertEqual(self.upload.uploaded, [])
+
+    @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
+    def test_age_rotation_uploads_buffered_rows_with_empty_file(self):
+        # Regression: a low-volume stream can hold rows only in memory while its
+        # on-disk file is still empty (the periodic write_to_disk was starved by
+        # frequent count-rotations of busy streams). Age-based rotation must
+        # still flush+upload those buffered rows mid-trace, not defer to shutdown
+        # — otherwise a hard kill loses the whole stream (the symptom seen for
+        # the network streams in live captures).
+        self.wm.max_file_bytes = 10**12  # disable size trigger
+        self.wm.nw_conn_buffer.append("ts,CONNECT,1,1,proc,AF_INET")
+        self.wm.nw_conn_buffer.append("ts,CLOSE,1,1,proc,AF_INET")
+        # Precondition: nothing on disk for this stream yet.
+        cur = self.wm.output_nw_conn_file
+        self.assertFalse(os.path.exists(cur) and os.path.getsize(cur) > 0)
+
+        now = self.wm._stream_opened["nw_conn"] + self.wm.max_file_age + 1
+        self.wm._maybe_rotate_stale_logs(now=now)
+
+        self.assertEqual(len(self.upload.uploaded), 1)
+        uploaded = self.upload.uploaded[0]
+        self.assertEqual(os.path.basename(os.path.dirname(uploaded)), "nw_conn")
+        content = _zstd_read_text(uploaded)
+        self.assertIn("CONNECT", content)
+        self.assertIn("CLOSE", content)
+        # Buffer was drained into the rotated file.
+        self.assertEqual(len(self.wm.nw_conn_buffer), 0)
+
+    def test_count_rotation_does_not_reset_periodic_flush_timer(self):
+        # Regression: a single stream's count-based rotation must not defer the
+        # global periodic write_to_disk that lands every other stream's buffer on
+        # disk. Resetting the shared flush timer on each rotation starved that
+        # flush on busy hosts (fs/cache rotate every few seconds).
+        self.wm.vfs_buffer.append("a,b,c")
+        before = self.wm._last_flush_time
+        self.wm._rotate_stream("vfs")
+        self.assertEqual(self.wm._last_flush_time, before)
 
     @unittest.skipUnless(HAS_ZSTD, "zstandard not installed")
     def test_rotate_flushes_buffered_rows(self):
@@ -297,7 +335,7 @@ class StaleLogRotationTests(unittest.TestCase):
         self.assertEqual(len(self.wm.vfs_buffer), 0)
 
     def test_rotation_defaults(self):
-        self.assertEqual(self.wm.max_file_age, 20 * 60)
+        self.assertEqual(self.wm.max_file_age, 5 * 60)
         self.assertEqual(self.wm.max_file_bytes, 100 * 1024 * 1024)
         # Snapshots must be excluded from generic rotation.
         self.assertNotIn("process", self.wm._streams)

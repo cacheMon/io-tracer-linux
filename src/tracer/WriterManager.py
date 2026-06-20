@@ -222,7 +222,7 @@ class WriteManager:
         # queued for upload) once it is older than max_file_age or larger than
         # max_file_bytes, even if it never reaches its event-count threshold.
         # Monotonic open-times so the age check ignores wall-clock jumps.
-        self.max_file_age = 20 * 60               # 20 minutes
+        self.max_file_age = 5 * 60                # 5 minutes
         self.max_file_bytes = 100 * 1024 * 1024   # 100 MB (uncompressed on disk)
         self._stream_opened = {key: time.monotonic() for key in self._streams}
         # Per-stream rotation sequence, appended to each rotated filename so two
@@ -828,7 +828,13 @@ class WriteManager:
             setattr(self, s['file'], new_file)
             setattr(self, s['handle'], self._open_log_file(new_file, key))
             self._stream_opened[key] = time.monotonic()
-            self._reset_flush_timer()
+            # NOTE: do NOT reset the periodic-flush timer here. A single stream's
+            # count-based rotation must not defer the global periodic write_to_disk
+            # of every OTHER stream: on a busy host fs/cache rotate every few
+            # seconds, so resetting the timer here starved write_to_disk entirely,
+            # leaving low-volume buffers (network especially) unwritten — and thus
+            # unrotated/un-uploaded — until shutdown. _maybe_rotate_stale_logs is
+            # now buffer-aware so slow streams still upload mid-trace regardless.
         # Compress outside the lock: compression + disk I/O is slow and must not block
         # the perf-callback flush or the periodic writer for this stream.
         if rotated is not None:
@@ -841,18 +847,26 @@ class WriteManager:
         any stream whose current file exceeds ``max_file_bytes`` or has been
         open longer than ``max_file_age`` is rotated and queued for upload.
         ``now`` is an injectable ``time.monotonic()`` reading for testing.
+
+        Buffered-but-unwritten rows count toward "has data": a low-volume stream
+        (network especially) may hold its rows in the in-memory buffer with an
+        empty on-disk file, because the periodic disk flush can be starved on a
+        busy host. Rotating on age still flushes those rows — _rotate_stream
+        lands the buffer into the file first — so the stream uploads mid-trace
+        instead of deferring to shutdown (where a hard kill would lose it).
         """
         if now is None:
             now = time.monotonic()
         for key, s in self._streams.items():
             cur_file = getattr(self, s['file'])
             try:
-                if not os.path.exists(cur_file):
-                    continue
-                size = os.path.getsize(cur_file)
+                size = os.path.getsize(cur_file) if os.path.exists(cur_file) else 0
             except OSError:
-                continue
-            if size <= 0:
+                size = 0
+            buf = getattr(self, s['buf'], None)
+            buffered = len(buf) if buf else 0
+            # Nothing on disk and nothing buffered -> genuinely empty, skip.
+            if size <= 0 and buffered == 0:
                 continue
             age = now - self._stream_opened.get(key, now)
             if size >= self.max_file_bytes or age >= self.max_file_age:
