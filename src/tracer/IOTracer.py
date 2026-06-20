@@ -1190,22 +1190,41 @@ class IOTracer:
     def _log_block_diagnostics(self):
         """Log a summary of block-tracing health from ``block_stats``.
 
-        A high miss rate means the issue map was evicted under load (completions
-        dropped) — the likely explanation if block events appear to stop before
-        the end of a long trace.
+        Completions with no matching issue ctx (``missed``) split into two kinds
+        with different remedies:
+
+        * **structural** — completions whose issue was never seen by the trace
+          (in-flight before tracing started, or via a path that does not fire
+          ``block_rq_issue``). Bounded by ``total_completions - issued`` and
+          irreducible by map sizing.
+        * **evictable** — the remainder: an issue ctx *was* recorded but was lost
+          before its completion, via LRU eviction under load or ``(dev,sector)``
+          key overwrite by a concurrent in-flight request. A larger
+          ``block_start_times`` map reduces the eviction part.
+
+        Reporting the split avoids blaming all misses on eviction (the previous
+        behavior), which over-stated how much a bigger map can recover.
         """
         s = self._block_stats()
         if not s:
             return
         stale = s.get("stale", 0)
-        total_completions = s["completed"] + s["missed"] + stale
-        miss_pct = (s["missed"] / total_completions * 100) if total_completions else 0.0
+        missed = s["missed"]
+        total_completions = s["completed"] + missed + stale
+        miss_pct = (missed / total_completions * 100) if total_completions else 0.0
+        # Excess completions over issues had no recorded issue at all (structural,
+        # unfixable by sizing); the rest were recorded then lost (evictable).
+        structural = max(0, total_completions - s["issued"])
+        structural = min(structural, missed)
+        evictable = missed - structural
         logger("info",
                f"Block diagnostics: {s['issued']} issued, {s['completed']} completed, "
-               f"{s['missed']} completions without a tracked issue "
-               f"({miss_pct:.1f}% of completions), {stale} dropped as stale "
-               f"((dev,sector) key reuse). A high miss rate indicates the "
-               f"issue map was evicted under load (dropped completions).")
+               f"{missed} completions without a tracked issue "
+               f"({miss_pct:.1f}% of completions) — {structural} structural "
+               f"(issue never seen; pre-trace or un-issued path) and {evictable} "
+               f"evictable (issue lost to LRU eviction or (dev,sector) key reuse; "
+               f"reducible with a larger issue map). {stale} dropped as stale "
+               f"((dev,sector) key reuse).")
 
     def _attached_probes(self):
         """Sorted list of kernel functions the tracer has probes attached to."""
