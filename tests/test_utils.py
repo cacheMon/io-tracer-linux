@@ -198,11 +198,9 @@ class ResourceTracingTests(unittest.TestCase):
         self.assertTrue(cache)
         self.assertTrue(network)
 
-    def test_auto_select_does_not_auto_enable_cache(self):
-        # Page-cache tracing is the highest-volume stream (~1 CPU core on a busy
-        # host), so it must NEVER be auto-enabled from spare resources — only an
-        # explicit --cache turns it on. Network stays auto-enabled on a capable,
-        # fast-linked host.
+    def test_auto_select_enables_cache_on_capable_host(self):
+        # Page-cache tracing is auto-enabled on a capable host (>=8 cores and
+        # >=16 GB RAM), where its ~1-core overhead is affordable.
         big = dict(
             logical_cores=64,
             total_ram_gb=512.0,
@@ -213,11 +211,33 @@ class ResourceTracingTests(unittest.TestCase):
             "src.utility.utils.detect_host_resources", return_value=big
         ):
             cache, network = auto_select_tracing(False, False)
-            self.assertFalse(cache)   # not auto-enabled despite a huge host
-            self.assertTrue(network)  # network still auto-enabled
+            self.assertTrue(cache)    # auto-enabled on a capable host
+            self.assertTrue(network)
 
+    def test_auto_select_leaves_cache_off_on_small_host(self):
+        # Below the cache threshold (too few cores / too little RAM) it stays off
+        # unless explicitly requested.
+        small = dict(
+            logical_cores=4,            # < 8
+            total_ram_gb=8.0,           # < 16
+            available_ram_gb=4.0,
+            max_net_speed_mbps=10000,
+        )
+        with unittest.mock.patch(
+            "src.utility.utils.detect_host_resources", return_value=small
+        ):
+            cache, _ = auto_select_tracing(False, False)
+            self.assertFalse(cache)
             cache_optin, _ = auto_select_tracing(True, False)
-            self.assertTrue(cache_optin)  # explicit --cache honored
+            self.assertTrue(cache_optin)  # explicit --cache always honored
+
+    def test_cache_ram_threshold_is_16gb(self):
+        from src.utility.utils import AUTO_TRACE_MIN_TOTAL_RAM_GB, AUTO_TRACE_MIN_LOGICAL_CORES
+        self.assertEqual(AUTO_TRACE_MIN_TOTAL_RAM_GB, 16.0)
+        self.assertEqual(AUTO_TRACE_MIN_LOGICAL_CORES, 8)
+        # 8 cores + exactly 16 GB qualifies; 15.9 GB does not.
+        self.assertTrue(evaluate_resource_tracing(8, 16.0, 4.0, 100)["enable_cache"])
+        self.assertFalse(evaluate_resource_tracing(8, 15.9, 4.0, 100)["enable_cache"])
 
 
 if __name__ == "__main__":
