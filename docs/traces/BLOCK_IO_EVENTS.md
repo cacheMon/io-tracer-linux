@@ -150,4 +150,4 @@ Character flags from the block layer tracepoint `rwbs` string. Each character in
 | `P` | PRIO | High priority |
 | `B` | BARRIER | Barrier (legacy) |
 
-**Output File:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/ds/ds_*.csv.zst`
+**Output File:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/block/block_*.csv.zst`

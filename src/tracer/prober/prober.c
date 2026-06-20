@@ -691,9 +691,22 @@ struct block_rq_key_t {
 
 /* Block layer latency tracking maps. LRU so that requests that never
  * complete (e.g. merged into another request) cannot permanently fill the
- * map and starve later requests. */
-BPF_TABLE("lru_hash", struct block_rq_key_t, struct block_issue_ctx, block_start_times, 10240); /**< Issue time + submitter, keyed by dev+sector */
-BPF_TABLE("lru_hash", struct block_rq_key_t, u64, block_insert_times, 10240);  /**< Tracks block request insert time (queue latency) */
+ * map and starve later requests.
+ *
+ * Sized at 65536 (was 10240). The map holds in-flight requests plus the
+ * residue of requests that are issued but never reach block_rq_complete
+ * (merged/requeued), which accumulate until LRU-evicted. Under sustained
+ * load that residue can approach the old 10240 ceiling and start evicting
+ * still-in-flight issue contexts, so their completions arrive with no match
+ * and are dropped (the block_stats[2] "miss" counter). The larger ceiling
+ * gives ~6x headroom for the never-completing residue before eviction kicks
+ * in, recovering the evictable share of those misses. (It cannot recover
+ * completions whose issue was never seen at all — pre-trace in-flight or
+ * un-issued paths; those are a structural floor, reported separately at exit.)
+ * Cost is ~10 MB of kernel memory across both maps, well within the resource
+ * envelope that gates block tracing. */
+BPF_TABLE("lru_hash", struct block_rq_key_t, struct block_issue_ctx, block_start_times, 65536); /**< Issue time + submitter, keyed by dev+sector */
+BPF_TABLE("lru_hash", struct block_rq_key_t, u64, block_insert_times, 65536);  /**< Tracks block request insert time (queue latency) */
 
 /* Monotonic generator for per-request IDs (see block_event.req_id). A single
  * u64 bumped atomically at issue time; lets consumers disambiguate repeated

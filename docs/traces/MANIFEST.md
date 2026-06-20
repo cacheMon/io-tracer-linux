@@ -12,16 +12,16 @@ and rewritten at shutdown with the stop time and final diagnostics.
 ## Schema versioning
 
 `schema_version` identifies the on-disk format. Consumers should read it and
-adapt rather than assume a fixed layout.
+adapt rather than assume a fixed layout. The current value is **`1`**
+(`SCHEMA_VERSION` in `src/tracer/schema.py`).
 
-| Version | Format |
-|---------|--------|
-| 1 | Headerless CSVs, no manifest, per-stream clocks. |
-| 2 | **CSV header row** on every file + this manifest + a common `mono_ns` (CLOCK_MONOTONIC) column appended to every stream. |
-| 3 | **Cross-OS aligned** `fs`/`ds` layout: a fixed shared column prefix (identical names/order to the Windows tracer), **lowercase** canonical operation names, `size_requested` renamed to `size`, and a dedicated block `flags` column (rwbs sub-flags split out of `operation`). |
+The current format (**schema_version 1**) is the **cross-OS aligned** layout:
 
-As of **schema_version 2**:
-
+- The `fs`/`block` streams use a fixed shared column prefix (identical
+  names/order to the Windows tracer, whose equivalent stream is named `ds`),
+  **lowercase** canonical operation names, `size` (formerly `size_requested`),
+  and a dedicated block `flags` column (rwbs sub-flags split out of
+  `operation`).
 - Every CSV file (including rotated parts) begins with a **header row** naming
   its columns — the same names listed under `streams.<key>.columns` here.
 - Every record carries a trailing **`mono_ns`** column: `CLOCK_MONOTONIC`
@@ -34,12 +34,12 @@ As of **schema_version 2**:
 
 ```jsonc
 {
-  "schema_version": 2,
+  "schema_version": 1,
   "streams": {
     "fs":  { "subdir": "fs", "filename_prefix": "fs", "description": "...",
              "wall_clock": "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
              "columns": [ { "name": "timestamp", "type": "datetime", "unit": "", "description": "..." }, ... ] },
-    "ds":  { ... }, "cache": { ... }, "pagefault": { ... },
+    "block":  { ... }, "cache": { ... }, "pagefault": { ... },
     "process": { ... }, "filesystem_snapshot": { ... }
   },
   "tracer":  { "version": "..." },
@@ -54,7 +54,7 @@ As of **schema_version 2**:
   "session": { "started_at": "ISO-8601", "stopped_at": "ISO-8601", "duration_seconds": 123.4 },
   "diagnostics": {
     "attached_probes": [ "vfs_read", "vfs_write", "block_rq_complete", ... ],
-    "lost_events":     { "fs": 0, "ds": 0 },
+    "lost_events":     { "fs": 0, "block": 0 },
     "rows_written":    { "VFS": 12345, "Block": 678, ... },
     "block":           { "issued": 1000, "completed": 990, "missed": 10 }
   }

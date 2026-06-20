@@ -17,7 +17,7 @@ from src.tracer import schema
 # the number of fields each callback passes to format_csv_row.
 EXPECTED_COLUMN_COUNTS = {
     "fs": 23,                  # 22 documented + mono_ns
-    "ds": 17,                  # 16 documented (incl. aligned flags col) + mono_ns
+    "block": 17,               # 16 documented (incl. aligned flags col) + mono_ns
     "cache": 11,               # 10 + mono_ns
     "pagefault": 11,           # 10 + mono_ns
     "nw_conn": 18,             # 17 + mono_ns
@@ -27,8 +27,10 @@ EXPECTED_COLUMN_COUNTS = {
     "filesystem_snapshot": 7,  # 6 + mono_ns
 }
 
-# Cross-OS aligned shared column prefix. These leading columns must
-# match the Windows tracer's fs/ds streams exactly and in the same order.
+# Cross-OS aligned shared column prefix. These leading columns must match the
+# Windows tracer's fs/ds streams exactly and in the same order. (The Linux
+# block stream is named ``block``; the Windows equivalent is named ``ds``, but
+# the column layouts are identical.)
 ALIGNED_FS_PREFIX = [
     "timestamp", "operation", "pid", "tid", "command", "filename",
     "size", "offset", "bytes_completed", "inode", "device", "flags",
@@ -43,10 +45,10 @@ class SchemaShapeTests(unittest.TestCase):
     def test_schema_version_is_1(self):
         self.assertEqual(schema.SCHEMA_VERSION, 1)
 
-    def test_fs_ds_aligned_prefix(self):
+    def test_fs_block_aligned_prefix(self):
         self.assertEqual(schema.column_names("fs")[:len(ALIGNED_FS_PREFIX)],
                          ALIGNED_FS_PREFIX)
-        self.assertEqual(schema.column_names("ds")[:len(ALIGNED_DS_PREFIX)],
+        self.assertEqual(schema.column_names("block")[:len(ALIGNED_DS_PREFIX)],
                          ALIGNED_DS_PREFIX)
 
     def test_all_streams_present(self):

@@ -14,7 +14,7 @@ Traces are uploaded to object storage with the following prefix structure:
 ```
 linux_trace_v4_test/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── fs/                    # VFS (Virtual File System) traces
-├── ds/                    # Block device traces
+├── block/                 # Block device traces
 ├── cache/                 # Page cache events (opt-in: --cache)
 ├── pagefault/             # Memory-mapped page fault events
 ├── nw_conn/               # Network connection lifecycle (opt-in: --network)
@@ -78,7 +78,7 @@ For operations captured and examples, see [VFS_EVENTS.md](traces/VFS_EVENTS.md).
 
 ## 2. Block Device Traces
 
-**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/ds/ds_*.csv.zst`
+**Location:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/block/block_*.csv.zst`
 
 **Description:** Captures block layer I/O operations with latency measurements from issue to completion.
 
@@ -89,7 +89,8 @@ timestamp,operation,pid,tid,command,sector,size,latency_ms,device,flags,cpu_id,p
 ```
 
 **Cross-OS aligned.** Columns 1–10 (`timestamp` … `flags`) are the
-**shared prefix** emitted identically by the Windows tracer's `ds/` stream. The
+**shared prefix** emitted identically by the Windows tracer's `ds/` stream (the
+Linux stream is named `block/`; the column layout is identical). The
 `operation` column now holds the **base op only** (`read`, `write`, `flush`,
 `discard`, …); the rwbs sub-flags (`sync`, `meta`, `ahead`, …) that used to be
 appended to it (e.g. `write|sync`) now live in the dedicated `flags` column.
