@@ -40,6 +40,7 @@ The current format (**schema_version 1**) is the **cross-OS aligned** layout:
              "wall_clock": "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
              "columns": [ { "name": "timestamp", "type": "datetime", "unit": "", "description": "..." }, ... ] },
     "block":  { ... }, "cache": { ... }, "pagefault": { ... },
+    "nw_conn": { ... }, "nw_sockopt": { ... }, "nw_drop": { ... },
     "process": { ... }, "filesystem_snapshot": { ... }
   },
   "tracer":  { "version": "..." },

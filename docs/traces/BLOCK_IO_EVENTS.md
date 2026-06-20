@@ -4,11 +4,12 @@
 
 **Kernel Probes:** Attached via block layer instrumentation in the eBPF program.
 
-> **A missing or empty `ds/` stream is usually expected, not a bug.** Block
+> **A missing or empty `block/` stream is usually expected, not a bug.** Block
 > events are only produced by *physical* device I/O (`block_rq_complete`). On a
 > short or cache-served run — reads hitting the page cache, dirty-page
 > writeback not yet flushed — little or no I/O reaches the device, so the
-> lazily-created `ds/` folder may not appear at all. Block I/O shows up once
+> lazily-created `block/` folder may not appear at all (the Windows tracer calls
+> its equivalent stream `ds`). Block I/O shows up once
 > there is real device activity: cache misses, `fsync`, writeback, or direct
 > I/O. The tracer logs a `Block diagnostics: 0 block I/O events captured …`
 > line at shutdown when this happens, to distinguish it from a failed stream.
@@ -25,35 +26,36 @@
 
 | # | Field | Type | Description |
 |---|-------|------|-------------|
-| 1 | Timestamp | `datetime` | Event timestamp (`YYYY-MM-DD HH:MM:SS.ffffff`) |
-| 2 | PID | `u32` | Process ID that submitted the request |
-| 3 | Command | `string` | Process name (max 16 characters) |
-| 4 | Sector | `u64` | Starting sector number on disk (LBA) |
-| 5 | Operation | `string` | Block operation type (see table below) |
-| 6 | Size | `u64` | I/O size in bytes |
-| 7 | Latency | `float` | Device latency in milliseconds (issue → completion) |
-| 8 | TID | `u32` | Thread ID |
-| 9 | CPU ID | `u32` | CPU where completion was processed |
-| 10 | PPID | `u32` | Parent process ID |
-| 11 | Device | `string` | Device number as `major:minor` identifying the partition/device |
-| 12 | Queue Latency | `float` | Queue/scheduler latency in milliseconds (insert → issue); empty if unavailable |
-| 13 | Command Flags | `string` | Pipe-separated REQ_* flags (e.g., `REQ_SYNC\|REQ_META`); empty if no flags set or on kernel ≥ 5.17 |
-| 14 | Operation Code | `string` | Raw block operation code name (e.g., `REQ_OP_READ`, `REQ_OP_WRITE`); empty on kernel ≥ 5.17 |
-| 15 | Request ID | `u64` | Monotonic per-request id, unique within a trace session and assigned at issue time. Distinguishes separate I/Os that reuse the same `(Device, Sector)` pair, which are otherwise identical apart from their timestamps |
-| 16 | mono_ns | `u64` | Completion time in `CLOCK_MONOTONIC` nanoseconds (kernel `bpf_ktime_get_ns()`) — the common clock for correlating across streams. Add the manifest's `clock.mono_to_real_offset_ns` to recover wall-clock ns. |
+| 1 | timestamp | `datetime` | Event timestamp (`YYYY-MM-DD HH:MM:SS.ffffff`) |
+| 2 | operation | `string` | Block operation type (see table below) |
+| 3 | pid | `u32` | Process ID that submitted the request |
+| 4 | tid | `u32` | Thread ID |
+| 5 | command | `string` | Process name (max 16 characters) |
+| 6 | sector | `u64` | Starting sector number on disk (LBA) |
+| 7 | size | `u64` | I/O size in bytes |
+| 8 | latency_ms | `float` | Device latency in milliseconds (issue → completion) |
+| 9 | device | `string` | Device number as `major:minor` identifying the partition/device |
+| 10 | flags | `string` | Pipe-separated rwbs sub-flags (`sync`, `meta`, `ahead`, …) split out of the `operation` column |
+| 11 | cpu_id | `u32` | CPU where completion was processed |
+| 12 | ppid | `u32` | Parent process ID |
+| 13 | queue_latency_ms | `float` | Queue/scheduler latency in milliseconds (insert → issue); empty if unavailable |
+| 14 | command_flags | `string` | Pipe-separated REQ_* flags (e.g., `REQ_SYNC\|REQ_META`); empty if no flags set or on kernel ≥ 5.17 |
+| 15 | operation_code | `string` | Raw block operation code name (e.g., `REQ_OP_READ`, `REQ_OP_WRITE`); empty on kernel ≥ 5.17 |
+| 16 | request_id | `u64` | Monotonic per-request id, unique within a trace session and assigned at issue time. Distinguishes separate I/Os that reuse the same `(device, sector)` pair, which are otherwise identical apart from their timestamps |
+| 17 | mono_ns | `u64` | Completion time in `CLOCK_MONOTONIC` nanoseconds (kernel `bpf_ktime_get_ns()`) — the common clock for correlating across streams. Add the manifest's `clock.mono_to_real_offset_ns` to recover wall-clock ns. |
 
-> **Note:** Command Flags (field 13) and Operation Code (field 14) are only available on Linux kernel versions < 5.17. The `cmd_flags` field was removed from the `block_rq_complete` tracepoint in kernel 5.17+. On newer kernels (including 5.17, 6.x), these fields will always be empty. Use the Operation field (field 5) and RWBS flags to distinguish I/O types on newer kernels.
+> **Note:** Command Flags (field 14) and Operation Code (field 15) are only available on Linux kernel versions < 5.17. The `cmd_flags` field was removed from the `block_rq_complete` tracepoint in kernel 5.17+. On newer kernels (including 5.17, 6.x), these fields will always be empty. Use the Operation field (field 2) and RWBS flags to distinguish I/O types on newer kernels.
 
 ## Latency Measurement
 
 I/O latency is tracked across the block layer request lifecycle using kernel tracepoints. The BPF program calculates two distinct types of latency to differentiate software queueing overhead from actual hardware processing time:
 
-1. **Device Latency (Field 7)**:
+1. **Device Latency (Field 8)**:
    - **Calculation**: Time from `issue` to `completion` (`completion_time - issue_time`).
    - **Tracepoints**: `block_rq_issue` (records start time) and `block_rq_complete` (calculates final latency).
    - **Meaning**: Represents the time the request spent being processed by the device driver and the physical storage hardware.
 
-2. **Queue/Scheduler Latency (Field 12)**:
+2. **Queue/Scheduler Latency (Field 13)**:
    - **Calculation**: Time from `insert` to `issue` (`issue_time - insert_time`).
    - **Tracepoints**: `block_rq_insert` (records insert time) and `block_rq_complete` (calculates final queue latency based on issue time).
    - **Meaning**: Represents the time the request spent queued up in the OS scheduler waiting to be dispatched to the device.
@@ -102,11 +104,11 @@ Raw operation codes from the kernel block layer:
 | 35 | `REQ_OP_DRV_OUT` | Driver-specific output |
 | 36 | `REQ_OP_LAST` | Sentinel value |
 
-These raw operation codes are captured in field 14 (Operation Code) on Linux kernels < 5.17 and provide the most accurate indication of the block layer operation type. On newer kernels, use field 5 (Operation) which derives the operation type from the rwbs string.
+These raw operation codes are captured in field 15 (Operation Code) on Linux kernels < 5.17 and provide the most accurate indication of the block layer operation type. On newer kernels, use field 2 (Operation) which derives the operation type from the rwbs string.
 
 ## Block Request Flags (`REQ_*`)
 
-Command flags captured in the `Command Flags` field (field 13). Multiple flags are pipe-separated:
+Command flags captured in the `command_flags` field (field 14). Multiple flags are pipe-separated:
 
 | Bit | Name | Description |
 |-----|------|-------------|
@@ -128,7 +130,7 @@ Command flags captured in the `Command Flags` field (field 13). Multiple flags a
 
 ## RWBS Flags
 
-Character flags from the block layer tracepoint `rwbs` string. Each character in the rwbs string is decoded to its corresponding flag name, and when multiple characters are present, they are concatenated with pipes in the Operation field (field 5).
+Character flags from the block layer tracepoint `rwbs` string. Each character in the rwbs string is decoded to its corresponding flag name, and when multiple characters are present, they are concatenated with pipes in the Operation field (field 2).
 
 **Examples:**
 - `"R"` → `"read"`
@@ -150,4 +152,4 @@ Character flags from the block layer tracepoint `rwbs` string. Each character in
 | `P` | PRIO | High priority |
 | `B` | BARRIER | Barrier (legacy) |
 
-**Output File:** `linux_trace_v4_test/{MACHINE_ID}/{TIMESTAMP}/block/block_*.csv.zst`
+**Output File:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/block/block_*.csv.zst`
