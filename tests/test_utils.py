@@ -11,6 +11,7 @@ Written with stdlib unittest so they run via either:
 import os
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -150,6 +151,27 @@ class ResourceTracingTests(unittest.TestCase):
         cache, network = auto_select_tracing(True, True)
         self.assertTrue(cache)
         self.assertTrue(network)
+
+    def test_auto_select_does_not_auto_enable_cache(self):
+        # Page-cache tracing is the highest-volume stream (~1 CPU core on a busy
+        # host), so it must NEVER be auto-enabled from spare resources — only an
+        # explicit --cache turns it on. Network stays auto-enabled on a capable,
+        # fast-linked host.
+        big = dict(
+            logical_cores=64,
+            total_ram_gb=512.0,
+            available_ram_gb=256.0,
+            max_net_speed_mbps=10000,
+        )
+        with unittest.mock.patch(
+            "src.utility.utils.detect_host_resources", return_value=big
+        ):
+            cache, network = auto_select_tracing(False, False)
+            self.assertFalse(cache)   # not auto-enabled despite a huge host
+            self.assertTrue(network)  # network still auto-enabled
+
+            cache_optin, _ = auto_select_tracing(True, False)
+            self.assertTrue(cache_optin)  # explicit --cache honored
 
 
 if __name__ == "__main__":
