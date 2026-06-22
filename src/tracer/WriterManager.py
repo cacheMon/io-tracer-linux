@@ -24,7 +24,6 @@ Example:
 import os
 import sys
 import json
-import io
 from datetime import datetime
 import tarfile
 
@@ -81,6 +80,16 @@ class WriteManager:
         # session manifest — lets a consumer spot a stream whose probes attached
         # but produced no events.
         self.rows_written = {}
+        # Rows that could NOT be persisted (write/flush raised — e.g. ENOSPC /
+        # EDQUOT / closed handle) and were dropped after exceeding the on-error
+        # retry cap. Surfaced in the manifest so a consumer can tell honest data
+        # loss apart from a complete stream — never silently swallowed.
+        self.write_dropped = {}
+        # Cap on rows re-queued for retry after a failed write, so a persistently
+        # full/over-quota disk re-queues for transient errors but cannot grow the
+        # in-memory buffers without bound (OOM). Oldest rows past the cap are
+        # dropped and counted in ``write_dropped``.
+        self._max_buffered_rows_on_error = 500_000
         self.last_status_log_time = time.time()
         self.status_log_interval = 60  # Log status every 60 seconds
         self.output_dir = output_dir
@@ -938,26 +947,46 @@ class WriteManager:
         """
         if not buffer:
             return
-            
+
+        # Drain the buffer into a local batch first, then write. We advance
+        # rows_written (the manifest's "rows persisted" counter) ONLY after the
+        # write+flush succeed, and we put the batch back on failure — so a write
+        # error (ENOSPC / EDQUOT / a handle closed by a concurrent shutdown)
+        # neither silently drops rows nor over-reports them as written. The old
+        # code popped every row and bumped the counter *before* writing, so any
+        # write error lost the whole batch while the manifest still counted it.
+        drained = []
+        while buffer:
+            drained.append(buffer.popleft())
+        if not drained:
+            return
+        complete_data = "".join(event + "\n" for event in drained)
+
         try:
-            string_buffer = io.StringIO()
-
-            n = 0
-            while buffer:
-                event = buffer.popleft()
-                string_buffer.write(event)
-                string_buffer.write('\n')
-                n += 1
-            self.rows_written[buffer_name] = self.rows_written.get(buffer_name, 0) + n
-
-            complete_data = string_buffer.getvalue()
             file_handle.write(complete_data)
             file_handle.flush()
-            
-            string_buffer.close()
-            
         except Exception as e:
-            logger("error", f"Error writing {buffer_name} buffer: {e}")
+            # Re-queue the un-persisted rows at the FRONT (preserving order) so
+            # the next periodic flush / shutdown force_flush retries them. Bound
+            # the retained rows so a persistently full/over-quota disk can't grow
+            # the buffers without limit; oldest rows past the cap are dropped and
+            # recorded in write_dropped (honest loss, not a silent drop).
+            buffer.extendleft(reversed(drained))
+            dropped = 0
+            while len(buffer) > self._max_buffered_rows_on_error:
+                buffer.popleft()
+                dropped += 1
+            if dropped:
+                self.write_dropped[buffer_name] = (
+                    self.write_dropped.get(buffer_name, 0) + dropped
+                )
+            logger("error", f"Error writing {buffer_name} buffer: {e}"
+                   + (f" — dropped {dropped} rows past retry cap" if dropped else ""))
+            return
+
+        self.rows_written[buffer_name] = (
+            self.rows_written.get(buffer_name, 0) + len(drained)
+        )
 
     def write_to_disk(self):
         """Write all buffered data to disk using parallel threads."""

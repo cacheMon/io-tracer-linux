@@ -456,5 +456,97 @@ class NetworkStreamCompressionTests(unittest.TestCase):
             self.assertEqual(os.path.basename(os.path.dirname(p)), "nw_conn")
 
 
+class WriteBufferErrorHandlingTests(unittest.TestCase):
+    """A failed write/flush (ENOSPC, EDQUOT, a handle closed by a concurrent
+    shutdown) must NOT silently drop rows nor over-report them in the manifest.
+    Regression for the bug where _write_buffer_to_file popped the whole buffer
+    and bumped rows_written *before* writing, so any error lost the batch while
+    the manifest still counted it as persisted."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.output_dir = os.path.join(self.tmp, "trace")
+        self.upload = FakeUploadManager()
+        self.wm = SilentWriteManager(
+            output_dir=self.output_dir,
+            upload_manager=self.upload,
+            automatic_upload=True,
+        )
+
+    def tearDown(self):
+        import shutil
+        try:
+            self.wm.close_handles()
+        except Exception:
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    class _FailingHandle:
+        def __init__(self, exc):
+            self.exc = exc
+        def write(self, data):
+            raise self.exc
+        def flush(self):
+            pass
+
+    def test_write_error_does_not_lose_rows_or_overcount(self):
+        import errno
+        from collections import deque
+        buf = deque(["r1", "r2", "r3"])
+        handle = self._FailingHandle(OSError(errno.EDQUOT, "Disk quota exceeded"))
+
+        self.wm._write_buffer_to_file(buf, handle, "VFS")
+
+        # Rows are retained for retry (not silently lost)...
+        self.assertEqual(list(buf), ["r1", "r2", "r3"])
+        # ...and NOT counted as written (manifest must not over-report).
+        self.assertEqual(self.wm.rows_written.get("VFS", 0), 0)
+
+    def test_requeued_rows_are_written_on_a_later_successful_flush(self):
+        import io as _io
+        import errno
+        from collections import deque
+        buf = deque(["r1", "r2", "r3"])
+
+        # First flush fails — rows go back on the buffer, nothing counted.
+        self.wm._write_buffer_to_file(
+            buf, self._FailingHandle(OSError(errno.ENOSPC, "No space")), "VFS")
+        self.assertEqual(list(buf), ["r1", "r2", "r3"])
+
+        # Second flush to a working handle persists them, in original order.
+        good = _io.StringIO()
+        self.wm._write_buffer_to_file(buf, good, "VFS")
+        self.assertEqual(good.getvalue(), "r1\nr2\nr3\n")
+        self.assertEqual(self.wm.rows_written.get("VFS", 0), 3)
+        self.assertEqual(len(buf), 0)
+
+    def test_successful_write_counts_exactly_once(self):
+        import io as _io
+        from collections import deque
+        buf = deque([f"row{i}" for i in range(5)])
+        good = _io.StringIO()
+        self.wm._write_buffer_to_file(buf, good, "Cache")
+        self.assertEqual(self.wm.rows_written.get("Cache"), 5)
+        self.assertEqual(good.getvalue().count("\n"), 5)
+
+    def test_persistent_failure_is_bounded_and_loss_is_recorded(self):
+        import errno
+        from collections import deque
+        # Tiny cap so the test is cheap; mimics a persistently full disk.
+        self.wm._max_buffered_rows_on_error = 10
+        handle = self._FailingHandle(OSError(errno.EDQUOT, "quota"))
+        buf = deque()
+        for i in range(25):
+            buf.append(f"row{i}")
+            self.wm._write_buffer_to_file(buf, handle, "VFS")
+
+        # Memory is bounded at the cap (no unbounded growth / OOM)...
+        self.assertLessEqual(len(buf), 10)
+        # ...the dropped rows are recorded honestly (not silently swallowed)...
+        self.assertGreater(self.wm.write_dropped.get("VFS", 0), 0)
+        # ...and dropped rows are NOT also counted as written.
+        self.assertEqual(self.wm.rows_written.get("VFS", 0), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

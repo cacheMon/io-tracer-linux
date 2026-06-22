@@ -1289,6 +1289,7 @@ class IOTracer:
                 "attached_probes": self._attached_probes(),
                 "lost_events": dict(self._lost_counts),
                 "rows_written": dict(self.writer.rows_written),
+                "write_dropped": dict(getattr(self.writer, "write_dropped", {})),
                 "block": self._block_stats(),
             },
         })
