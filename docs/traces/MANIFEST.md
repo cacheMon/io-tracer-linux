@@ -39,7 +39,7 @@ The current format (**schema_version 1**) is the **cross-OS aligned** layout:
     "fs":  { "subdir": "fs", "filename_prefix": "fs", "description": "...",
              "wall_clock": "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
              "columns": [ { "name": "timestamp", "type": "datetime", "unit": "", "description": "..." }, ... ] },
-    "block":  { ... }, "cache": { ... }, "pagefault": { ... },
+    "block":  { ... }, "cache": { ... },
     "nw_conn": { ... }, "nw_sockopt": { ... }, "nw_drop": { ... },
     "process": { ... }, "filesystem_snapshot": { ... }
   },

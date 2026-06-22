@@ -6,7 +6,7 @@
  * - VFS (Virtual File System) operations: read, write, open, close, fsync, etc.
  * - Block layer events: request queuing, issue, and completion with latency
  * - Page cache operations: hits, misses, dirty pages, writeback, eviction
- * - Memory-mapped I/O: page faults, msync, madvise
+ * - Memory-mapped I/O: mmap region tracking (mmap, mremap, munmap)
  * - Async I/O: direct I/O, splice
  *
  * The tracer uses BCC (BPF Compiler Collection) and attaches to kernel
@@ -325,38 +325,6 @@ struct block_event {
   u64 req_id;               /**< Monotonic per-request id, unique within a trace
                               *   session. Disambiguates distinct I/Os that reuse
                               *   the same (dev, sector). */
-};
-
-/* ============================================================================
- * PAGE FAULT TRACING STRUCTURES
- * ============================================================================
- * Tracks memory-mapped file I/O by monitoring page faults that trigger
- * actual disk reads (major faults) or page cache access (minor faults).
- */
-
-/** @brief Page fault access type */
-enum pagefault_type {
-  FAULT_READ = 0,   /**< Read access triggered the fault */
-  FAULT_WRITE = 1   /**< Write access triggered the fault */
-};
-
-/**
- * @brief Page fault event data structure
- *
- * Captures file-backed page faults that occur when accessing
- * memory-mapped files. Major faults indicate actual disk I/O.
- */
-struct pagefault_data {
-  u64 ts;                   /**< Timestamp in nanoseconds */
-  u32 pid;                  /**< Process ID */
-  u32 tid;                  /**< Thread ID */
-  char comm[TASK_COMM_LEN]; /**< Process name */
-  u64 address;              /**< Faulting virtual address */
-  u64 inode;                /**< Backing file inode (0 if anonymous mapping) */
-  u64 offset;               /**< File offset in pages (pgoff) */
-  u8 fault_type;            /**< FAULT_READ or FAULT_WRITE */
-  u8 major;                 /**< 0=minor (cached), 1=major (disk read) */
-  u32 dev_id;               /**< Device ID from file's superblock */
 };
 
 /* ============================================================================
@@ -849,7 +817,6 @@ BPF_PERF_OUTPUT(net_conn_events);   /**< Connection lifecycle events (conn_event
 BPF_PERF_OUTPUT(net_sockopt_events);/**< Socket option events (sockopt_event_data) */
 BPF_PERF_OUTPUT(net_drop_events);   /**< Drop/retransmit events (net_drop_data) */
 #endif /* ENABLE_NETWORK */
-BPF_PERF_OUTPUT(pagefault_events);  /**< Memory-mapped page faults (pagefault_data) */
 BPF_PERF_OUTPUT(io_uring_events);   /**< io_uring events (io_uring_event_data) */
 
 /* ============================================================================
@@ -3886,81 +3853,6 @@ int trace_shrink_folio_list(struct pt_regs *ctx) {
   return 0;
 }
 #endif
-
-/* ============================================================================
- * PAGE FAULT TRACING
- * ============================================================================
- * Page faults occur when accessing memory-mapped files. Major faults
- * require disk I/O, minor faults are served from page cache.
- */
-
-/**
- * @brief File-backed page fault probe
- *
- * filemap_fault() handles page faults for memory-mapped files.
- * Captures the faulting address, file offset, and fault type.
- * Major/minor fault distinction requires return probe analysis.
- *
- * @param ctx  BPF context
- * @param vmf  VM fault context containing fault details
- * @return     0
- */
-int trace_filemap_fault_entry(struct pt_regs *ctx, struct vm_fault *vmf) {
-  u64 pid_tgid = bpf_get_current_pid_tgid();
-  u32 pid = pid_tgid >> 32;
-
-  u32 config_key = 0;
-  u32 *tracer_pid = tracer_config.lookup(&config_key);
-  if (tracer_pid && pid == *tracer_pid)
-    return 0;
-
-  struct pagefault_data data = {};
-  data.ts = bpf_ktime_get_ns();
-  data.pid = pid;
-  data.tid = (u32)pid_tgid;
-  bpf_get_current_comm(&data.comm, sizeof(data.comm));
-  
-  if (vmf) {
-    // Get faulting address
-    bpf_probe_read_kernel(&data.address, sizeof(data.address), &vmf->address);
-    
-    // Get page offset (file offset in pages)
-    bpf_probe_read_kernel(&data.offset, sizeof(data.offset), &vmf->pgoff);
-    
-    // Determine if this is a write fault
-    unsigned int flags = 0;
-    bpf_probe_read_kernel(&flags, sizeof(flags), &vmf->flags);
-    data.fault_type = (flags & 0x01) ? FAULT_WRITE : FAULT_READ;  // FAULT_FLAG_WRITE = 0x01
-    
-    // Get VMA to access the backing file
-    struct vm_area_struct *vma = NULL;
-    bpf_probe_read_kernel(&vma, sizeof(vma), &vmf->vma);
-    if (vma) {
-      struct file *file = NULL;
-      bpf_probe_read_kernel(&file, sizeof(file), &vma->vm_file);
-      if (file) {
-        data.inode = get_file_inode(file);
-        
-        // Get device ID from superblock
-        struct dentry *dentry = NULL;
-        bpf_probe_read_kernel(&dentry, sizeof(dentry), &file->f_path.dentry);
-        if (dentry) {
-          struct super_block *sb = NULL;
-          bpf_probe_read_kernel(&sb, sizeof(sb), &dentry->d_sb);
-          if (sb) {
-            bpf_probe_read_kernel(&data.dev_id, sizeof(data.dev_id), &sb->s_dev);
-          }
-        }
-      }
-    }
-  }
-  
-  // Major/minor fault determination requires kretprobe
-  data.major = 0;  // Will be updated by return probe if available
-
-  pagefault_events.perf_submit(ctx, &data, sizeof(data));
-  return 0;
-}
 
 /* ============================================================================
  * DIRECT I/O TRACING

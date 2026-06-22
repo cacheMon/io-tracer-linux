@@ -19,7 +19,6 @@ linux_v1/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── fs/                    # VFS traces (also receives mirrored io_uring I/O)
 ├── block/                 # Block device traces
 ├── cache/                 # Page cache events (auto-enabled on capable hosts; force with --cache)
-├── pagefault/             # Page fault events
 ├── nw_conn/               # Network connection lifecycle (auto-enabled on capable hosts; force with --network)
 ├── nw_sockopt/            # Network socket-option events (auto-enabled on capable hosts; force with --network)
 ├── nw_drop/               # Network drops/retransmits (auto-enabled on capable hosts; force with --network)

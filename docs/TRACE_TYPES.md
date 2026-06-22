@@ -9,8 +9,7 @@ IO Tracer uses eBPF/BPF technology to intercept kernel functions and collect var
 | 1 | [VFS Events](traces/VFS_EVENTS.md) | File system operations at the VFS layer | `fs/fs_*.csv.zst` |
 | 2 | [Block I/O Events](traces/BLOCK_IO_EVENTS.md) | Block-level device I/O operations | `block/block_*.csv.zst` |
 | 3 | [Page Cache Events](traces/PAGE_CACHE_EVENTS.md) | Page cache hits, misses, writebacks, evictions | `cache/cache_*.csv.zst` |
-| 4 | [Page Fault Events](traces/PAGE_FAULT_EVENTS.md) | File-backed page faults from mmap access | `pagefault/pagefault_*.csv.zst` |
-| 5 | [Network Events](traces/NETWORK_EVENTS.md) | Connection lifecycle, socket options, drops | `nw_conn/*.csv.zst`, `nw_sockopt/*.csv.zst`, `nw_drop/*.csv.zst` |
+| 4 | [Network Events](traces/NETWORK_EVENTS.md) | Connection lifecycle, socket options, drops | `nw_conn/*.csv.zst`, `nw_sockopt/*.csv.zst`, `nw_drop/*.csv.zst` |
 
 > Per-stream files are written as `.csv.zst` (Zstandard), falling back to
 > `.csv.gz` (gzip) when the `zstandard` library is unavailable.
@@ -49,9 +48,8 @@ IO Tracer uses eBPF/BPF technology to intercept kernel functions and collect var
 │  │                  │    │ - _print_event (VFS)              │  │
 │  │  Trace Types:    │    │ - _print_event_block (Block)      │  │
 │  │  • VFS Events    │    │ - _print_event_cache (Cache)      │  │
-│  │  • Block Events  │    │ - _print_event_pagefault (Fault)  │  │
-│  │  • Cache Events  │                                          │
-│  │  • Page Faults   │                                          │
+│  │  • Block Events  │    └───────────────────────────────────┘  │
+│  │  • Cache Events  │                                           │
 │  └────────┬────────┘                                           │
 │           │                                                    │
 │  ┌────────▼────────┐    ┌─────────────────────────────────┐  │
@@ -68,7 +66,6 @@ IO Tracer uses eBPF/BPF technology to intercept kernel functions and collect var
 │  │                  │    • fs/*.csv.zst (VFS events)          │  │
 │  │                  │    • block/*.csv.zst (block events)     │  │
 │  │                  │    • cache/*.csv.zst (cache events)     │  │
-│  │                  │    • pagefault/*.csv.zst (page faults)  │  │
 │  │                  │    • filesystem_snapshot/*.csv.zst      │  │
 │  │                  │    • process/*.csv.zst                  │  │
 │  │                  │    • system_spec/*.json                 │  │

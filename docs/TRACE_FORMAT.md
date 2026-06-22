@@ -16,7 +16,6 @@ linux_v1/{MACHINE_ID}/{YYYYMMDD_HHMMSS_mmm}/
 ├── fs/                    # VFS (Virtual File System) traces
 ├── block/                 # Block device traces
 ├── cache/                 # Page cache events (auto-enabled on capable hosts; force with --cache)
-├── pagefault/             # Memory-mapped page fault events
 ├── nw_conn/               # Network connection lifecycle (auto-enabled on capable hosts; force with --network)
 ├── nw_sockopt/            # Network socket-option events (auto-enabled on capable hosts; force with --network)
 ├── nw_drop/               # Network drops/retransmits (auto-enabled on capable hosts; force with --network)
@@ -116,23 +115,7 @@ For event types and examples, see [PAGE_CACHE_EVENTS.md](traces/PAGE_CACHE_EVENT
 
 ---
 
-## 4. Page Fault Events
-
-**Location:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/pagefault/pagefault_*.csv.zst`
-
-**Description:** Captures file-backed page faults from memory-mapped I/O operations. Tracks which memory accesses trigger disk reads (major faults) vs cache hits (minor faults).
-
-### CSV Header
-
-```csv
-timestamp,pid,tid,command,fault_type,severity,inode,offset_pages,address,device_id,mono_ns
-```
-
-For fault types and examples, see [PAGE_FAULT_EVENTS.md](traces/PAGE_FAULT_EVENTS.md).
-
----
-
-## 4b. Network Events (auto-enabled on capable hosts; force with `--network`)
+## 4. Network Events (auto-enabled on capable hosts; force with `--network`)
 
 **Location:** `linux_v1/{MACHINE_ID}/{TIMESTAMP}/nw_conn|nw_sockopt|nw_drop/*.csv.zst`
 
@@ -246,7 +229,7 @@ For field details, see [SYSTEM_SNAPSHOT.md](traces/SYSTEM_SNAPSHOT.md).
 - Final archives: `.csv.zst` format
 
 ### File Rotation
-Continuous streams (VFS, block, cache, page fault, nw_conn, nw_sockopt, nw_drop) are rotated and compressed when any
+Continuous streams (VFS, block, cache, nw_conn, nw_sockopt, nw_drop) are rotated and compressed when any
 of the following is reached (see `WriteManager` in `src/tracer/WriterManager.py`):
 - **Event count:** ~80,000–100,000 buffered events (adaptively raised under load)
 - **File age:** 5 minutes since the current file was opened

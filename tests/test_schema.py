@@ -19,7 +19,6 @@ EXPECTED_COLUMN_COUNTS = {
     "fs": 23,                  # 22 documented + mono_ns
     "block": 17,               # 16 documented (incl. aligned flags col) + mono_ns
     "cache": 11,               # 10 + mono_ns
-    "pagefault": 11,           # 10 + mono_ns
     "nw_conn": 18,             # 17 + mono_ns
     "nw_sockopt": 10,          # 9 + mono_ns
     "nw_drop": 14,             # 13 + mono_ns
