@@ -548,5 +548,53 @@ class WriteBufferErrorHandlingTests(unittest.TestCase):
         self.assertEqual(self.wm.rows_written.get("VFS", 0), 0)
 
 
+class CreatedFilesCounterTests(unittest.TestCase):
+    """created_files is bumped from several threads (compress on the
+    perf-callback and periodic-flush threads, plus snapshot part uploads). The
+    bump must be atomic so concurrent rotations don't lose increments via a
+    read-modify-write race."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.output_dir = os.path.join(self.tmp, "trace")
+        self.upload = FakeUploadManager()
+        self.wm = SilentWriteManager(
+            output_dir=self.output_dir,
+            upload_manager=self.upload,
+            automatic_upload=True,
+        )
+
+    def tearDown(self):
+        import shutil
+        try:
+            self.wm.close_handles()
+        except Exception:
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_concurrent_bumps_lose_no_increments(self):
+        import threading
+        threads_n, per_thread = 16, 2000
+        barrier = threading.Barrier(threads_n)
+
+        def worker():
+            barrier.wait()  # maximise contention by releasing all at once
+            for _ in range(per_thread):
+                self.wm._bump_created_files()
+
+        threads = [threading.Thread(target=worker) for _ in range(threads_n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(self.wm.created_files, threads_n * per_thread)
+
+    def test_bump_returns_new_total_and_supports_n(self):
+        self.assertEqual(self.wm._bump_created_files(), 1)
+        self.assertEqual(self.wm._bump_created_files(5), 6)
+        self.assertEqual(self.wm.created_files, 6)
+
+
 if __name__ == "__main__":
     unittest.main()

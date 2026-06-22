@@ -76,6 +76,11 @@ class WriteManager:
         self.current_datetime = datetime.now()
 
         self.created_files = 0
+        # created_files is bumped from several threads (perf-callback compress,
+        # periodic-flush compress, and the snapshot thread's part upload). A
+        # plain += is a non-atomic read-modify-write, so concurrent rotations
+        # could lose increments and undercount this telemetry — guard it.
+        self._created_files_lock = threading.Lock()
         # Total rows written to disk per stream (keyed by buffer label), for the
         # session manifest — lets a consumer spot a stream whose probes attached
         # but produced no events.
@@ -736,8 +741,8 @@ class WriteManager:
                     num_parts = len(self.fs_snapshot_parts_pending_upload)
                     if num_parts > 0:
                         # Count each part individually to match upload counter
-                        self.created_files += num_parts
-                        logger('info', f"Files Created: {str(self.created_files)} (filesystem snapshot with {num_parts} parts)", True)
+                        total_created = self._bump_created_files(num_parts)
+                        logger('info', f"Files Created: {str(total_created)} (filesystem snapshot with {num_parts} parts)", True)
                     for part_file in self.fs_snapshot_parts_pending_upload:
                         if os.path.exists(part_file):
                             self.upload_manager.append_object(part_file)
@@ -1096,6 +1101,15 @@ class WriteManager:
         # in the window between a stream's drain and the clear — silently losing
         # events on every periodic flush. The drain is the only emptying needed.
 
+    def _bump_created_files(self, n: int = 1) -> int:
+        """Atomically add ``n`` to the created-files counter and return the new
+        total. Called from multiple threads (perf-callback / periodic-flush
+        compression and the snapshot upload), where a bare ``+=`` could lose
+        increments to a read-modify-write race."""
+        with self._created_files_lock:
+            self.created_files += n
+            return self.created_files
+
     def compress_log(self, input_file: str):
         """
         Compress a log file and optionally upload it.
@@ -1120,8 +1134,8 @@ class WriteManager:
             upload_target = compressed if compressed is not None else src
 
             if self.automatic_upload:
-                self.created_files += 1
-                logger('info', f"Files Created: {str(self.created_files)}", True)
+                total_created = self._bump_created_files()
+                logger('info', f"Files Created: {str(total_created)}", True)
                 # Upload each log individually, preserving its subdirectory
                 # (fs, block, cache, process, ...) on the backend.
                 self.upload_manager.append_object(upload_target)
@@ -1160,8 +1174,8 @@ class WriteManager:
                     tar.add(src, arcname=os.path.basename(src))
 
             if self.automatic_upload:
-                self.created_files += 1
-                logger("info", f"Files Created: {self.created_files}", True)
+                total_created = self._bump_created_files()
+                logger("info", f"Files Created: {total_created}", True)
                 self.upload_manager.append_object(dst)
 
             shutil.rmtree(src)
