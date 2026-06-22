@@ -1470,6 +1470,17 @@ class IOTracer:
                 logger("info", f"Trace completed after {actual_duration:.2f} seconds")
 
             self._log_block_diagnostics()
+            # Flush every remaining buffered row to disk BEFORE writing the
+            # manifest, so its rows_written counts them. Previously the manifest
+            # was finalised here but the final flush happened later in
+            # force_flush(), so the last rotated rows reached disk *uncounted* —
+            # rows_written under-reported the trace (e.g. fs/nw streams short by a
+            # few dozen rows). The poll thread is already stopped (polling_active
+            # cleared above) and snapshots are halted, so no new rows arrive.
+            try:
+                self.writer.write_to_disk()
+            except Exception as e:
+                logger("warning", f"Final pre-manifest flush failed: {e}")
             # Finalise the manifest with stop time + final diagnostics. Guarded
             # so a manifest failure never blocks shutdown/flush.
             try:
