@@ -178,6 +178,11 @@ class IOTracer:
         # and detaching probes twice on already-closed handles.
         self._cleanup_lock      = threading.Lock()
         self._cleanup_done      = False
+        # Both must exist before trace() assigns them: the SIGINT/SIGTERM handler
+        # (_cleanup) is installed partway through trace() startup but references
+        # self.polling_thread, which trace() only sets once probes are attached.
+        # A signal in that window must not raise AttributeError and abort cleanup.
+        self.polling_thread     = None
         self._poll_thread       = None
         self.verbose            = verbose
         self.duration           = duration
@@ -1181,10 +1186,15 @@ class IOTracer:
             # later, in trace()'s finally), so a perf-buffer callback could write
             # to a handle being closed. Joining first guarantees no callback runs
             # during the flush/close below.
-            if self.polling_thread is not None:
-                self.polling_thread.polling_active = False
-            if self._poll_thread is not None:
-                self._poll_thread.join(timeout=2.0)
+            # getattr-guarded so a signal that fires before trace() has assigned
+            # these (the startup window) can never raise AttributeError and abort
+            # cleanup mid-way (which would leave _cleanup_done=True and block retry).
+            polling_thread = getattr(self, "polling_thread", None)
+            if polling_thread is not None:
+                polling_thread.polling_active = False
+            poll_thread = getattr(self, "_poll_thread", None)
+            if poll_thread is not None:
+                poll_thread.join(timeout=2.0)
 
             self.probe_tracker.detach_kprobes()
 
