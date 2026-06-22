@@ -118,7 +118,9 @@ class IOTracer:
             SystemExit: If BPF initialization fails
         """
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_dir = os.path.join(output_dir, "linux_trace" ,capture_machine_id().upper() ,str(timestamp))
+        # The local staging directory is built below from the resolved upload
+        # bucket so the on-disk layout matches the R2 prefix (and the docs).
+        output_base = output_dir
 
         temp_version = version if not developer_mode else f"vdev"
         if developer_mode:
@@ -143,6 +145,18 @@ class IOTracer:
             osm_kwargs["trace_bucket"] = trace_bucket
         self.upload_manager     = ObjectStorageManager(**osm_kwargs)
         self.automatic_upload   = automatic_upload
+
+        # Stage traces locally under the SAME top-level name as the upload
+        # bucket/prefix (linux_v1 by default, or a dev --trace-bucket override),
+        # so the on-disk path matches the R2 key and the documented layout.
+        # Previously this was hardcoded to "linux_trace", which disagreed with
+        # the default "linux_v1" bucket and the docs, and ignored --trace-bucket.
+        output_dir = os.path.join(
+            output_base,
+            self.upload_manager.trace_bucket,
+            capture_machine_id().upper(),
+            str(timestamp),
+        )
 
         # Test connection for automatic upload
         if self.automatic_upload:
