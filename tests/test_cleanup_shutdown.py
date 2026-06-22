@@ -152,6 +152,22 @@ class CleanupShutdownTests(unittest.TestCase):
         self.assertLess(rec.calls.index("detach"), rec.calls.index("write_to_disk"))
         self.assertLess(rec.calls.index("write_to_disk"), rec.calls.index("close_handles"))
 
+    def test_cleanup_safe_when_signal_arrives_during_startup(self):
+        # Regression: the SIGINT/SIGTERM handler (_cleanup) is installed partway
+        # through trace() startup, before self.polling_thread is assigned. A
+        # signal in that window must NOT raise AttributeError — which would abort
+        # cleanup with _cleanup_done already True, leaving probes attached and
+        # buffers unflushed. _cleanup must tolerate polling_thread / _poll_thread
+        # being absent (or None) and still detach + flush.
+        t, rec = self._make_tracer()
+        del t.polling_thread          # simulate the pre-assignment startup state
+        del t._poll_thread
+        t._cleanup(2, None)           # must not raise
+        self.assertIn("detach", rec.calls)
+        self.assertIn("write_to_disk", rec.calls)
+        self.assertIn("close_handles", rec.calls)
+        self.assertTrue(t._cleanup_done)
+
 
 if __name__ == "__main__":
     unittest.main()
