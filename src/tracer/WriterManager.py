@@ -103,7 +103,6 @@ class WriteManager:
         self.output_cache_file = f"{self.output_dir}/cache/cache_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_process_file = f"{self.output_dir}/process/process_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         self.output_fs_snapshot_file = f"{self.output_dir}/filesystem_snapshot/filesystem_snapshot_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-        self.output_pagefault_file = f"{self.output_dir}/pagefault/pagefault_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
         # Network streams (low-overhead subset: connection lifecycle, socket
         # options, drops). Files stay empty unless --network is enabled.
         self.output_nw_conn_file = f"{self.output_dir}/nw_conn/nw_conn_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
@@ -117,7 +116,6 @@ class WriteManager:
         os.makedirs(f"{self.output_dir}/cache", exist_ok=True)
         os.makedirs(f"{self.output_dir}/process", exist_ok=True)
         os.makedirs(f"{self.output_dir}/filesystem_snapshot", exist_ok=True)
-        os.makedirs(f"{self.output_dir}/pagefault", exist_ok=True)
         os.makedirs(f"{self.output_dir}/nw_conn", exist_ok=True)
         os.makedirs(f"{self.output_dir}/nw_sockopt", exist_ok=True)
         os.makedirs(f"{self.output_dir}/nw_drop", exist_ok=True)
@@ -131,7 +129,6 @@ class WriteManager:
         self.cache_buffer = deque()
         self.process_buffer = deque()
         self.fs_snap_buffer = deque()
-        self.pagefault_buffer = deque()
         self.nw_conn_buffer = deque()
         self.nw_sockopt_buffer = deque()
         self.nw_drop_buffer = deque()
@@ -143,7 +140,6 @@ class WriteManager:
             'cache': deque(maxlen=1000),
             'fs_state': deque(maxlen=1000),
             'proc_state': deque(maxlen=1000),
-            'pagefault': deque(maxlen=1000),
             'nw_conn': deque(maxlen=1000),
             'nw_sockopt': deque(maxlen=1000),
             'nw_drop': deque(maxlen=1000),
@@ -160,7 +156,6 @@ class WriteManager:
             'cache': (100000, 1000000),
             'fs_state': (80000, 200000),
             'proc_state': (80000, 100000),
-            'pagefault': (80000, 400000),
         }
         
         # Start adaptive sizing thread
@@ -181,7 +176,6 @@ class WriteManager:
         self.block_max_events = 80000
         self.process_max_events = 80000  # Large enough to fit entire hourly snapshot
         self.fs_snap_max_events = 80000
-        self.pagefault_max_events = 80000
         # Network streams are comparatively low-volume (no per-packet path), so a
         # fixed threshold is sufficient; they are not adaptively resized.
         self.nw_conn_max_events = 80000
@@ -199,7 +193,6 @@ class WriteManager:
             'cache':     threading.Lock(),
             'process':   threading.Lock(),
             'fs_snap':   threading.Lock(),
-            'pagefault': threading.Lock(),
             'nw_conn':    threading.Lock(),
             'nw_sockopt': threading.Lock(),
             'nw_drop':    threading.Lock(),
@@ -210,7 +203,6 @@ class WriteManager:
         self._block_handle = None
         self._cache_handle = None
         self._process_handle = None
-        self._pagefault_handle = None
         self._fs_snap_handle = None
         self._nw_conn_handle = None
         self._nw_sockopt_handle = None
@@ -225,7 +217,6 @@ class WriteManager:
             'vfs':       {'subdir': 'fs',        'prefix': 'fs',        'buf': 'vfs_buffer',       'handle': '_vfs_handle',       'file': 'output_vfs_file',       'log': 'VFS'},
             'block':     {'subdir': 'block',     'prefix': 'block',     'buf': 'block_buffer',     'handle': '_block_handle',     'file': 'output_block_file',     'log': 'Block'},
             'cache':     {'subdir': 'cache',     'prefix': 'cache',     'buf': 'cache_buffer',     'handle': '_cache_handle',     'file': 'output_cache_file',     'log': 'Cache'},
-            'pagefault': {'subdir': 'pagefault', 'prefix': 'pagefault', 'buf': 'pagefault_buffer', 'handle': '_pagefault_handle', 'file': 'output_pagefault_file', 'log': 'PageFault'},
             'nw_conn':    {'subdir': 'nw_conn',    'prefix': 'nw_conn',    'buf': 'nw_conn_buffer',    'handle': '_nw_conn_handle',    'file': 'output_nw_conn_file',    'log': 'NetConn'},
             'nw_sockopt': {'subdir': 'nw_sockopt', 'prefix': 'nw_sockopt', 'buf': 'nw_sockopt_buffer', 'handle': '_nw_sockopt_handle', 'file': 'output_nw_sockopt_file', 'log': 'NetSockopt'},
             'nw_drop':    {'subdir': 'nw_drop',    'prefix': 'nw_drop',    'buf': 'nw_drop_buffer',    'handle': '_nw_drop_handle',    'file': 'output_nw_drop_file',    'log': 'NetDrop'},
@@ -259,7 +250,7 @@ class WriteManager:
 
     # WriteManager stream key -> schema.STREAMS key.
     _SCHEMA_KEY = {
-        'vfs': 'fs', 'block': 'block', 'cache': 'cache', 'pagefault': 'pagefault',
+        'vfs': 'fs', 'block': 'block', 'cache': 'cache',
         'process': 'process', 'fs_snap': 'filesystem_snapshot',
         'nw_conn': 'nw_conn',
         'nw_sockopt': 'nw_sockopt', 'nw_drop': 'nw_drop',
@@ -309,7 +300,7 @@ class WriteManager:
         while True:
             time.sleep(10)  
             
-            for event_type in ['vfs', 'block', 'cache', 'fs_state','proc_state', 'pagefault']:
+            for event_type in ['vfs', 'block', 'cache', 'fs_state','proc_state']:
                 rate = self._calculate_event_rate(event_type)
                 min_limit, max_limit = self.dynamic_limits[event_type]
                 
@@ -332,8 +323,6 @@ class WriteManager:
                     self.fs_snap_max_events = new_limit
                 elif event_type == 'proc_state':
                     self.process_max_events = new_limit
-                elif event_type == 'pagefault':
-                    self.pagefault_max_events = new_limit
 
     def _periodic_flush(self):
         """
@@ -388,8 +377,6 @@ class WriteManager:
             buffer_info.append(f"Block:{len(self.block_buffer)}")
         if len(self.cache_buffer) > 0:
             buffer_info.append(f"Cache:{len(self.cache_buffer)}")
-        if len(self.pagefault_buffer) > 0:
-            buffer_info.append(f"PgFault:{len(self.pagefault_buffer)}")
         if buffer_info:
             status_parts.append(f"Buffers: {', '.join(buffer_info)}")
         
@@ -443,10 +430,6 @@ class WriteManager:
     def should_flush_fssnap(self) -> bool:
         """Check if filesystem snapshot buffer should be flushed."""
         return (len(self.fs_snap_buffer) >= self.fs_snap_max_events)
-
-    def should_flush_pagefault(self) -> bool:
-        """Check if pagefault buffer should be flushed."""
-        return (len(self.pagefault_buffer) >= self.pagefault_max_events)
 
     def append_fs_snap_log(self, log_output: str):
         """
@@ -533,22 +516,6 @@ class WriteManager:
                 self.flush_cache_only()
         else:
             logger("error", "Invalid cache log output format. Expected a string.")
-
-    def append_pagefault_log(self, log_output: str):
-        """
-        Add a page fault event log entry.
-        
-        Args:
-            log_output: CSV-formatted log string
-        """
-        if isinstance(log_output, str):
-            self.pagefault_buffer.append(log_output)
-            self.event_timestamps['pagefault'].append(time.time())
-
-            if self.should_flush_pagefault():
-                self.flush_pagefault_only()
-        else:
-            logger("error", "Invalid pagefault log output format. Expected a string.")
 
     def append_conn_log(self, log_output: str):
         """Add a network connection-lifecycle log entry."""
@@ -793,10 +760,6 @@ class WriteManager:
         """Flush block buffer to file (rotate + compress + upload)."""
         self._rotate_stream('block')
 
-    def flush_pagefault_only(self):
-        """Flush pagefault buffer to file (rotate + compress + upload)."""
-        self._rotate_stream('pagefault')
-
     def _rotate_stream(self, key: str):
         """Rotate one continuous stream's current log and queue it for upload.
 
@@ -925,7 +888,6 @@ class WriteManager:
             self.fs_snapshot_parts_pending_upload.clear()
             self.fs_snap_buffer.clear()
         
-        self.compress_log(self.output_pagefault_file)
         self.compress_log(self.output_nw_conn_file)
         self.compress_log(self.output_nw_sockopt_file)
         self.compress_log(self.output_nw_drop_file)
@@ -1030,13 +992,6 @@ class WriteManager:
                         self._fs_snap_handle = self._open_log_file(self.output_fs_snapshot_file, 'fs_snap')
                     self._write_buffer_to_file(self.fs_snap_buffer, self._fs_snap_handle, "Filesystem Snapshot")
 
-        def write_pagefault():
-            with self._stream_locks['pagefault']:
-                if self.pagefault_buffer:
-                    if self._pagefault_handle is None:
-                        self._pagefault_handle = self._open_log_file(self.output_pagefault_file, 'pagefault')
-                    self._write_buffer_to_file(self.pagefault_buffer, self._pagefault_handle, "PageFault")
-
         def write_network():
             # Land any buffered network rows into their current files. Each stream
             # is keyed in the generic _streams registry, so reuse it.
@@ -1079,11 +1034,6 @@ class WriteManager:
             t5 = threading.Thread(target=write_fssnap)
             threads.append(t5)
             t5.start()
-
-        if self.pagefault_buffer:
-            t7 = threading.Thread(target=write_pagefault)
-            threads.append(t7)
-            t7.start()
 
         if (self.nw_conn_buffer
                 or self.nw_sockopt_buffer or self.nw_drop_buffer):
@@ -1195,7 +1145,6 @@ class WriteManager:
             (self._cache_handle, "Cache"),
             (self._process_handle, "Process State"),
             (self._fs_snap_handle, "Filesystem Snapshot"),
-            (self._pagefault_handle, "PageFault"),
             (self._nw_conn_handle, "NetConn"),
             (self._nw_sockopt_handle, "NetSockopt"),
             (self._nw_drop_handle, "NetDrop"),
@@ -1215,7 +1164,6 @@ class WriteManager:
         self._cache_handle = None
         self._process_handle = None
         self._fs_snap_handle = None
-        self._pagefault_handle = None
         self._nw_conn_handle = None
         self._nw_sockopt_handle = None
         self._nw_drop_handle = None

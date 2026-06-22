@@ -273,13 +273,6 @@ class KernelProbeTracker:
                 if self.developer_mode:
                     logger("warning", "splice probe not available on this kernel version")
             
-            # Page fault probe for mmap I/O tracking
-            # if BPF.get_kprobe_functions(b'filemap_fault'):
-            #     self.add_kprobe("filemap_fault", "trace_filemap_fault_entry")
-            #     logger("info", "Page fault tracing enabled via filemap_fault")
-            # else:
-            #     logger("warning", "filemap_fault not available - mmap I/O tracking disabled")
-            
             # Direct I/O probes. The entry probe stages the I/O direction from
             # the iov_iter (the return value alone cannot distinguish a read
             # from a write); the return probe emits the completion event.

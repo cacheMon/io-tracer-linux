@@ -1035,38 +1035,6 @@ class IOTracer:
                 print("="*50)
         self.writer.append_block_log(output)
 
-    def _print_event_pagefault(self, cpu, data, size):
-        """
-        Callback for processing page fault events from the perf buffer.
-        
-        Captures mmap I/O patterns by tracking file-backed page faults.
-        
-        Args:
-            cpu: CPU number where the event was captured
-            data: Raw event data pointer
-            size: Size of the event data
-        """
-        event = self.b["pagefault_events"].event(data)
-        pid = event.pid
-        if pid == self._self_pid:
-            return
-        timestamp = self._event_walltime(event)
-        tid = event.tid
-        comm = event.comm.decode('utf-8', errors='replace')
-
-        if self._should_filter_process(comm):
-            return
-            
-        address = hex(event.address) if event.address else ""
-        inode = event.inode if event.inode != 0 else ""
-        offset = event.offset if event.offset != 0 else ""
-        fault_type = "WRITE" if event.fault_type == 1 else "READ"
-        major = "MAJOR" if event.major else "MINOR"
-        dev_id = event.dev_id if hasattr(event, 'dev_id') and event.dev_id != 0 else ""
-        
-        output = format_csv_row(timestamp, pid, tid, comm, fault_type, major, inode, offset, address, dev_id, getattr(event, "ts", 0))
-        self.writer.append_pagefault_log(output)
-
     def _print_event_io_uring(self, cpu, data, size):
         """
         Callback for io_uring perf events.
@@ -1452,17 +1420,6 @@ class IOTracer:
                 except KeyError:
                     if self.verbose:
                         logger("warning", f"{buf_name} buffer not available")
-
-        # Page fault events for mmap I/O tracking
-        # try:
-        #     self.b["pagefault_events"].open_perf_buffer(
-        #         self._print_event_pagefault,
-        #         page_cnt=self.page_cnt,
-        #         lost_cb=self._make_lost_cb("pagefault")
-        #     )
-        # except KeyError:
-        #     if self.verbose:
-        #         logger("warning", "pagefault_events buffer not available")
 
         # io_uring events for async I/O tracking
         try:

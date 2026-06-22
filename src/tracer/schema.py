@@ -132,23 +132,6 @@ STREAMS = {
             _col("count", "u32", "pages", "Pages affected by the operation."),
         ],
     ),
-    "pagefault": _stream(
-        "pagefault", "pagefault",
-        "File-backed page-fault events (mmap I/O).",
-        "CLOCK_REALTIME (derived from kernel CLOCK_MONOTONIC)",
-        [
-            _col("timestamp", "datetime"),
-            _col("pid", "u32"),
-            _col("tid", "u32"),
-            _col("command", "string"),
-            _col("fault_type", "string", "", "Access type that triggered the fault."),
-            _col("severity", "string", "", "Fault severity (major/minor)."),
-            _col("inode", "u64", "", "Backing file inode; empty for anonymous."),
-            _col("offset_pages", "u64", "pages", "File offset in pages (pgoff)."),
-            _col("address", "string", "", "Faulting virtual address (hex)."),
-            _col("device_id", "u32"),
-        ],
-    ),
     "nw_conn": _stream(
         "nw_conn", "nw_conn",
         "Network connection-lifecycle events (socket/bind/listen/accept/connect/"
