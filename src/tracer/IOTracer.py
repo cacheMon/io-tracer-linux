@@ -20,6 +20,7 @@ import shutil
 import signal
 import os
 import ctypes
+import threading
 import json
 import platform
 import socket
@@ -156,6 +157,14 @@ class IOTracer:
         self.system_snapper     = SystemSnapper(self.writer)
         self.flag_mapper        = FlagMapper()
         self.running            = True
+        # Shutdown is driven by _cleanup, which can be entered more than once —
+        # the SIGINT/SIGTERM handler, a second signal, and the timed path all
+        # call it. This non-reentrant lock makes it run exactly once; a
+        # re-entrant or concurrent call returns immediately instead of flushing
+        # and detaching probes twice on already-closed handles.
+        self._cleanup_lock      = threading.Lock()
+        self._cleanup_done      = False
+        self._poll_thread       = None
         self.verbose            = verbose
         self.duration           = duration
         self.anonymous          = anonymous
@@ -1171,16 +1180,41 @@ class IOTracer:
         self.writer.append_fs_log(output)
 
     def _cleanup(self, signum, frame):
-        self.running = False
-        self.probe_tracker.detach_kprobes()
+        # Run exactly once. _cleanup is reached from the SIGINT/SIGTERM handler,
+        # a possible second signal (double Ctrl-C, or SIGINT then SIGTERM), and
+        # the timed path's direct call — a non-blocking acquire makes every
+        # entry after the first return immediately, so we never detach probes or
+        # flush+close handles twice.
+        if not self._cleanup_lock.acquire(blocking=False):
+            return
+        try:
+            if self._cleanup_done:
+                return
+            self._cleanup_done = True
+            self.running = False
 
-        def _flush():
-            self.fs_snapper.stop_snapper()
-            self.process_snapper.stop_snapper()
-            self.writer.write_to_disk()
-            self.writer.close_handles()
+            # Stop and JOIN the poll thread before touching handles. Previously
+            # cleanup detached probes and closed the writer handles while the
+            # poll thread was still running (polling_active was only cleared
+            # later, in trace()'s finally), so a perf-buffer callback could write
+            # to a handle being closed. Joining first guarantees no callback runs
+            # during the flush/close below.
+            if self.polling_thread is not None:
+                self.polling_thread.polling_active = False
+            if self._poll_thread is not None:
+                self._poll_thread.join(timeout=2.0)
 
-        run_with_spinner("Flushing trace data", _flush)
+            self.probe_tracker.detach_kprobes()
+
+            def _flush():
+                self.fs_snapper.stop_snapper()
+                self.process_snapper.stop_snapper()
+                self.writer.write_to_disk()
+                self.writer.close_handles()
+
+            run_with_spinner("Flushing trace data", _flush)
+        finally:
+            self._cleanup_lock.release()
 
     def _block_stats(self, collapse_zero: bool = True):
         """Read the per-CPU ``block_stats`` map → {issued, completed, missed, stale}.
@@ -1440,9 +1474,11 @@ class IOTracer:
         else:
             logger("info", "Tracing indefinitely. Ctrl + C to stop.")
 
-        # Start the polling thread for perf buffer
+        # Start the polling thread for perf buffer. Keep the Thread handle so
+        # _cleanup can join it before flushing/closing handles (otherwise a
+        # callback could still write to a handle being torn down).
         self.polling_thread = PollingThread(self.b, True)
-        self.polling_thread.create_thread()
+        self._poll_thread = self.polling_thread.create_thread()
 
         try:
             if self.duration is not None:
@@ -1478,9 +1514,13 @@ class IOTracer:
         except Exception as e:
             logger("error", f"Main loop error: {e}")
         finally:
-            self.polling_thread.polling_active = False
-            time.sleep(0.2)
-            
+            # Funnel every exit path (timed, Ctrl-C via handler, KeyboardInterrupt
+            # before the handler was installed, or an unexpected error) through
+            # the one idempotent cleanup, so probes are always detached and
+            # buffers flushed exactly once — the KeyboardInterrupt/error paths
+            # used to skip detach + flush entirely. A no-op if cleanup already ran.
+            self._cleanup(None, None)
+
             if self.verbose:
                 actual_duration = time.time() - start
                 logger("info", f"Trace completed after {actual_duration:.2f} seconds")
