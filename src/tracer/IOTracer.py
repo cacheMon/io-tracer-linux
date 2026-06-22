@@ -200,6 +200,21 @@ class IOTracer:
             sys.exit(1)
         self.page_cnt = page_cnt
 
+        # Per-stream perf-buffer sizing (pages per CPU; a perf buffer requires a
+        # power-of-two page count). A flat page_cnt=8 (32 KB/CPU) overflowed on
+        # the high-volume page-cache and VFS streams — a short bursty workload
+        # dropped ~64% of cache events and ~27% of fs events *in the kernel*
+        # because the single poll thread could not drain the tiny buffers fast
+        # enough. Give the hot streams much larger kernel buffers so they absorb
+        # bursts and drain during lulls; keep the low-rate streams (block,
+        # network) modest to bound memory. (page_cnt is rounded up to a power of
+        # two so an odd --page-cnt override stays valid.)
+        base = 1 << max(0, self.page_cnt - 1).bit_length()
+        self._page_cnt_cache = max(base, 256)   # ~1 MB/CPU   — hottest stream
+        self._page_cnt_fs    = max(base, 128)   # ~512 KB/CPU — VFS + io_uring
+        self._page_cnt_block = max(base, 64)    # ~256 KB/CPU
+        self._page_cnt_net   = max(base, 32)    # ~128 KB/CPU — low event rate
+
         if duration is not None and duration <= 0:
             logger("error", f"Invalid duration: {duration}. Duration must be a positive integer.")
             sys.exit(1)
@@ -1344,19 +1359,19 @@ class IOTracer:
         # Open perf buffers for each event type
         self.b["events"].open_perf_buffer(
             self._print_event,
-            page_cnt=self.page_cnt,
+            page_cnt=self._page_cnt_fs,
             lost_cb=self._make_lost_cb("fs")
         )
 
         self.b["events_dual"].open_perf_buffer(
             self._print_event_dual,
-            page_cnt=self.page_cnt,
+            page_cnt=self._page_cnt_fs,
             lost_cb=self._make_lost_cb("fs")
         )
 
         self.b["bl_events"].open_perf_buffer(
             self._print_event_block,
-            page_cnt=self.page_cnt,
+            page_cnt=self._page_cnt_block,
             lost_cb=self._make_lost_cb("block")
         )
 
@@ -1366,7 +1381,7 @@ class IOTracer:
         if self.trace_cache:
             self.b["cache_events"].open_perf_buffer(
                 self._print_event_cache,
-                page_cnt=self.page_cnt,
+                page_cnt=self._page_cnt_cache,
                 lost_cb=self._make_lost_cb("cache")
             )
 
@@ -1382,7 +1397,7 @@ class IOTracer:
                 try:
                     self.b[buf_name].open_perf_buffer(
                         callback,
-                        page_cnt=self.page_cnt,
+                        page_cnt=self._page_cnt_net,
                         lost_cb=self._make_lost_cb(stream)
                     )
                 except KeyError:
@@ -1404,7 +1419,7 @@ class IOTracer:
         try:
             self.b["io_uring_events"].open_perf_buffer(
                 self._print_event_io_uring,
-                page_cnt=self.page_cnt,
+                page_cnt=self._page_cnt_fs,
                 lost_cb=self._make_lost_cb("fs")
             )
         except KeyError:
