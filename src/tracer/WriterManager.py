@@ -739,7 +739,14 @@ class WriteManager:
                 self._process_handle.close()
                 rotated = self.output_process_file
                 self.output_process_file = f"{self.output_dir}/process/process_{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}.csv"
-                self._process_handle = self._open_log_file(self.output_process_file, 'process')
+                # Reopen LAZILY (on the next append) rather than eagerly: an eager
+                # _open_log_file here writes a schema header into the new file
+                # immediately, so the LAST snapshot before shutdown left a
+                # header-only, 0-data-row file that force_flush still compressed +
+                # uploaded (a stray part; a bogus 2nd header to a concatenating
+                # reader). With None, the file is created only when there is a row
+                # to write, and force_flush's compress_log skips the missing path.
+                self._process_handle = None
                 self._reset_flush_timer()
 
                 # Mark process snapshot as complete

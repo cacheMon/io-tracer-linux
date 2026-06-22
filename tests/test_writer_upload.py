@@ -547,6 +547,49 @@ class WriteBufferErrorHandlingTests(unittest.TestCase):
         self.assertEqual(self.wm.rows_written.get("VFS", 0), 0)
 
 
+class ProcessRotationTests(unittest.TestCase):
+    """flush_process_state_only must not leave a stray header-only file: it
+    reopens the next process file LAZILY, so the last snapshot before shutdown
+    doesn't produce a 0-data-row part that force_flush still compresses+uploads."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.output_dir = os.path.join(self.tmp, "trace")
+        self.upload = FakeUploadManager()
+        self.wm = SilentWriteManager(
+            output_dir=self.output_dir,
+            upload_manager=self.upload,
+            automatic_upload=True,
+        )
+
+    def tearDown(self):
+        import shutil
+        try:
+            self.wm.close_handles()
+        except Exception:
+            pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @unittest.skipUnless(HAS_ZSTD or True, "")
+    def test_flush_does_not_leave_header_only_part(self):
+        for i in range(5):
+            self.wm.append_process_log(f"2026-01-01,{i},proc{i},,1,1,0,0,0,0,running,1")
+        self.wm.flush_process_state_only()
+
+        # The full file was rotated + uploaded; the NEXT process file is reopened
+        # lazily, so it must NOT exist on disk yet (no eager header write).
+        self.assertFalse(os.path.exists(self.wm.output_process_file),
+                         "next process file should be created lazily, not eagerly with a header")
+        uploads_after_flush = len(self.upload.uploaded)
+        self.assertEqual(uploads_after_flush, 1)
+
+        # Simulate shutdown compressing the (still un-written) current file:
+        # compress_log must skip the missing path, so NO stray empty part uploads.
+        self.wm.compress_log(self.wm.output_process_file)
+        self.assertEqual(len(self.upload.uploaded), uploads_after_flush,
+                         "force_flush must not upload a header-only/missing process part")
+
+
 class CreatedFilesCounterTests(unittest.TestCase):
     """created_files is bumped from several threads (compress on the
     perf-callback and periodic-flush threads, plus snapshot part uploads). The
