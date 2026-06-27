@@ -410,16 +410,20 @@ class FlagMapper:
         # entries are a plain bit test; O_SYNC/O_TMPFILE need their full mask and
         # supersede the O_DSYNC/O_DIRECTORY bit a regular test appended earlier.
         for flag, name, kind in self._fs_flag_plan:
+            # ``flag`` is the entry's full mask from flag_fs_map. For the
+            # composite O_SYNC / O_TMPFILE entries that mask already includes the
+            # subordinate bit (O_DSYNC / O_DIRECTORY), so a `(flags & flag) ==
+            # flag` test is the full-mask check — no need to hardcode the octal.
             if kind == "regular":
                 if flags & flag:
                     result.append(name)
-            elif kind == "sync":
-                if (flags & 0o04010000) == 0o04010000:
+            elif kind == "sync":  # O_SYNC supersedes the O_DSYNC bit it contains
+                if (flags & flag) == flag:
                     result.append(name)
                     if "O_DSYNC" in result:
                         result.remove("O_DSYNC")
-            else:  # "tmpfile" — O_TMPFILE includes O_DIRECTORY
-                if (flags & 0o020200000) == 0o020200000:
+            else:  # "tmpfile" — O_TMPFILE supersedes the O_DIRECTORY bit
+                if (flags & flag) == flag:
                     result.append(name)
                     if "O_DIRECTORY" in result:
                         result.remove("O_DIRECTORY")
