@@ -112,21 +112,35 @@ Three leaves account for the bulk of attributable time:
 
 ## Findings & optimization opportunities
 
-These are recorded for follow-up. They are **not applied here** — this change
-is profiling only, and several touch the trace output format, which deserves
-its own review. Impact figures are measured against the baseline above.
+Impact figures are measured against the baseline above.
 
-1. **`format_fs_flags` loops the full flag table even when `flags == 0`.**
-   On a read/write/close-heavy mix the overwhelmingly common argument is
-   `flags == 0`, yet the function still iterates all 19 entries of
-   `flag_fs_map` and runs per-entry list-membership scans
-   (`name in [...]`, `"O_DSYNC" in result`). A short-circuit —
-   `if flags == 0: return "O_RDONLY"` — is exactly equivalent (access mode 0 =
-   `O_RDONLY`, no other bits set) and is **~25× faster on that path**
-   (2460 ns → 96 ns per call, microbenchmarked). Since `format_fs_flags` is
-   ~16% of fs `tottime`, this alone is a meaningful win. The general path could
-   also precompute the non-access flag list once instead of re-filtering the
-   dict per call.
+### Applied
+
+1. **`format_fs_flags` no longer rescans the flag table on the hot path.**
+   *(implemented)* On a read/write/close-heavy mix the overwhelmingly common
+   argument is `flags == 0`, yet the function used to iterate all 19 entries of
+   `flag_fs_map` and run per-entry list-membership scans (`name in [...]`,
+   `"O_DSYNC" in result`). Two changes, both verified byte-for-byte identical to
+   the original output (equivalence test over 200k+ flag values, plus a
+   reference-implementation regression test in `tests/test_flag_mapper.py`):
+   - a `flags == 0` fast path returning `"O_RDONLY"` directly — **~37× faster**
+     on that case (≈2460 ns → 66 ns per call);
+   - a precomputed per-entry iteration plan (built once in `__init__`) that
+     drops the two per-iteration list-membership tests — **~2.6–3× faster** on
+     non-zero flags.
+
+   In the fs cProfile run `format_fs_flags` `tottime` fell from 1.30s to 0.06s
+   (it left the top-10 leaves entirely).
+
+5. **`format_fs_type` / `format_errno` two-step lookup.** *(implemented)* The
+   `f"FS(0x…)"` / `f"ERRNO(…)"` default is now built only on a cache miss
+   instead of eagerly on every (common) hit; `format_fs_type` also does a
+   single `int()`. `format_fs_type` `tottime` roughly halved (0.17s → 0.09s).
+
+### Remaining opportunities
+
+These are **not yet applied** — they touch the trace output format or the
+event-decode contract and deserve their own review.
 
 2. **`format_csv_row` is the single biggest leaf.** It is already hand-rolled
    to avoid the stdlib `csv` overhead, but per field it does a type check and a
@@ -151,11 +165,6 @@ its own review. Impact figures are measured against the baseline above.
    could be resolved once at startup (e.g. capture the field set from
    `event._fields_`) rather than per event.
 
-5. **`format_fs_type` does `dict.get` with an f-string default per call.** The
-   `f"FS(0x{int(magic):x})"` default is built eagerly even on the common cache
-   hit. A two-step lookup (check membership, format only on miss) avoids the
-   per-event f-string allocation.
-
 None of these change *what* is traced — only how fast each event is turned into
-a CSV row. Item 1 is the cleanest first step: large, isolated, and behavior
-preserving.
+a CSV row. Items 2 and 3 are the next-biggest leaves; both need care to keep the
+emitted row byte-for-byte stable, so they are deferred to a dedicated change.

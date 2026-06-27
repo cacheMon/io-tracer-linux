@@ -31,6 +31,72 @@ class FsFlagTests(unittest.TestCase):
         self.assertIn("O_WRONLY", out)
         self.assertIn("O_APPEND", out)
 
+    def test_sync_supersedes_dsync(self):
+        # O_SYNC's mask includes the O_DSYNC bit; only O_SYNC should appear.
+        out = self.m.format_fs_flags(0o4010002)  # O_RDWR | O_SYNC
+        self.assertIn("O_SYNC", out)
+        self.assertNotIn("O_DSYNC", out)
+
+    def test_tmpfile_supersedes_directory(self):
+        # O_TMPFILE's mask includes the O_DIRECTORY bit; only O_TMPFILE appears.
+        out = self.m.format_fs_flags(0o20200002)  # O_RDWR | O_TMPFILE
+        self.assertIn("O_TMPFILE", out)
+        self.assertNotIn("O_DIRECTORY", out)
+
+    def test_invalid_access_mode_no_flags(self):
+        # access bits 0b11 is invalid and matches no other flag -> NO_FLAGS.
+        self.assertEqual(self.m.format_fs_flags(0o3), "NO_FLAGS")
+
+    def test_fast_path_matches_general_path(self):
+        # The flags==0 fast path must equal the full scan's output, and the
+        # optimized scan must reproduce the original loop's output exactly
+        # (byte-for-byte, including flag ordering) across a wide input range.
+        # A reference copy of the pre-optimization implementation guards
+        # against any output regression from the precomputed-plan rewrite.
+        flag_map = self.m.flag_fs_map
+
+        def reference(flags):
+            access_mode = flags & 0o3
+            access_str = None
+            if access_mode == 0o0:
+                access_str = "O_RDONLY"
+            elif access_mode == 0o1:
+                access_str = "O_WRONLY"
+            elif access_mode == 0o2:
+                access_str = "O_RDWR"
+            result = []
+            if access_str:
+                result.append(access_str)
+            for flag, name in flag_map.items():
+                if name in ["O_RDONLY", "O_WRONLY", "O_RDWR"]:
+                    continue
+                if name == "O_SYNC" and (flags & 0o04010000) == 0o04010000:
+                    result.append(name)
+                    if "O_DSYNC" in result:
+                        result.remove("O_DSYNC")
+                    continue
+                if name == "O_TMPFILE" and (flags & 0o020200000) == 0o020200000:
+                    result.append(name)
+                    if "O_DIRECTORY" in result:
+                        result.remove("O_DIRECTORY")
+                    continue
+                if name not in ["O_SYNC", "O_TMPFILE"] and flags & flag:
+                    result.append(name)
+            return "|".join(result) if result else "NO_FLAGS"
+
+        # Dense low range + every known bit + all pairs/triples of known bits.
+        known = list(flag_map.keys())
+        candidates = set(range(0, 4096))
+        candidates.update(known)
+        for a in known:
+            for b in known:
+                candidates.add(a | b)
+                for c in known:
+                    candidates.add(a | b | c)
+        for flags in candidates:
+            self.assertEqual(self.m.format_fs_flags(flags), reference(flags),
+                             msg=f"flags={oct(flags)}")
+
 
 class MmapProtTests(unittest.TestCase):
     def setUp(self):
