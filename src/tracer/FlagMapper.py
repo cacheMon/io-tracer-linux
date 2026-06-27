@@ -60,6 +60,30 @@ class FlagMapper:
             0o020200000: "O_TMPFILE"
         }
 
+        # Precomputed iteration plan for format_fs_flags(). Built once so the
+        # hot path (one call per OPEN/READ/WRITE/CLOSE/FSYNC/READDIR event) does
+        # not re-run the per-entry list-membership tests the old loop did for
+        # every one of the ~19 flag entries on every event.
+        #
+        # Access-mode names (O_RDONLY/O_WRONLY/O_RDWR) are excluded entirely —
+        # they are emitted from the access-mode mask, never the bit scan. Each
+        # remaining entry is tagged 'regular' (a plain bit test), 'sync', or
+        # 'tmpfile' (composite flags that need their full mask and supersede a
+        # bit appended earlier). The order is flag_fs_map insertion order, so
+        # the emitted flag string is byte-for-byte identical to the old loop.
+        _access_names = {"O_RDONLY", "O_WRONLY", "O_RDWR"}
+        self._fs_flag_plan = []
+        for _flag, _name in self.flag_fs_map.items():
+            if _name in _access_names:
+                continue
+            if _name == "O_SYNC":
+                _kind = "sync"
+            elif _name == "O_TMPFILE":
+                _kind = "tmpfile"
+            else:
+                _kind = "regular"
+            self._fs_flag_plan.append((_flag, _name, _kind))
+
         # Block device operation types - https://elixir.bootlin.com/linux/v6.14.6/source/include/linux/blk_types.h#L312
         self.op_block_types = {
             0: "REQ_OP_READ",
@@ -363,44 +387,43 @@ class FlagMapper:
             >>> mapper.format_fs_flags(0o00000202)
             'O_RDWR|O_CREAT'
         """
-        # Handle access mode specially
-        access_mode = flags & 0o3  # mask with 0b11 (3 in decimal)
-        access_str = None
+        # Fast path: the overwhelmingly common argument on READ/WRITE/CLOSE
+        # events is 0 — access mode O_RDONLY with no other bits set. The general
+        # path below returns exactly "O_RDONLY" for flags == 0, so short-circuit
+        # it and skip the entire flag scan (the hottest case by far).
+        if flags == 0:
+            return "O_RDONLY"
+
+        # Access mode comes from the low two bits (O_RDONLY=0 / O_WRONLY=1 /
+        # O_RDWR=2; 3 is invalid and emits no access name).
+        access_mode = flags & 0o3
         if access_mode == 0o0:
-            access_str = "O_RDONLY"
+            result = ["O_RDONLY"]
         elif access_mode == 0o1:
-            access_str = "O_WRONLY"
+            result = ["O_WRONLY"]
         elif access_mode == 0o2:
-            access_str = "O_RDWR"
-            
-        result = []
-        if access_str:
-            result.append(access_str)
-            
-        # Check for other flags (skip access mode flags already handled)
-        for flag, name in self.flag_fs_map.items():
-            if name in ["O_RDONLY", "O_WRONLY", "O_RDWR"]:
-                continue
-                
-            # Special handling for O_SYNC because it includes O_DSYNC
-            if name == "O_SYNC" and (flags & 0o04010000) == 0o04010000:
-                result.append(name)
-                if "O_DSYNC" in result:
-                    result.remove("O_DSYNC")
-                continue
-                
-            # Special handling for O_TMPFILE because it includes O_DIRECTORY
-            if name == "O_TMPFILE" and (flags & 0o020200000) == 0o020200000:
-                result.append(name)
-                # Remove O_DIRECTORY if it's already in the list since it's part of O_TMPFILE
-                if "O_DIRECTORY" in result:
-                    result.remove("O_DIRECTORY")
-                continue
-                
-            # Handle all other regular flags
-            if name not in ["O_SYNC", "O_TMPFILE"] and flags & flag:
-                result.append(name)
-        
+            result = ["O_RDWR"]
+        else:
+            result = []
+
+        # Walk the precomputed plan (access names already excluded). 'regular'
+        # entries are a plain bit test; O_SYNC/O_TMPFILE need their full mask and
+        # supersede the O_DSYNC/O_DIRECTORY bit a regular test appended earlier.
+        for flag, name, kind in self._fs_flag_plan:
+            if kind == "regular":
+                if flags & flag:
+                    result.append(name)
+            elif kind == "sync":
+                if (flags & 0o04010000) == 0o04010000:
+                    result.append(name)
+                    if "O_DSYNC" in result:
+                        result.remove("O_DSYNC")
+            else:  # "tmpfile" — O_TMPFILE includes O_DIRECTORY
+                if (flags & 0o020200000) == 0o020200000:
+                    result.append(name)
+                    if "O_DIRECTORY" in result:
+                        result.remove("O_DIRECTORY")
+
         return "|".join(result) if result else "NO_FLAGS"
     
     def decode_mmap_flags(self, flags):
@@ -791,14 +814,21 @@ class FlagMapper:
         if not code:
             return ""
         code = abs(int(code))
-        return cls.errno_map.get(code, f"ERRNO({code})")
+        # Two-step lookup so the f-string default is only built on a miss, not
+        # eagerly on every (common) hit.
+        name = cls.errno_map.get(code)
+        return name if name is not None else f"ERRNO({code})"
 
     @classmethod
     def format_fs_type(cls, magic):
         """Map a superblock magic number to a filesystem name."""
         if not magic:
             return ""
-        return cls.fs_type_map.get(int(magic), f"FS(0x{int(magic):x})")
+        # One int() and a two-step lookup: avoid building the f-string default
+        # on the common hit (this runs once per READ/WRITE/OPEN event).
+        m = int(magic)
+        name = cls.fs_type_map.get(m)
+        return name if name is not None else f"FS(0x{m:x})"
 
     # ========================================================================
     # NETWORK FLAG MAPS (low-overhead subset: connection lifecycle, socket
