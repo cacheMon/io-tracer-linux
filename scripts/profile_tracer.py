@@ -34,6 +34,7 @@ import cProfile
 import io
 import os
 import pstats
+import shutil
 import sys
 import tempfile
 import time
@@ -237,20 +238,17 @@ def make_block_events(n, self_pid):
     base_ts = time.monotonic_ns()
     out = []
     for i in range(n):
+        # The block callback also reads sector/bio_size/queue_time_ns/cmd_flags/
+        # op_code/req_id; pass them straight to the constructor (all are in
+        # FakeEvent.__slots__).
         out.append(FakeEvent(
             pid=1001 + (i % 5), tid=2001 + (i % 5), ppid=1,
             comm=b"app-worker", op=b"R" if i % 2 else b"W",
             inode=0, size=0, latency_ns=120000, cpu_id=i % 8,
             dev=(8 << 20) | 1, ts=base_ts + i * 800,
+            sector=i * 8, bio_size=4096, queue_time_ns=3000,
+            cmd_flags=0, op_code=0, req_id=i,
         ))
-        # block callback reads .sector/.bio_size/.queue_time_ns/.cmd_flags/
-        # .op_code/.req_id via attributes; add them.
-        out[-1].sector = i * 8  # type: ignore[attr-defined]
-        out[-1].bio_size = 4096  # type: ignore[attr-defined]
-        out[-1].queue_time_ns = 3000  # type: ignore[attr-defined]
-        out[-1].cmd_flags = 0  # type: ignore[attr-defined]
-        out[-1].op_code = 0  # type: ignore[attr-defined]
-        out[-1].req_id = i  # type: ignore[attr-defined]
     return out
 
 
@@ -308,60 +306,58 @@ def main():
     print(f"Profiling stream={args.stream} events={args.num_events:,} "
           f"compress={'on' if compress else 'off'} output={output_dir}")
 
-    pr = None
-    if args.bench:
-        # cProfile inflates per-call cost ~5-10x; for an accurate throughput
-        # number, time the same workload with the profiler off.
-        wall0 = time.perf_counter()
-        run_stream(tracer, args.stream, events)
-        wall1 = time.perf_counter()
-    else:
-        pr = cProfile.Profile()
-        wall0 = time.perf_counter()
-        pr.enable()
-        run_stream(tracer, args.stream, events)
-        pr.disable()
-        wall1 = time.perf_counter()
-
-    # Flush remaining buffers (counts the final flush + compress in the timing
-    # summary below, but not inside the per-event cProfile window).
+    # Everything below runs inside try/finally so the temp trace tree is always
+    # removed — including the early return in --bench mode and any exception.
     try:
-        tracer.writer.write_to_disk()
-        tracer.writer.close_handles()
-    except Exception:
-        pass
+        pr = None
+        if args.bench:
+            # cProfile inflates per-call cost ~5-10x; for an accurate throughput
+            # number, time the same workload with the profiler off.
+            wall0 = time.perf_counter()
+            run_stream(tracer, args.stream, events)
+            wall1 = time.perf_counter()
+        else:
+            pr = cProfile.Profile()
+            wall0 = time.perf_counter()
+            pr.enable()
+            run_stream(tracer, args.stream, events)
+            pr.disable()
+            wall1 = time.perf_counter()
 
-    elapsed = wall1 - wall0
-    rate = args.num_events / elapsed if elapsed else 0.0
-    print()
-    print(f"=== Summary ({args.stream}) ===")
-    print(f"events processed : {args.num_events:,}")
-    print(f"wall time        : {elapsed:.3f} s")
-    print(f"throughput       : {rate:,.0f} events/s")
-    print(f"per-event cost   : {elapsed / args.num_events * 1e6:.3f} us/event")
-    if pr is None:
-        print("(measured with cProfile OFF — throughput is representative)")
-        return
-    print("(measured with cProfile ON — throughput is depressed; use --bench "
-          "for an accurate rate)")
-    print()
+        # Flush remaining buffers (counts the final flush + compress in the
+        # timing summary below, but not inside the per-event cProfile window).
+        try:
+            tracer.writer.write_to_disk()
+            tracer.writer.close_handles()
+        except Exception:
+            pass
 
-    s = io.StringIO()
-    ps = pstats.Stats(pr, stream=s).strip_dirs()
-    sort_key = {"cumulative": "cumulative", "tottime": "tottime", "ncalls": "ncalls"}[args.sort]
-    ps.sort_stats(sort_key).print_stats(args.top)
-    print(s.getvalue())
+        elapsed = wall1 - wall0
+        rate = args.num_events / elapsed if elapsed else 0.0
+        print()
+        print(f"=== Summary ({args.stream}) ===")
+        print(f"events processed : {args.num_events:,}")
+        print(f"wall time        : {elapsed:.3f} s")
+        print(f"throughput       : {rate:,.0f} events/s")
+        print(f"per-event cost   : {elapsed / args.num_events * 1e6:.3f} us/event")
+        if pr is None:
+            print("(measured with cProfile OFF — throughput is representative)")
+            return
+        print("(measured with cProfile ON — throughput is depressed; use --bench "
+              "for an accurate rate)")
+        print()
 
-    if args.dump:
-        pstats.Stats(pr).dump_stats(args.dump)
-        print(f"raw stats written to {args.dump}")
+        s = io.StringIO()
+        ps = pstats.Stats(pr, stream=s).strip_dirs()
+        sort_key = {"cumulative": "cumulative", "tottime": "tottime", "ncalls": "ncalls"}[args.sort]
+        ps.sort_stats(sort_key).print_stats(args.top)
+        print(s.getvalue())
 
-    # Clean up the temp trace tree.
-    try:
-        import shutil
+        if args.dump:
+            pstats.Stats(pr).dump_stats(args.dump)
+            print(f"raw stats written to {args.dump}")
+    finally:
         shutil.rmtree(output_dir, ignore_errors=True)
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":
