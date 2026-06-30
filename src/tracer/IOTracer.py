@@ -54,6 +54,9 @@ _NON_IO_SIZE_OPS = frozenset({
 })
 
 
+_ACTIVITY_THRESHOLD = 100  # block I/O events/sec to qualify as "active"
+
+
 class IOTracer:
     """
     Main class for tracing Linux I/O operations.
@@ -166,6 +169,8 @@ class IOTracer:
 
 
         self.writer             = WriteManager(output_dir, self.upload_manager, automatic_upload)
+        if self.automatic_upload:
+            self.upload_manager.on_upload_success = self._post_telemetry_delta
         self.fs_snapper         = FilesystemSnapper(self.writer, anonymous)
         self.process_snapper    = ProcessSnapper(self.writer, anonymous)
         self.system_snapper     = SystemSnapper(self.writer)
@@ -219,6 +224,14 @@ class IOTracer:
         self._event_count           = 0
         self._maintenance_interval  = 50000  # events between cache sweeps
         self._cmdline_cache_max     = 100000  # hard cap on cmdline cache entries
+        self._disk_event_counter: int = 0
+        self._counter_lock          = threading.Lock()
+        self.active_duration_s: int = 0
+        self._activity_stop         = threading.Event()
+        self._activity_t: threading.Thread | None = None
+        self._last_posted_active_s: int = 0
+        self._last_posted_rows: dict[str, int] = {}
+        self._telemetry_lock        = threading.Lock()
 
         if cache_sample_rate > 1:
             self.writer.set_cache_sampling(cache_sample_rate)
@@ -271,6 +284,37 @@ class IOTracer:
             logger("error", f"failed to initialize BPF: {e}")
             print("Your device are incompatible with this version of IO Tracer. Please notify us at io-tracer@googlegroups.com")
             sys.exit(1)
+
+    def _increment_disk_counter(self) -> None:
+        with self._counter_lock:
+            self._disk_event_counter += 1
+
+    def _activity_detector(self) -> None:
+        while not self._activity_stop.wait(timeout=1.0):
+            with self._counter_lock:
+                count = self._disk_event_counter
+                self._disk_event_counter = 0
+            if count > _ACTIVITY_THRESHOLD:
+                self.active_duration_s += 1
+
+    def _post_telemetry_delta(self) -> None:
+        with self._telemetry_lock:
+            duration_delta = self.active_duration_s - self._last_posted_active_s
+            self._last_posted_active_s = self.active_duration_s
+
+            current_rows = dict(self.writer.rows_written)
+            events_delta = {
+                k.lower().replace(" ", "_"): current_rows.get(k, 0) - self._last_posted_rows.get(k, 0)
+                for k in current_rows
+                if current_rows.get(k, 0) > self._last_posted_rows.get(k, 0)
+            }
+            self._last_posted_rows = current_rows
+
+        self.upload_manager.post_telemetry(
+            duration_s=duration_delta,
+            events=events_delta,
+            operating_system="Linux",
+        )
 
     def _should_filter_process(self, comm: str) -> bool:
         """Helper to filter out I/O unrelated system processes."""
@@ -985,6 +1029,7 @@ class IOTracer:
         pid = event.pid
         if pid == self._self_pid:
             return
+        self._increment_disk_counter()
         timestamp = self._event_walltime(event)
         tid = event.tid
         comm = event.comm.decode('utf-8', errors='replace')
@@ -1179,6 +1224,7 @@ class IOTracer:
                 return
             self._cleanup_done = True
             self.running = False
+            self._activity_stop.set()
 
             # Stop and JOIN the poll thread before touching handles. Previously
             # cleanup detached probes and closed the writer handles while the
@@ -1369,6 +1415,10 @@ class IOTracer:
         if self.automatic_upload:
             self.upload_manager.start_worker()
 
+        self._activity_stop.clear()
+        self._activity_t = threading.Thread(target=self._activity_detector, daemon=True)
+        self._activity_t.start()
+
         signal.signal(signal.SIGINT, self._cleanup)
         signal.signal(signal.SIGTERM, self._cleanup)
 
@@ -1528,6 +1578,15 @@ class IOTracer:
 
             print()
             logger("info", "Trace stopped")
+
+            if self._activity_t is not None:
+                self._activity_t.join(timeout=2.0)
+
+            if self.automatic_upload:
+                try:
+                    self._post_telemetry_delta()
+                except Exception as e:
+                    logger("warn", f"Telemetry post failed (non-fatal): {e}")
 
             run_with_spinner("Compressing trace output", self.writer.force_flush)
 

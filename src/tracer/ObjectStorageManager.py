@@ -20,6 +20,7 @@ import mimetypes
 import os
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
@@ -66,7 +67,7 @@ class ObjectStorageManager:
         self._t: list[threading.Thread] = []
         self.backend_url = "https://io-tracer-worker.1a1a11a.workers.dev"
         # self.app_version = get_current_tag()
-        self.machine_id = capture_machine_id()
+        self.machine_id = capture_machine_id().upper()
         self.current_datetime = datetime.now()
         self.file_queue: Queue[str] = Queue()
         self.successful_upload = 0
@@ -78,6 +79,7 @@ class ObjectStorageManager:
         # clean_queue()/stop_worker() from ever draining the queue.
         self._attempts: dict[str, int] = {}
         self.MAX_UPLOAD_ATTEMPTS = 5
+        self.on_upload_success: Callable[[], None] | None = None
 
 
     def test_connection(self) -> bool:
@@ -88,7 +90,11 @@ class ObjectStorageManager:
             bool: True if connection successful, False otherwise
         """
         def _check():
-            r = requests.get(f"{self.backend_url}/connection-test.txt", timeout=5)
+            payload = {
+                "computer_id": self.machine_id,
+                "operating_system": "Linux",
+            }
+            r = requests.post(f"{self.backend_url}/telemetry", json=payload, timeout=5)
             if not r.ok:
                 raise Exception("can't connect")
             return True
@@ -115,9 +121,10 @@ class ObjectStorageManager:
         Raises:
             RuntimeError: If the request fails
         """
-        r = requests.post(
-            f"{self.backend_url}/{self.trace_bucket}/"
-            f"{self.machine_id.upper()}/"
+        r = requests.get(
+            f"{self.backend_url}/presigned-url/"
+            f"{self.trace_bucket}/"
+            f"{self.machine_id}/"
             f"{self.current_datetime.strftime('%Y%m%d_%H%M%S_%f')[:-3]}/"
             f"{file_type}/"
             f"{filename}",
@@ -163,10 +170,42 @@ class ObjectStorageManager:
         if r.ok:
             os.remove(file_path)
             self.successful_upload += 1
-            unlock_reward()  
+            unlock_reward()
             logger("info", f"Files Uploaded: {self.successful_upload}", True)
+            if self.on_upload_success is not None:
+                try:
+                    self.on_upload_success()
+                except Exception:
+                    pass  # telemetry failure must never break the upload path
         else:
             raise RuntimeError(f"Upload failed: {r.status_code} {r.text}")
+
+    def post_telemetry(
+        self,
+        duration_s: int,
+        events: dict[str, int],
+        operating_system: str | None = None,
+    ):
+        """
+        Post session telemetry to the backend.
+
+        Args:
+            duration_s: Active trace duration in seconds (delta, not cumulative)
+            events: Per-stream row counts, e.g. {"fs": 1500, "block": 200}
+            operating_system: Platform string (e.g. platform.platform())
+
+        Raises:
+            RuntimeError: If the request fails
+        """
+        payload: dict = {"computer_id": self.machine_id}
+        if operating_system:
+            payload["operating_system"] = operating_system
+        payload["duration_s"] = duration_s
+        payload["events"] = events
+        r = requests.post(f"{self.backend_url}/telemetry", json=payload, timeout=10)
+        if not r.ok:
+            raise RuntimeError(f"Telemetry post failed: {r.status_code} {r.text}")
+        logger("info", f"Telemetry sent: {payload}")
 
     def append_object(self, file_path: str):
         """
