@@ -965,6 +965,15 @@ class WriteManager:
                 self.rows_written.get(buffer_name, 0) + len(drained)
             )
 
+    def get_rows_written_snapshot(self) -> dict[str, int]:
+        with self._rows_written_lock:
+            return dict(self.rows_written)
+
+    def get_counters_snapshot(self) -> tuple[dict[str, int], dict[str, int]]:
+        """Return (rows_written, write_dropped) snapshots under one lock."""
+        with self._rows_written_lock:
+            return dict(self.rows_written), dict(self.write_dropped)
+
     def write_to_disk(self):
         """Write all buffered data to disk using parallel threads."""
         def write_vfs():

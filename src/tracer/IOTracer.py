@@ -304,8 +304,7 @@ class IOTracer:
         with self._telemetry_lock:
             duration_delta = current_active_s - self._last_posted_active_s
 
-            with self.writer._rows_written_lock:
-                current_rows = dict(self.writer.rows_written)
+            current_rows = self.writer.get_rows_written_snapshot()
 
             events_delta = {
                 k.lower().replace(" ", "_"): current_rows.get(k, 0) - self._last_posted_rows.get(k, 0)
@@ -1360,9 +1359,7 @@ class IOTracer:
         """
         manifest = schema.schema_for_manifest()
         duration = (stopped_at - started_at).total_seconds() if stopped_at else None
-        with self.writer._rows_written_lock:
-            rows_written_snap = dict(self.writer.rows_written)
-            write_dropped_snap = dict(getattr(self.writer, "write_dropped", {}))
+        rows_written_snap, write_dropped_snap = self.writer.get_counters_snapshot()
         manifest.update({
             "tracer": {"version": self.version},
             "machine_id": capture_machine_id(),
