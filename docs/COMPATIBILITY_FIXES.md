@@ -39,3 +39,45 @@ When combined, the initial burst quickly saturates the 1024 limit.
 ### The Solution
 * **RLIMIT_NOFILE Bump**: We added a booster function `maximize_fd_limit()` at the start of `iotrc.py`. By importing `resource`, the script now dynamically bypasses the default 1024 soft limit and escalates the `RLIMIT_NOFILE` to up to `1,048,576` at runtime before starting any tracing allocations.
 * **psutil Context Guarding**: We improved file descriptor cleanup inside `ProcessSampler.py`. The `psutil.process_iter` iterations are now safely enclosed in protective `try/except` blocks to handle processes that disappear mid-iteration, safely closing their descriptors instead of leaking them into memory.
+
+## 4. OS Information Dump on Compile / Run Failure
+
+### The Problem
+When the BPF prober could not compile (e.g. a kernel-version mismatch the
+`#if` guards didn't cover) or failed to load/attach on an unexpected kernel,
+the tracer exited with a generic *"Your device is incompatible … please notify
+us"* message. The user had nothing concrete to send, and the maintainers had
+nothing to act on — diagnosing the incompatibility meant a slow back-and-forth
+asking for the kernel version, BTF availability, toolchain versions, and so on.
+
+### The Solution
+On any compile/load failure (`IOTracer.__init__`) or probe-attach failure
+(`IOTracer.trace()`), the tracer now calls
+`SystemSnapper.dump_failure_diagnostics()`, which collects **as much of the OS /
+kernel / toolchain environment as possible** and writes it to a local file
+named `io-tracer-os-info_<timestamp>.json` (in the current directory, falling
+back to the system temp dir). A short summary is also printed to the console.
+
+Collection is *best effort* — every probe is individually guarded, so a missing
+`/proc` entry or absent tool is recorded as an error rather than aborting the
+dump. The captured data includes:
+
+* **The triggering error** and its full traceback, plus the exact `cflags` and
+  BPF source path that were attempted.
+* **Kernel**: `uname` fields, `/proc/version`, `/proc/cmdline` (surfaces
+  BPF-blocking boot params such as `lockdown=`; secret-looking `key=value`
+  tokens are redacted), and the libc version.
+* **BTF**: whether `/sys/kernel/btf/vmlinux` is present (required by BCC/CO-RE).
+* **Kernel config**: a curated set of BPF-relevant `CONFIG_*` values read from
+  `/proc/config.gz` or `/boot/config-<release>` (`CONFIG_BPF_SYSCALL`,
+  `CONFIG_DEBUG_INFO_BTF`, `CONFIG_KPROBES`, …).
+* **Toolchain**: Python, `bcc`, `clang`/`llc`, `gcc`, and `ld` versions (`clang`
+  is what BCC shells out to when compiling the prober).
+* **Kernel headers**: presence of `/lib/modules/<release>/build` and
+  `/usr/src/linux-headers-<release>` (BCC's fallback when BTF is absent).
+* **tracefs**: whether debugfs/tracefs is mounted and whether the
+  `block_rq_complete` tracepoint exposes `cmd_flags` (the field `-DHAS_CMD_FLAGS`
+  keys off).
+* **System specs**: OS/distribution, CPU, and memory. The IP-geolocation
+  country lookup is intentionally skipped on this path so a slow/unreachable
+  network can't delay or block the dump.

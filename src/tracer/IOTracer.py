@@ -263,6 +263,10 @@ class IOTracer:
         self.b: BPF
         self.probe_tracker: KernelProbeTracker
 
+        # Remember the BPF source path and the cflags actually used, so a
+        # compile/load failure can report exactly what was attempted.
+        self.bpf_file = bpf_file
+        self._attempted_cflags: list[str] = []
         try:
             def _init_bpf():
                 cflags = ["-Wno-duplicate-decl-specifier", "-Wno-macro-redefined", "-mllvm", "-bpf-stack-size=4096"]
@@ -276,14 +280,37 @@ class IOTracer:
                 # so gating at compile time keeps overhead at zero when off.
                 if self.trace_network:
                     cflags.append("-DENABLE_NETWORK")
+                # Record the cflags before compiling so the diagnostics dump can
+                # report them even when the BPF() call itself raises.
+                self._attempted_cflags = cflags
                 self.b = BPF(src_file=bpf_file.encode(), cflags=cflags)
                 self.probe_tracker = KernelProbeTracker(self.b, developer_mode, trace_cache=self.trace_cache)
 
             run_with_spinner("Loading BPF program", _init_bpf)
         except Exception as e:
             logger("error", f"failed to initialize BPF: {e}")
-            print("Your device are incompatible with this version of IO Tracer. Please notify us at io-tracer@googlegroups.com")
+            print("Your device is incompatible with this version of IO Tracer.")
+            # Dump as much OS/kernel/toolchain information as possible so the
+            # incompatibility can actually be diagnosed (rather than emailing us
+            # a bare "it doesn't work"). Never let the dump mask the real error.
+            self._dump_failure_diagnostics(e, "BPF program failed to compile or load")
             sys.exit(1)
+
+    def _dump_failure_diagnostics(self, error: BaseException, context: str) -> None:
+        """Best-effort OS-information dump for a compile/run failure.
+
+        Wrapped so a failure inside the diagnostics path never replaces the
+        original error with a confusing secondary traceback.
+        """
+        try:
+            self.system_snapper.dump_failure_diagnostics(
+                error=error,
+                attempted_cflags=getattr(self, "_attempted_cflags", None),
+                bpf_file=getattr(self, "bpf_file", None),
+                context=context,
+            )
+        except Exception as diag_err:  # noqa: BLE001 - diagnostics are best effort
+            logger("warning", f"Could not collect OS diagnostics: {diag_err}")
 
     def _increment_disk_counter(self) -> None:
         with self._counter_lock:
@@ -1420,7 +1447,17 @@ class IOTracer:
         The trace runs indefinitely if no duration is specified,
         or for the specified number of seconds otherwise.
         """
-        run_with_spinner("Attaching kernel probes", self.probe_tracker.attach_probes)
+        try:
+            run_with_spinner("Attaching kernel probes", self.probe_tracker.attach_probes)
+        except Exception as e:
+            # The program compiled and loaded but a probe would not attach (e.g.
+            # a kernel symbol the verifier accepted is missing/renamed on this
+            # kernel). That is still a "failed to run" — dump the environment so
+            # the attach failure can be diagnosed, then exit.
+            logger("error", f"failed to attach kernel probes: {e}")
+            print("Your device is incompatible with this version of IO Tracer.")
+            self._dump_failure_diagnostics(e, "Kernel probe attachment failed")
+            sys.exit(1)
         if self.automatic_upload:
             self.upload_manager.start_worker()
 
