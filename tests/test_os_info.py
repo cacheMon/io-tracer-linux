@@ -130,6 +130,30 @@ class SanitizeCmdlineTests(unittest.TestCase):
         self.assertNotIn("SUPERSECRET", out)
         self.assertNotIn("hunter2", out)
 
+    def test_redacts_space_separated_secret_values(self):
+        # Secrets passed as a separate token after a flag (common after `--`).
+        out = SystemSnapper._sanitize_cmdline(
+            "-- --addr 0.0.0.0:2024 --password hunter2 --verbose"
+        )
+        self.assertIn("--addr 0.0.0.0:2024", out)
+        self.assertIn("--password <redacted>", out)
+        self.assertNotIn("hunter2", out)
+        self.assertIn("--verbose", out)
+
+    def test_secret_flag_followed_by_flag_is_not_redacted(self):
+        # A secret-looking flag immediately followed by another flag has no
+        # value to redact — the following flag must be preserved.
+        out = SystemSnapper._sanitize_cmdline("--token --verbose quiet")
+        self.assertEqual(out, "--token --verbose quiet")
+
+    def test_does_not_overredact_benign_cmdline(self):
+        # The real boot cmdline observed in this environment has no secrets.
+        cmd = (
+            "console=ttyS0 reboot=k panic=1 nomodule random.trust_cpu=1 "
+            "ipv6.disable=1 -- --firecracker-init --addr 0.0.0.0:2024"
+        )
+        self.assertEqual(SystemSnapper._sanitize_cmdline(cmd), cmd)
+
     def test_handles_empty_and_none(self):
         self.assertIsNone(SystemSnapper._sanitize_cmdline(None))
         self.assertEqual(SystemSnapper._sanitize_cmdline(""), "")

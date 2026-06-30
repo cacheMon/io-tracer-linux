@@ -289,7 +289,7 @@ class IOTracer:
             run_with_spinner("Loading BPF program", _init_bpf)
         except Exception as e:
             logger("error", f"failed to initialize BPF: {e}")
-            print("Your device are incompatible with this version of IO Tracer.")
+            print("Your device is incompatible with this version of IO Tracer.")
             # Dump as much OS/kernel/toolchain information as possible so the
             # incompatibility can actually be diagnosed (rather than emailing us
             # a bare "it doesn't work"). Never let the dump mask the real error.
@@ -1446,7 +1446,7 @@ class IOTracer:
             # kernel). That is still a "failed to run" — dump the environment so
             # the attach failure can be diagnosed, then exit.
             logger("error", f"failed to attach kernel probes: {e}")
-            print("Your device are incompatible with this version of IO Tracer.")
+            print("Your device is incompatible with this version of IO Tracer.")
             self._dump_failure_diagnostics(e, "Kernel probe attachment failed")
             sys.exit(1)
         if self.automatic_upload:

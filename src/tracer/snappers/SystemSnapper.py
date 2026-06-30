@@ -396,7 +396,7 @@ class SystemSnapper:
             except ImportError:
                 # Fallback if distro package not available
                 try:
-                    with open("/etc/os-release") as f:
+                    with open("/etc/os-release", encoding="utf-8") as f:
                         os_release = {}
                         for line in f:
                             if "=" in line:
@@ -439,7 +439,7 @@ class SystemSnapper:
     def _read_text_file(path: str, max_bytes: int = 64 * 1024) -> str | None:
         """Read a (small) text file, returning ``None`` if it can't be read."""
         try:
-            with open(path, "r", errors="replace") as f:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
                 return f.read(max_bytes).strip()
         except OSError:
             return None
@@ -471,20 +471,37 @@ class SystemSnapper:
 
     @classmethod
     def _sanitize_cmdline(cls, cmdline: str | None) -> str | None:
-        """Redact secret-looking ``key=value`` tokens from a kernel cmdline.
+        """Redact secret-looking tokens from a kernel cmdline.
 
         Keeps every diagnostically useful parameter (lockdown, lsm, console, …)
-        but replaces the *value* of any token whose key looks like a secret
-        (e.g. a provisioning token occasionally passed at boot) with
-        ``<redacted>``, so the dump the user is asked to share doesn't leak it.
+        but redacts secrets (e.g. a provisioning token occasionally passed at
+        boot) so the dump the user is asked to share doesn't leak them. Handles
+        both forms:
+
+        * ``key=value`` — the value is redacted when ``key`` looks like a secret.
+        * ``--flag value`` — when a bare flag looks like a secret, the following
+          whitespace-separated token is redacted (unless it is itself a flag),
+          covering the space-separated args that can follow ``--`` on the line.
         """
         if not cmdline:
             return cmdline
+        hints = cls._CMDLINE_SECRET_KEY_HINTS
         out = []
+        expect_value = False
         for token in cmdline.split():
+            if expect_value:
+                expect_value = False
+                # The previous token was a bare secret flag; this is its value
+                # unless it's another flag (in which case the flag had no value).
+                if not token.startswith("-"):
+                    out.append("<redacted>")
+                    continue
             key, sep, _ = token.partition("=")
-            if sep and any(h in key.lower() for h in cls._CMDLINE_SECRET_KEY_HINTS):
+            if sep and any(h in key.lower() for h in hints):
                 out.append(f"{key}=<redacted>")
+            elif not sep and any(h in token.lower() for h in hints):
+                out.append(token)
+                expect_value = True
             else:
                 out.append(token)
         return " ".join(out)
@@ -531,7 +548,7 @@ class SystemSnapper:
         source = None
         try:
             if os.path.exists("/proc/config.gz"):
-                with gzip.open("/proc/config.gz", "rt", errors="replace") as f:
+                with gzip.open("/proc/config.gz", "rt", encoding="utf-8", errors="replace") as f:
                     raw = f.read()
                 source = "/proc/config.gz"
             else:
@@ -757,7 +774,7 @@ class SystemSnapper:
                 continue
             try:
                 candidate = os.path.join(directory, filename)
-                with open(candidate, "w") as f:
+                with open(candidate, "w", encoding="utf-8") as f:
                     f.write(text)
                 path = candidate
                 break
