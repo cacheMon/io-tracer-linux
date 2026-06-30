@@ -84,6 +84,7 @@ class WriteManager:
         # Total rows written to disk per stream (keyed by buffer label), for the
         # session manifest — lets a consumer spot a stream whose probes attached
         # but produced no events.
+        self._rows_written_lock = threading.Lock()
         self.rows_written = {}
         # Rows that could NOT be persisted (write/flush raised — e.g. ENOSPC /
         # EDQUOT / closed handle) and were dropped after exceeding the on-error
@@ -958,9 +959,10 @@ class WriteManager:
                    + (f" — dropped {dropped} rows past retry cap" if dropped else ""))
             return
 
-        self.rows_written[buffer_name] = (
-            self.rows_written.get(buffer_name, 0) + len(drained)
-        )
+        with self._rows_written_lock:
+            self.rows_written[buffer_name] = (
+                self.rows_written.get(buffer_name, 0) + len(drained)
+            )
 
     def write_to_disk(self):
         """Write all buffered data to disk using parallel threads."""

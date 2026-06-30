@@ -168,7 +168,7 @@ class IOTracer:
                 self.automatic_upload = False
 
 
-        self.writer             = WriteManager(output_dir, self.upload_manager, automatic_upload)
+        self.writer             = WriteManager(output_dir, self.upload_manager, self.automatic_upload)
         if self.automatic_upload:
             self.upload_manager.on_upload_success = self._post_telemetry_delta
         self.fs_snapper         = FilesystemSnapper(self.writer, anonymous)
@@ -294,20 +294,29 @@ class IOTracer:
             with self._counter_lock:
                 count = self._disk_event_counter
                 self._disk_event_counter = 0
-            if count > _ACTIVITY_THRESHOLD:
-                self.active_duration_s += 1
+                if count > _ACTIVITY_THRESHOLD:
+                    self.active_duration_s += 1
 
     def _post_telemetry_delta(self) -> None:
-        with self._telemetry_lock:
-            duration_delta = self.active_duration_s - self._last_posted_active_s
-            self._last_posted_active_s = self.active_duration_s
+        with self._counter_lock:
+            current_active_s = self.active_duration_s
 
-            current_rows = dict(self.writer.rows_written)
+        with self._telemetry_lock:
+            duration_delta = current_active_s - self._last_posted_active_s
+
+            with self.writer._rows_written_lock:
+                current_rows = dict(self.writer.rows_written)
+
             events_delta = {
                 k.lower().replace(" ", "_"): current_rows.get(k, 0) - self._last_posted_rows.get(k, 0)
                 for k in current_rows
                 if current_rows.get(k, 0) > self._last_posted_rows.get(k, 0)
             }
+
+            if duration_delta == 0 and not events_delta:
+                return
+
+            self._last_posted_active_s = current_active_s
             self._last_posted_rows = current_rows
 
         self.upload_manager.post_telemetry(
@@ -1351,6 +1360,8 @@ class IOTracer:
         """
         manifest = schema.schema_for_manifest()
         duration = (stopped_at - started_at).total_seconds() if stopped_at else None
+        with self.writer._rows_written_lock:
+            rows_written_snap = dict(self.writer.rows_written)
         manifest.update({
             "tracer": {"version": self.version},
             "machine_id": capture_machine_id(),
@@ -1375,7 +1386,7 @@ class IOTracer:
             "diagnostics": {
                 "attached_probes": self._attached_probes(),
                 "lost_events": dict(self._lost_counts),
-                "rows_written": dict(self.writer.rows_written),
+                "rows_written": rows_written_snap,
                 "write_dropped": dict(getattr(self.writer, "write_dropped", {})),
                 "block": self._block_stats(),
             },
