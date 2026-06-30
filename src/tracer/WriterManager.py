@@ -952,9 +952,10 @@ class WriteManager:
                 buffer.popleft()
                 dropped += 1
             if dropped:
-                self.write_dropped[buffer_name] = (
-                    self.write_dropped.get(buffer_name, 0) + dropped
-                )
+                with self._rows_written_lock:
+                    self.write_dropped[buffer_name] = (
+                        self.write_dropped.get(buffer_name, 0) + dropped
+                    )
             logger("error", f"Error writing {buffer_name} buffer: {e}"
                    + (f" — dropped {dropped} rows past retry cap" if dropped else ""))
             return

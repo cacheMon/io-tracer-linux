@@ -1362,6 +1362,7 @@ class IOTracer:
         duration = (stopped_at - started_at).total_seconds() if stopped_at else None
         with self.writer._rows_written_lock:
             rows_written_snap = dict(self.writer.rows_written)
+            write_dropped_snap = dict(getattr(self.writer, "write_dropped", {}))
         manifest.update({
             "tracer": {"version": self.version},
             "machine_id": capture_machine_id(),
@@ -1387,7 +1388,7 @@ class IOTracer:
                 "attached_probes": self._attached_probes(),
                 "lost_events": dict(self._lost_counts),
                 "rows_written": rows_written_snap,
-                "write_dropped": dict(getattr(self.writer, "write_dropped", {})),
+                "write_dropped": write_dropped_snap,
                 "block": self._block_stats(),
             },
         })
