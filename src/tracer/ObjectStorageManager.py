@@ -26,7 +26,7 @@ from pathlib import Path
 from queue import Queue, Empty
 import requests
 
-from src.utility.utils import capture_machine_id, logger, get_current_tag, unlock_reward, run_with_spinner
+from src.utility.utils import capture_machine_id, logger, get_current_tag, unlock_reward, print_reward_notification, run_with_spinner
 
 
 class ObjectStorageManager:
@@ -170,7 +170,8 @@ class ObjectStorageManager:
         if r.ok:
             os.remove(file_path)
             self.successful_upload += 1
-            unlock_reward()
+            if unlock_reward():
+                print_reward_notification()
             logger("info", f"Files Uploaded: {self.successful_upload}", True)
             if self.on_upload_success is not None:
                 try:

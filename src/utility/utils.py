@@ -395,13 +395,32 @@ def is_reward_unlocked() -> bool:
     """
     return get_reward_marker_path().exists()
 
-def unlock_reward() -> None:
+def unlock_reward() -> bool:
     """
     Unlock the reward by creating the marker file.
+
+    Returns:
+        bool: True if this is a fresh unlock, False if already unlocked before.
     """
     marker_path = get_reward_marker_path()
+    if marker_path.exists():
+        return False
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     marker_path.touch()
+    return True
+
+def print_reward_notification() -> None:
+    """Print a one-time banner when the reward is freshly unlocked."""
+    _GREEN = "\033[1;32m"
+    _R = "\033[0m"
+    banner = (
+        f"\n{_GREEN}{'*' * 56}{_R}\n"
+        f"{_GREEN}  Reward Unlocked! Prolific submission code:{_R}\n"
+        f"{_GREEN}  {REWARD_CODE}{_R}\n"
+        f"{_GREEN}  Run: sudo python iotrc.py --reward to view again.{_R}\n"
+        f"{_GREEN}{'*' * 56}{_R}\n"
+    )
+    print(banner)
 
 def get_reward_code() -> str | None:
     """
