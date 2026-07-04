@@ -18,8 +18,14 @@ Example:
     hashed = simple_hash("sensitive_data")
 """
 
+# PEP 563: keep all annotations lazy so PEP 604 (`X | None`) and PEP 585
+# (`list[str]`) syntax import cleanly on Python 3.7-3.9 (RHEL 9, Debian 11,
+# Ubuntu 20.04, Amazon Linux stock interpreters).
+from __future__ import annotations
+
 import gzip
 import itertools
+import uuid
 import shutil
 import sys
 import threading
@@ -359,20 +365,49 @@ def compress_log(input_file: str):
 def capture_machine_id() -> str:
     """
     Capture and hash the machine's unique identifier.
-    
-    Reads /etc/machine-id and returns a 16-character hash.
-    This provides a consistent anonymous machine identifier.
-    
+
+    Tries /etc/machine-id, then /var/lib/dbus/machine-id (hosts without
+    systemd), treating empty or "uninitialized" content as missing (container
+    images where systemd never booted ship an empty /etc/machine-id, and
+    hashing "" would collide every such host onto one ID). As a last resort a
+    random ID is generated once and persisted so the machine keeps a stable
+    identity across runs — previously a missing /etc/machine-id crashed the
+    tracer at startup with an unhandled FileNotFoundError.
+
     Returns:
         str: 16-character hash of the machine ID
-        
+
     Example:
         >>> capture_machine_id()
         'a1b2c3d4e5f6g7h8'
     """
-    with open("/etc/machine-id") as f:
-        machine_id = f.read().strip()
-        return simple_hash(machine_id, 16)
+    for candidate in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(candidate) as f:
+                machine_id = f.read().strip()
+        except OSError:
+            continue
+        if machine_id and machine_id != "uninitialized":
+            return simple_hash(machine_id, 16)
+
+    # No usable system machine-id: generate one and persist it so repeated
+    # runs (and upload grouping/reward attribution) keep a stable identity.
+    state_path = Path("/var/lib/iotracer/machine-id")
+    try:
+        machine_id = state_path.read_text().strip()
+        if machine_id:
+            return simple_hash(machine_id, 16)
+    except OSError:
+        pass
+    machine_id = uuid.uuid4().hex
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(machine_id + "\n")
+    except OSError:
+        # Unwritable filesystem: fall through with the in-memory ID; the ID
+        # will differ on the next run, which is still better than crashing.
+        pass
+    return simple_hash(machine_id, 16)
 
 # Reward code for Prolific submissions
 REWARD_CODE = "CKXDRTBX"

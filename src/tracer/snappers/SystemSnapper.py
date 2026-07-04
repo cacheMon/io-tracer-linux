@@ -23,6 +23,11 @@ Example:
     snapper.capture_spec_snapshot()  # Capture and write specs
 """
 
+# PEP 563: keep all annotations lazy so PEP 604 (`X | None`) and PEP 585
+# (`list[str]`) syntax import cleanly on Python 3.7-3.9 (RHEL 9, Debian 11,
+# Ubuntu 20.04, Amazon Linux stock interpreters).
+from __future__ import annotations
+
 from ..WriterManager import WriteManager
 from ...utility.utils import logger
 import subprocess
@@ -619,6 +624,9 @@ class SystemSnapper:
             "modules_build_symlink_target": build_target,
             "usr_src_headers_path": headers_dir,
             "usr_src_headers_present": os.path.exists(headers_dir),
+            # CONFIG_IKHEADERS: BCC can extract headers embedded in the kernel
+            # when no headers package is installed (common on WSL2/cloud).
+            "kheaders_present": os.path.exists("/sys/kernel/kheaders.tar.xz"),
         }
 
     def get_tracefs_info(self) -> dict:
@@ -630,16 +638,26 @@ class SystemSnapper:
         """
         debug_tracing = "/sys/kernel/debug/tracing"
         tracefs = "/sys/kernel/tracing"
-        tp_format = f"{debug_tracing}/events/block/block_rq_complete/format"
+        # Check both mounts — modern systems increasingly expose only tracefs
+        # at /sys/kernel/tracing (mirrors IOTracer._init_bpf's sniffing).
         has_cmd_flags = None
-        if os.path.exists(tp_format):
-            fmt = self._read_text_file(tp_format)
-            has_cmd_flags = ("cmd_flags" in fmt) if fmt is not None else None
+        for base in (debug_tracing, tracefs):
+            tp_format = f"{base}/events/block/block_rq_complete/format"
+            if os.path.exists(tp_format):
+                fmt = self._read_text_file(tp_format)
+                has_cmd_flags = ("cmd_flags" in fmt) if fmt is not None else None
+                break
         return {
             "debugfs_tracing_mounted": os.path.isdir(debug_tracing),
             "tracefs_mounted": os.path.isdir(tracefs),
             "block_rq_complete_has_cmd_flags": has_cmd_flags,
         }
+
+    def get_lockdown_info(self) -> dict:
+        """Kernel lockdown state — Secure Boot lockdown blocks kprobes without
+        ever appearing on the boot cmdline, so read the runtime state too."""
+        state = self._read_text_file("/sys/kernel/security/lockdown")
+        return {"lockdown": state.strip() if state else None}
 
     def get_cpu_info(self) -> dict:
         """CPU brand and core counts (no frequency probe — kept dependency-light)."""
@@ -665,6 +683,7 @@ class SystemSnapper:
         attempted_cflags: list[str] | None = None,
         bpf_file: str | None = None,
         context: str | None = None,
+        include_toolchain_probes: bool = True,
     ) -> dict:
         """
         Gather as much OS / kernel / toolchain context as possible.
@@ -716,9 +735,17 @@ class SystemSnapper:
             "kernel": self._safe(self.get_kernel_info),
             "btf": self._safe(self.get_btf_info),
             "kernel_config": self._safe(self.get_kernel_config),
-            "toolchain": self._safe(self.get_toolchain_info),
+            # The toolchain probe shells out to clang/llc/gcc/ld --version
+            # (2s timeout each); callers on the happy path (the pre-compile
+            # breadcrumb, written on EVERY startup) skip it so a hung/slow
+            # toolchain can't add seconds to tracer startup. The full
+            # failure-path dump always includes it.
+            "toolchain": (self._safe(self.get_toolchain_info)
+                          if include_toolchain_probes
+                          else {"skipped": "pre-compile breadcrumb omits subprocess probes"}),
             "kernel_headers": self._safe(self.get_kernel_headers_info),
             "tracefs": self._safe(self.get_tracefs_info),
+            "lockdown": self._safe(self.get_lockdown_info),
         }
 
         diagnostics["system"] = {
@@ -782,7 +809,57 @@ class SystemSnapper:
                 continue
 
         self._print_diagnostics_summary(diagnostics, path)
+        self._print_remediation_hints(diagnostics)
         return path
+
+    @staticmethod
+    def _print_remediation_hints(diagnostics: dict) -> None:
+        """Print actionable next steps when the collected diagnostics can
+        distinguish the common failure causes. Never raises."""
+        try:
+            def _get(d, *keys):
+                for k in keys:
+                    if not isinstance(d, dict):
+                        return None
+                    d = d.get(k)
+                return d
+
+            hints = []
+            release = _get(diagnostics, "bpf_environment", "kernel", "release") or "$(uname -r)"
+            headers = _get(diagnostics, "bpf_environment", "kernel_headers") or {}
+            if headers and not headers.get("modules_build_present") and not headers.get("kheaders_present"):
+                hints.append(
+                    "Matching kernel headers were not found. Install them "
+                    f"(apt: linux-headers-{release} / dnf: kernel-devel-{release}) "
+                    "or boot a kernel with CONFIG_IKHEADERS; BCC cannot compile "
+                    "the tracer without them."
+                )
+            lockdown = _get(diagnostics, "bpf_environment", "lockdown", "lockdown") or ""
+            if "[integrity]" in lockdown or "[confidentiality]" in lockdown:
+                hints.append(
+                    "The kernel is in Secure Boot lockdown mode "
+                    f"({lockdown}), which blocks kprobes/eBPF tracing. Disable "
+                    "lockdown or Secure Boot to run the tracer."
+                )
+            bcc_version = _get(diagnostics, "bpf_environment", "toolchain", "bcc_version")
+            if bcc_version:
+                try:
+                    major_minor = tuple(int(x) for x in str(bcc_version).split(".")[:2])
+                    if major_minor < (0, 15):
+                        hints.append(
+                            f"The installed bcc ({bcc_version}) is very old and "
+                            "lacks compatibility shims this tracer relies on; "
+                            "upgrade bcc/python3-bpfcc."
+                        )
+                except (TypeError, ValueError):
+                    pass
+
+            if hints:
+                print("\nPossible fixes for this host:")
+                for hint in hints:
+                    print(f"  * {hint}")
+        except Exception:  # noqa: BLE001 - hints must never mask the real error
+            pass
 
     @staticmethod
     def _print_diagnostics_summary(diagnostics: dict, path: str | None) -> None:

@@ -18,13 +18,26 @@ We implemented selective compilation using standard kernel version macros (`#if 
 ## 2. Missing `cmd_flags` in `block_rq_complete`
 
 ### The Problem
-The `block_rq_complete` tracepoint arguments vary between kernel versions. On some older kernels, the `cmd_flags` variable is missing from the tracepoint format definition entirely, leading to a direct compilation failure when `args->cmd_flags` was accessed in `prober.c`.
+Referencing a tracepoint `args->` field that the running kernel's format file
+does not define is a direct compilation failure that aborts the whole BPF
+load. (Note: mainline `block_rq_complete` has never exposed `cmd_flags` — the
+field only exists on patched/vendor kernels, so on stock kernels the
+`cmd_flags`/`op_code` trace columns are empty by design and classification
+comes from `rwbs`.)
 
 ### The Solution
-Instead of relying on a hardcoded kernel version macro, which can be unreliable across backported distribution kernels, `src/tracer/IOTracer.py` now dynamically checks for the presence of `cmd_flags` by parsing the format file directly:
-`/sys/kernel/debug/tracing/events/block/block_rq_complete/format`
+Instead of relying on a hardcoded kernel version macro, which can be unreliable
+across backported distribution kernels, `src/tracer/IOTracer.py` dynamically
+checks for the presence of a field by parsing the tracepoint format file
+directly (checking both `/sys/kernel/debug/tracing` and `/sys/kernel/tracing`
+mounts).
 
-If the keyword `cmd_flags` is found, the Python script injects a `-DHAS_CMD_FLAGS` definition into the BPF compiler (`cflags`). In `prober.c`, `cmd_flags` collection is now wrapped in an `#ifdef HAS_CMD_FLAGS` block, ensuring safe access.
+If the field is found, the Python script injects a feature define into the BPF
+compiler `cflags`, and the corresponding `args->` access in `prober.c` is
+wrapped in an `#ifdef`. The same mechanism now also gates
+`skb:kfree_skb`'s `reason` field (`-DHAS_SKB_DROP_REASON`, kernel >= 5.17 or
+5.15.58+ LTS backports) and `tcp:tcp_retransmit_skb`'s `state` field
+(`-DHAS_TCP_RETRANSMIT_STATE`, kernel >= 4.20) for `--network` runs.
 
 ## 3. "Too many open files" (File Descriptor Exhaustion)
 
@@ -71,8 +84,9 @@ dump. The captured data includes:
 * **Kernel config**: a curated set of BPF-relevant `CONFIG_*` values read from
   `/proc/config.gz` or `/boot/config-<release>` (`CONFIG_BPF_SYSCALL`,
   `CONFIG_DEBUG_INFO_BTF`, `CONFIG_KPROBES`, …).
-* **Toolchain**: Python, `bcc`, `clang`/`llc`, `gcc`, and `ld` versions (`clang`
-  is what BCC shells out to when compiling the prober).
+* **Toolchain**: Python, `bcc`, `clang`/`llc`, `gcc`, and `ld` versions (BCC
+  compiles the prober in-process via libclang; the installed clang version
+  still indicates the LLVM generation in play).
 * **Kernel headers**: presence of `/lib/modules/<release>/build` and
   `/usr/src/linux-headers-<release>` (BCC's fallback when BTF is absent).
 * **tracefs**: whether debugfs/tracefs is mounted and whether the

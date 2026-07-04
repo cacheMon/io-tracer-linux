@@ -90,6 +90,9 @@ if __name__ == "__main__":
     parser.add_argument('--computer-id', action='store_true', help='Print this machine ID and exit')
     parser.add_argument('--reward', action='store_true', help='Show your reward code (unlocked after uploading traces)')
     parser.add_argument('--no-upload', action='store_true', help='Disable automatic upload of traces (for testing)')
+    parser.add_argument('--output', type=str, default=tempfile.gettempdir(), metavar='DIR',
+                        help='Base directory for trace output (default: system temp dir). '
+                             'The systemd service passes /var/log/iotracer/traces here.')
 
     subparsers = parser.add_subparsers(dest='subcommand')
     dev_parser = subparsers.add_parser('dev', help='Run in developer mode with extra logs and checks')
@@ -99,9 +102,13 @@ if __name__ == "__main__":
     dev_parser.add_argument('--network', action='store_true', help='Force-enable network event tracing: connection lifecycle, sockopt, drops (otherwise auto-enabled when the host has enough CPU, DRAM and network)')
     dev_parser.add_argument('--no-upload', action='store_true', help='Disable automatic upload of traces (for testing)')
     dev_parser.add_argument('--trace-bucket', type=str, default=None, help='Override upload bucket name (default: linux_v1)')
+    # SUPPRESS (not a real default): a subparser default would CLOBBER a value
+    # already parsed by the main parser ('iotrc --output /x dev' must keep /x).
+    dev_parser.add_argument('--output', type=str, default=argparse.SUPPRESS, metavar='DIR',
+                            help='Base directory for trace output (default: system temp dir)')
 
     parse_args = parser.parse_args()
-    output_dir = tempfile.gettempdir()
+    output_dir = parse_args.output
 
     # Handle --computer-id flag: print machine ID and exit
     if parse_args.computer_id:
@@ -132,10 +139,19 @@ if __name__ == "__main__":
         trace_cache, trace_network, verbose=verbose
     )
 
+    # Resolve the BPF source relative to this file, not the CWD. BCC's
+    # _find_file has an argv[0]-relative fallback that usually rescues a
+    # CWD-relative path, but it checks the CWD FIRST — so running iotrc from
+    # inside a different/stale checkout would silently compile that foreign
+    # prober.c. An absolute path removes both the fallback reliance and the
+    # shadowing hazard.
+    bpf_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'src', 'tracer', 'prober', 'prober.c')
+
     # Initialize and start the IO tracer
     tracer = IOTracer(
         output_dir=output_dir,
-        bpf_file='./src/tracer/prober/prober.c',
+        bpf_file=bpf_file,
         page_cnt=8,
         verbose=verbose,
         anonymous=anonimize,

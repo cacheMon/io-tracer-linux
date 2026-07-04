@@ -41,23 +41,33 @@
  * incomplete type". The program never instantiates these structs, so an empty
  * placeholder is enough to complete the type for the compiler.
  *
- * We can only declare the ones the headers leave incomplete: defining a
- * placeholder for a struct the headers already define fully is a redefinition
- * error, and there is no preprocessor test for "is this type complete?".
- * Hence the per-version guards below.
+ * Whether each struct is already complete depends on BOTH the kernel version
+ * AND the installed BCC release: BCC force-includes its own vendored uapi
+ * snapshot (virtual_bpf.h) BEFORE this file, and that snapshot fully defines
+ * e.g. struct bpf_timer since bcc 0.23. A LINUX_VERSION_CODE guard therefore
+ * cannot be right for every combination — `struct bpf_timer {};` under
+ * `< 5.17` was a hard "redefinition" compile error on stock Ubuntu 22.04
+ * (kernel 5.15 + bcc 0.24), and there is no preprocessor test for "is this
+ * type complete?".
+ *
+ * Instead, RENAME the struct tags from this point on: the vendored uapi
+ * definitions processed before this file keep their real names, while every
+ * later reference (the kernel headers' btf_field_type_size() and friends) is
+ * rewritten to a private placeholder tag that we define completely. This is
+ * correct on every bcc/kernel pair regardless of which side defines the real
+ * struct, because the renamed tag is ours alone.
  *
  * MAINTENANCE: if a future kernel fails to compile with
  *   "invalid application of 'sizeof' to an incomplete type 'struct bpf_<X>'"
- * add `struct bpf_<X> {};` here under the matching version guard. The
- * authoritative list lives in btf_field_type_size() in <linux/bpf.h>.
+ * add a rename + placeholder pair for bpf_<X> here. The authoritative list
+ * lives in btf_field_type_size() in <linux/bpf.h>.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
-struct bpf_timer {};       /* bpf_timer field, forward-declared from 5.17 on */
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-struct bpf_wq {};          /* workqueue field, added in 6.14 */
-struct bpf_task_work {};   /* task_work field, added in 6.14 */
-#endif
+#define bpf_timer     __iotracer_ph_bpf_timer
+#define bpf_wq        __iotracer_ph_bpf_wq
+#define bpf_task_work __iotracer_ph_bpf_task_work
+struct __iotracer_ph_bpf_timer {};
+struct __iotracer_ph_bpf_wq {};
+struct __iotracer_ph_bpf_task_work {};
 
 /* BPF atomic load/store instructions - fallback definitions */
 #ifndef BPF_LOAD_ACQ
@@ -91,6 +101,7 @@ struct bpf_task_work {};   /* task_work field, added in 6.14 */
 #include <linux/in.h>         /* IPv4 socket address structures */
 #include <linux/in6.h>        /* IPv6 socket address structures */
 #include <linux/mm.h>         /* Memory management (page, vm_area_struct) */
+#include <linux/pagemap.h>    /* Page cache (readahead_control, address_space) */
 #include <linux/sched.h>      /* Process/task structures */
 #include <linux/stat.h>       /* File mode/permission macros (S_ISREG, etc.) */
 #include <linux/tcp.h>        /* TCP protocol structures */
@@ -111,6 +122,45 @@ struct bpf_task_work {};   /* task_work field, added in 6.14 */
 #endif
 #endif
 
+/* ----------------------------------------------------------------------------
+ * bpf_probe_read_kernel/user compatibility (kernel < 5.5)
+ * ----------------------------------------------------------------------------
+ * The split probe_read helpers only exist from kernel 5.5; on older kernels
+ * the generic bpf_probe_read/bpf_probe_read_str ARE the correct helpers and
+ * every BCC release declares them. BCC >= 0.15 self-heals on such kernels by
+ * injecting its own object-like `#define bpf_probe_read_kernel bpf_probe_read`
+ * into the prologue (which makes the #ifndef below skip ours); bcc 0.12-0.14
+ * (stock Ubuntu 20.04) declare the new names but emit helper ids a < 5.5
+ * verifier rejects at load ("invalid func unknown#113"), so these
+ * function-like macros rewrite the calls to the legacy helpers instead.
+ * The kernel-version guard matters: on >= 5.5 kernels the legacy
+ * bpf_probe_read may not even exist (s390x/riscv64 omit it), and the
+ * kernel/user distinction must be preserved there.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0)
+#ifndef bpf_probe_read_kernel
+#define bpf_probe_read_kernel(dst, sz, src)      bpf_probe_read(dst, sz, src)
+#endif
+#ifndef bpf_probe_read_kernel_str
+#define bpf_probe_read_kernel_str(dst, sz, src)  bpf_probe_read_str(dst, sz, src)
+#endif
+#ifndef bpf_probe_read_user
+#define bpf_probe_read_user(dst, sz, src)        bpf_probe_read(dst, sz, src)
+#endif
+#ifndef bpf_probe_read_user_str
+#define bpf_probe_read_user_str(dst, sz, src)    bpf_probe_read_str(dst, sz, src)
+#endif
+#endif /* LINUX_VERSION_CODE < 5.5 */
+
+/* bpf_get_current_cgroup_id() exists from kernel 4.18 (commit bf6fa2c893c5);
+ * referencing it on older kernels rejects every program that calls it at
+ * load time. 0 is the "unknown cgroup" sentinel userspace already accepts. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0)
+#define iotracer_get_cgroup_id() bpf_get_current_cgroup_id()
+#else
+#define iotracer_get_cgroup_id() 0
+#endif
+
 /* ============================================================================
  * CONSTANTS AND CONFIGURATION
  * ============================================================================
@@ -118,6 +168,14 @@ struct bpf_task_work {};   /* task_work field, added in 6.14 */
 
 /** Maximum length for captured filenames (including null terminator) */
 #define FILENAME_MAX_LEN 256
+
+/* The BPF backend inlines constant memset/memcpy only up to 1024 bytes; above
+ * that, clang fails with "A call to built-in function 'memset' is not
+ * supported" on every LLVM version. Several buffers of this size are
+ * memset/memcpy'd as a unit, so keep the constant under the cliff. */
+_Static_assert(FILENAME_MAX_LEN <= 1024,
+               "FILENAME_MAX_LEN must stay <= 1024: larger constant "
+               "memset/memcpy cannot be inlined by the BPF backend");
 
 /** openat() dirfd sentinel meaning "resolve relative to the cwd". Defined here
  *  in case the BPF include set doesn't pull in <linux/fcntl.h>. */
@@ -272,21 +330,14 @@ struct data_dual_t {
   u64 latency_ns;                     /**< Operation latency */
 };
 
-/**
- * @brief Kernel renamedata structure (kernel 5.12+)
- *
- * Used by vfs_rename() in modern kernels. We define a minimal version
- * to extract the dentry pointers we need.
- */
-struct renamedata_bpf {
-  void *old_mnt_idmap;
-  struct inode *old_dir;
-  struct dentry *old_dentry;
-  void *new_mnt_idmap;
-  struct inode *new_dir;
-  struct dentry *new_dentry;
-  /* remaining fields not needed */
-};
+/* NOTE: vfs_rename's renamedata argument is read via the REAL struct
+ * renamedata from <linux/fs.h> (see trace_vfs_rename). A hand-rolled mirror
+ * of its layout used to live here and silently broke whenever the kernel
+ * reshuffled the struct — most recently in 6.18, which merged the two
+ * mnt_idmap fields and moved new_dentry from offset 40 to 32, so the stale
+ * offset read landed on delegated_inode and emitted garbage rename events.
+ * BCC recompiles against the running kernel's headers, so using the real
+ * type keeps the offsets correct on every kernel automatically. */
 
 /**
  * @brief Staging struct for sys_mremap arguments
@@ -322,9 +373,10 @@ struct block_event {
   u32 dev;                  /**< Device number (major:minor encoded) for partition ID */
   u64 queue_time_ns;        /**< Time from insert to issue (scheduler latency) */
   u32 op_code;              /**< Raw block operation code (REQ_OP_*) */
-  u64 req_id;               /**< Monotonic per-request id, unique within a trace
-                              *   session. Disambiguates distinct I/Os that reuse
-                              *   the same (dev, sector). */
+  u64 req_id;               /**< Per-request id, unique within a trace session
+                              *   (CPU id in the high 16 bits, per-CPU sequence
+                              *   in the low 48). Disambiguates distinct I/Os
+                              *   that reuse the same (dev, sector). */
 };
 
 /* ============================================================================
@@ -636,7 +688,7 @@ struct vfs_info {
  */
 struct block_issue_ctx {
   u64 ts;                   /**< Issue timestamp (device latency baseline) */
-  u64 req_id;               /**< Monotonic per-request id (see block_event.req_id) */
+  u64 req_id;               /**< Unique per-request id (see block_event.req_id) */
   u32 pid;                  /**< Submitting process ID */
   u32 tid;                  /**< Submitting thread ID */
   u32 ppid;                 /**< Submitter's parent PID */
@@ -676,10 +728,15 @@ struct block_rq_key_t {
 BPF_TABLE("lru_hash", struct block_rq_key_t, struct block_issue_ctx, block_start_times, 65536); /**< Issue time + submitter, keyed by dev+sector */
 BPF_TABLE("lru_hash", struct block_rq_key_t, u64, block_insert_times, 65536);  /**< Tracks block request insert time (queue latency) */
 
-/* Monotonic generator for per-request IDs (see block_event.req_id). A single
- * u64 bumped atomically at issue time; lets consumers disambiguate repeated
- * I/O to the same (dev, sector) and correlate a request across its lifecycle. */
-BPF_ARRAY(block_req_id_gen, u64, 1);
+/* Per-request ID generator (see block_event.req_id). A per-CPU u64 counter
+ * bumped at issue time; the emitted req_id folds the CPU id into the high bits
+ * so ids stay unique across CPUs without an atomic fetch-and-add. A global
+ * atomic counter is not portable here: the BPF XADD instruction can't return
+ * its old value on all kernels/LLVM ("Invalid usage of the XADD return value"),
+ * and a read-then-lock_xadd would race and hand out duplicate ids. Lets
+ * consumers disambiguate repeated I/O to the same (dev, sector) and correlate a
+ * request across its lifecycle. */
+BPF_PERCPU_ARRAY(block_req_id_gen, u64, 1);
 
 /* Block-tracing diagnostics counters (per-CPU, summed in userspace at exit):
  *   [0] requests issued, [1] requests completed (emitted),
@@ -1126,6 +1183,16 @@ BPF_PERCPU_ARRAY(dpath_scratch_map, struct dpath_scratch, 1);
 
 static __always_inline void build_dentry_path(struct dentry *dentry,
                                               char *buf, int buf_size) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 3, 0)
+  /* Pre-5.3 verifiers have no bounded-loop support: if the compiler leaves
+   * either loop below rolled (LLVM-version dependent — a real deployment has
+   * logged "loop not unrolled" here), the back-edge rejects the WHOLE
+   * program; and when the loops do unroll, the ~thousands of resulting
+   * instructions can breach the pre-5.2 4096-insn cap. Only the readdir
+   * probe reaches this path, so degrade it to basename-only on old kernels
+   * rather than risk the entire tracer. */
+  get_file_path_from_dentry(dentry, buf, buf_size);
+#else
   buf[0] = '\0';
   if (!dentry) return;
   /* The assembly buffer is masked into a FILENAME_MAX_LEN window and copied out
@@ -1181,6 +1248,7 @@ static __always_inline void build_dentry_path(struct dentry *dentry,
    * buffer; out[off] is already NUL-terminated within that window. */
   __builtin_memcpy(buf, out, FILENAME_MAX_LEN);
   buf[FILENAME_MAX_LEN - 1] = '\0';
+#endif /* LINUX_VERSION_CODE >= 5.3 */
 }
 
 /**
@@ -1276,7 +1344,7 @@ int trace_vfs_read(struct pt_regs *ctx, struct file *file, char __user *buf,
   // Provenance metadata: parent PID, container (cgroup) id, backing
   // device, and filesystem magic for source classification.
   data.ppid = get_ppid();
-  data.cgroup_id = bpf_get_current_cgroup_id();
+  data.cgroup_id = iotracer_get_cgroup_id();
   get_file_source(file, &data.dev, &data.fs_magic);
 
   // Defer submission to the kretprobe, which records the return value
@@ -1357,7 +1425,7 @@ int trace_vfs_write(struct pt_regs *ctx, struct file *file,
   // Provenance metadata: parent PID, container (cgroup) id, backing
   // device, and filesystem magic for source classification.
   data.ppid = get_ppid();
-  data.cgroup_id = bpf_get_current_cgroup_id();
+  data.cgroup_id = iotracer_get_cgroup_id();
   get_file_source(file, &data.dev, &data.fs_magic);
 
   // Defer submission to the kretprobe, which records the return value
@@ -1521,7 +1589,7 @@ int trace_vfs_open(struct pt_regs *ctx, const struct path *path,
   // Provenance metadata: parent PID, container (cgroup) id, backing
   // device, and filesystem magic for source classification.
   data.ppid = get_ppid();
-  data.cgroup_id = bpf_get_current_cgroup_id();
+  data.cgroup_id = iotracer_get_cgroup_id();
   get_file_source(file, &data.dev, &data.fs_magic);
 
   // Prefer the full path captured from the syscall entry (trace_do_sys_openat2_entry).
@@ -1965,6 +2033,45 @@ int trace_mremap_entry_x64(struct pt_regs *ctx) {
 }
 #endif /* __x86_64__ */
 
+#if defined(__aarch64__) || defined(bpf_target_arm64)
+/**
+ * @brief kprobe entry for the __arm64_sys_mremap syscall wrapper.
+ *
+ * arm64 has CONFIG_ARCH_HAS_SYSCALL_WRAPPER since 4.19: __arm64_sys_*
+ * functions receive a single struct pt_regs * holding the user registers;
+ * the syscall arguments live in regs[0..3] (x0-x3 per SC_ARM64_REGS_TO_ARGS),
+ * mirroring the x86-64 variant above. Without this variant (and its Python
+ * attach branch) arm64 silently lost all MREMAP events.
+ *
+ * @param ctx  BPF context (PARM1 = user pt_regs)
+ * @return     0
+ */
+int trace_mremap_entry_arm64(struct pt_regs *ctx) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 pid = pid_tgid >> 32;
+
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) {
+    return 0;
+  }
+
+  struct pt_regs *uregs = (struct pt_regs *)PT_REGS_PARM1(ctx);
+  if (!uregs) {
+    return 0;
+  }
+
+  struct mremap_args args = {};
+  bpf_probe_read_kernel(&args.old_addr, sizeof(args.old_addr), &uregs->regs[0]);
+  bpf_probe_read_kernel(&args.old_len, sizeof(args.old_len), &uregs->regs[1]);
+  bpf_probe_read_kernel(&args.new_len, sizeof(args.new_len), &uregs->regs[2]);
+  bpf_probe_read_kernel(&args.flags, sizeof(args.flags), &uregs->regs[3]);
+
+  mremap_staging.update(&pid_tgid, &args);
+  return 0;
+}
+#endif /* __aarch64__ */
+
 /**
  * @brief kretprobe return for sys_mremap - emit event with old + new addresses
  *
@@ -2399,17 +2506,14 @@ int trace_ksys_sync(struct pt_regs *ctx) {
  */
 
 /**
- * @brief Trace vfs_rename() - File/directory rename
+ * @brief Shared body for trace_vfs_rename (both signature variants below).
  *
  * Captures rename()/renameat() operations with source and destination paths.
  * Uses per-CPU buffer for the 572-byte data_dual_t structure.
- * Kernel 6.x signature: vfs_rename(struct renamedata *rd)
- *
- * @param ctx  BPF context
- * @param rd   Rename data structure containing old/new dentry info
- * @return     0
  */
-int trace_vfs_rename(struct pt_regs *ctx, struct renamedata_bpf *rd) {
+static __always_inline int emit_vfs_rename(struct pt_regs *ctx,
+                                           struct dentry *old_dentry,
+                                           struct dentry *new_dentry) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 pid = pid_tgid >> 32;
 
@@ -2418,16 +2522,6 @@ int trace_vfs_rename(struct pt_regs *ctx, struct renamedata_bpf *rd) {
   if (tracer_pid && pid == *tracer_pid) {
     return 0;
   }
-
-  if (!rd) {
-    return 0;
-  }
-
-  // Read dentry pointers from renamedata struct
-  struct dentry *old_dentry = NULL;
-  struct dentry *new_dentry = NULL;
-  bpf_probe_read_kernel(&old_dentry, sizeof(old_dentry), &rd->old_dentry);
-  bpf_probe_read_kernel(&new_dentry, sizeof(new_dentry), &rd->new_dentry);
 
   if (!old_dentry || !new_dentry) {
     return 0;
@@ -2439,11 +2533,11 @@ int trace_vfs_rename(struct pt_regs *ctx, struct renamedata_bpf *rd) {
   if (!data) {
     return 0;
   }
-  
+
   // Zero-initialize filename buffers to avoid stale data
   __builtin_memset(data->filename_old, 0, FILENAME_MAX_LEN);
   __builtin_memset(data->filename_new, 0, FILENAME_MAX_LEN);
-  
+
   data->pid = pid;
   data->ts = bpf_ktime_get_ns();
   bpf_get_current_comm(&data->comm, sizeof(data->comm));
@@ -2463,6 +2557,50 @@ int trace_vfs_rename(struct pt_regs *ctx, struct renamedata_bpf *rd) {
   events_dual.perf_submit(ctx, data, sizeof(*data));
   return 0;
 }
+
+/**
+ * @brief Trace vfs_rename() - File/directory rename
+ *
+ * Kernel >= 5.12 signature: vfs_rename(struct renamedata *rd). The dentries
+ * are read through the REAL struct renamedata from <linux/fs.h>, so BCC
+ * computes the field offsets from the running kernel's headers — correct
+ * across the 6.3 user_namespace->mnt_idmap swap AND the 6.18 relayout that
+ * broke the previous fixed-offset mirror (see the note above mremap_args).
+ * The old_dentry/new_dentry field names are stable across 5.12..6.18+.
+ *
+ * @param ctx  BPF context
+ * @param rd   Rename data structure containing old/new dentry info
+ * @return     0
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+int trace_vfs_rename(struct pt_regs *ctx, struct renamedata *rd) {
+  if (!rd) {
+    return 0;
+  }
+
+  // Read dentry pointers from the kernel's own renamedata definition
+  struct dentry *old_dentry = NULL;
+  struct dentry *new_dentry = NULL;
+  bpf_probe_read_kernel(&old_dentry, sizeof(old_dentry), &rd->old_dentry);
+  bpf_probe_read_kernel(&new_dentry, sizeof(new_dentry), &rd->new_dentry);
+
+  return emit_vfs_rename(ctx, old_dentry, new_dentry);
+}
+#else
+/**
+ * Kernel < 5.12 signature:
+ *   vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+ *              struct inode *new_dir, struct dentry *new_dentry,
+ *              struct inode **delegated_inode, unsigned int flags)
+ * The previous unguarded renamedata-typed handler read inode internals as
+ * dentry pointers on these kernels and emitted garbage rename events.
+ */
+int trace_vfs_rename(struct pt_regs *ctx, struct inode *old_dir,
+                     struct dentry *old_dentry, struct inode *new_dir,
+                     struct dentry *new_dentry) {
+  return emit_vfs_rename(ctx, old_dentry, new_dentry);
+}
+#endif
 
 /**
  * @brief Trace vfs_mkdir() - Directory creation
@@ -2881,11 +3019,19 @@ TRACEPOINT_PROBE(block, block_rq_issue) {
   ictx.ppid = get_ppid();
   bpf_get_current_comm(&ictx.comm, sizeof(ictx.comm));
 
-  // Assign a monotonic per-request id, carried to the completion event.
+  // Assign a unique per-request id, carried to the completion event. The
+  // generator is a per-CPU counter — BPF programs run with preemption disabled,
+  // so the read-increment-store needs no atomic — and the CPU id is folded into
+  // the high 16 bits to keep ids unique across CPUs. Using __sync_fetch_and_add
+  // on a global counter is not portable: its return value compiles to a BPF
+  // XADD that can't return its old value on all kernels/LLVM.
   u32 gen_key = 0;
   u64 *gen = block_req_id_gen.lookup(&gen_key);
-  if (gen)
-    ictx.req_id = __sync_fetch_and_add(gen, 1);
+  if (gen) {
+    u64 seq = *gen;
+    *gen = seq + 1;
+    ictx.req_id = ((u64)(bpf_get_smp_processor_id() & 0xFFFF) << 48) | (seq & 0xFFFFFFFFFFFFULL);
+  }
 
   block_start_times.update(&key, &ictx);
 
@@ -3030,7 +3176,7 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
  * folio_mark_accessed() is called when a cached page is accessed.
  * Indicates data was served from cache without disk I/O.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 int trace_folio_mark_accessed(struct pt_regs *ctx, struct folio *folio) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -3115,7 +3261,7 @@ int trace_hit(struct pt_regs *ctx, struct page *page) {
  * filemap_add_folio() adds a new page to cache after disk read.
  * This indicates a cache miss that required actual disk I/O.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 int trace_filemap_add_folio(struct pt_regs *ctx, struct address_space *mapping,
                             struct folio *folio, pgoff_t index, gfp_t gfp) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
@@ -3226,11 +3372,11 @@ int trace_account_page_dirtied(struct pt_regs *ctx, struct page *page,
 #endif
 
 /**
- * @brief Dirty page probe - folio version (kernel >= 5.17)
+ * @brief Dirty page probe - folio version (kernel >= 5.16)
  *
  * folio_mark_dirty() marks a folio as modified in newer kernels.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 int trace_folio_mark_dirty(struct pt_regs *ctx, struct folio *folio) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -3308,11 +3454,11 @@ int trace_clear_page_dirty_for_io(struct pt_regs *ctx, struct page *page) {
 #endif
 
 /**
- * @brief Writeback start probe - folio version (kernel >= 5.17)
+ * @brief Writeback start probe - folio version (kernel >= 5.16)
  *
  * folio_clear_dirty_for_io() starts writeback in newer kernels.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 int trace_folio_clear_dirty_for_io(struct pt_regs *ctx, struct folio *folio) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -3390,11 +3536,11 @@ int trace_test_clear_page_writeback(struct pt_regs *ctx, struct page *page) {
 #endif
 
 /**
- * @brief Writeback completion probe - folio version (kernel >= 5.17)
+ * @brief Writeback completion probe - folio version (kernel >= 5.16)
  *
  * folio_end_writeback() signals writeback completion.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 int trace_folio_end_writeback(struct pt_regs *ctx, struct folio *folio) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -3681,13 +3827,17 @@ int trace_truncate_pages(struct pt_regs *ctx, struct address_space *mapping,
 }
 
 /**
- * @brief Cache drop probe - folio version (kernel >= 5.18)
+ * @brief Cache drop probe - folio version (kernel >= 5.17)
  *
- * Captures explicit cache drops (e.g., POSIX_FADV_DONTNEED).
+ * Captures explicit cache drops (e.g., POSIX_FADV_DONTNEED). Attached to
+ * __filemap_remove_folio(folio, shadow) — the folio is the FIRST argument
+ * and the mapping is read from folio->mapping. (The previous prototype,
+ * (mapping, folio), matched no kernel: it misread the folio pointer as the
+ * mapping and the shadow pointer as the folio, emitting garbage drop rows.)
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
-int trace_cache_drop_folio(struct pt_regs *ctx, struct address_space *mapping,
-                           struct folio *folio) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+int trace_cache_drop_folio(struct pt_regs *ctx, struct folio *folio,
+                           void *shadow) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
   u32 config_key = 0;
@@ -3703,21 +3853,23 @@ int trace_cache_drop_folio(struct pt_regs *ctx, struct address_space *mapping,
 
   if (folio) {
     bpf_probe_read_kernel(&data.index, sizeof(data.index), &folio->index);
-    
+
     // Get LRU type from folio/page flags
     unsigned long flags = 0;
     struct page *p = (struct page *)folio;
     bpf_probe_read_kernel(&flags, sizeof(flags), &p->flags);
     if (flags != 0) {
     }
-  }
 
-  if (mapping) {
-    struct inode *host = NULL;
-    bpf_probe_read_kernel(&host, sizeof(host), &mapping->host);
-    if (host) {
-      bpf_probe_read_kernel(&data.inode, sizeof(data.inode), &host->i_ino);
-      populate_cache_metadata(&data, host);
+    struct address_space *mapping = NULL;
+    bpf_probe_read_kernel(&mapping, sizeof(mapping), &folio->mapping);
+    if (mapping) {
+      struct inode *host = NULL;
+      bpf_probe_read_kernel(&host, sizeof(host), &mapping->host);
+      if (host) {
+        bpf_probe_read_kernel(&data.inode, sizeof(data.inode), &host->i_ino);
+        populate_cache_metadata(&data, host);
+      }
     }
   }
 
@@ -3777,12 +3929,18 @@ int trace_cache_drop_page(struct pt_regs *ctx, struct page *page) {
 #endif
 
 /**
- * @brief Cache readahead probe - prefetch tracking
+ * @brief Cache readahead probe - legacy version (kernel < 5.10)
  *
  * Captures kernel readahead (prefetch) operations that speculatively
  * load pages into cache. count field contains pages being prefetched.
+ * Matches __do_page_cache_readahead(mapping, file, offset, nr_to_read,
+ * lookahead_size); kernel 5.10 replaced it with do_page_cache_ra() taking
+ * a readahead_control (see trace_page_cache_ra below). The old >= 5.17
+ * guard on this prototype matched no kernel at all: on >= 5.10 the first
+ * argument is the readahead_control, so reading it as the mapping emitted
+ * garbage readahead rows, and on < 5.17 the handler didn't compile.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 int trace_do_page_cache_readahead(struct pt_regs *ctx, struct address_space *mapping,
                                    struct file *file, pgoff_t index, unsigned long nr_pages) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
@@ -3816,13 +3974,112 @@ int trace_do_page_cache_readahead(struct pt_regs *ctx, struct address_space *map
 #endif
 
 /**
+ * @brief Cache readahead probe - readahead_control version (kernel >= 5.10)
+ *
+ * do_page_cache_ra(ractl, nr_to_read, lookahead_size) carries the mapping
+ * and the start index inside the readahead_control.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+int trace_page_cache_ra(struct pt_regs *ctx, struct readahead_control *ractl,
+                        unsigned long nr_to_read) {
+  u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid)
+    return 0;
+
+  struct cache_data data = {};
+  data.ts = bpf_ktime_get_ns();
+  data.pid = pid;
+  data.type = CACHE_READAHEAD;
+  data.count = (u32)nr_to_read;  // Number of pages in readahead window
+  bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+  if (ractl) {
+    struct address_space *mapping = NULL;
+    bpf_probe_read_kernel(&mapping, sizeof(mapping), &ractl->mapping);
+    // Set index before calling populate_cache_metadata
+    bpf_probe_read_kernel(&data.index, sizeof(data.index), &ractl->_index);
+    if (mapping) {
+      struct inode *host = NULL;
+      bpf_probe_read_kernel(&host, sizeof(host), &mapping->host);
+      if (host) {
+        bpf_probe_read_kernel(&data.inode, sizeof(data.inode), &host->i_ino);
+        populate_cache_metadata(&data, host);
+      }
+    }
+  }
+
+  data.cpu_id = bpf_get_smp_processor_id();
+  cache_events.perf_submit(ctx, &data, sizeof(data));
+  return 0;
+}
+#endif
+
+/**
+ * @brief Cache readahead probe - page_cache_ra_order fallback (kernel >= 5.18)
+ *
+ * page_cache_ra_order(ractl, ra, new_order) has no nr_to_read argument; the
+ * requested window size lives in ra->size. Only attached when
+ * do_page_cache_ra is unavailable (e.g. inlined) on a given kernel.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+int trace_page_cache_ra_order(struct pt_regs *ctx, struct readahead_control *ractl,
+                              struct file_ra_state *ra) {
+  u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid)
+    return 0;
+
+  struct cache_data data = {};
+  data.ts = bpf_ktime_get_ns();
+  data.pid = pid;
+  data.type = CACHE_READAHEAD;
+  bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+  if (ra) {
+    unsigned int ra_size = 0;
+    bpf_probe_read_kernel(&ra_size, sizeof(ra_size), &ra->size);
+    data.count = ra_size;  // Requested readahead window, in pages
+  }
+
+  if (ractl) {
+    struct address_space *mapping = NULL;
+    bpf_probe_read_kernel(&mapping, sizeof(mapping), &ractl->mapping);
+    // Set index before calling populate_cache_metadata
+    bpf_probe_read_kernel(&data.index, sizeof(data.index), &ractl->_index);
+    if (mapping) {
+      struct inode *host = NULL;
+      bpf_probe_read_kernel(&host, sizeof(host), &mapping->host);
+      if (host) {
+        bpf_probe_read_kernel(&data.inode, sizeof(data.inode), &host->i_ino);
+        populate_cache_metadata(&data, host);
+      }
+    }
+  }
+
+  data.cpu_id = bpf_get_smp_processor_id();
+  cache_events.perf_submit(ctx, &data, sizeof(data));
+  return 0;
+}
+#endif
+
+/**
  * @brief Cache reclaim probe - memory pressure tracking
  *
- * shrink_folio_list() is called during memory reclaim.
+ * shrink_folio_list() (shrink_page_list() before the folio conversion) is
+ * called during memory reclaim.
  * kswapd = background reclaim, other processes = direct reclaim.
  * Direct reclaim indicates memory pressure affecting performance.
+ *
+ * The handler reads no function arguments, so it works attached to either
+ * symbol on any kernel — no version guard needed (the old >= 5.17 guard
+ * compiled it out on kernels where shrink_page_list exists, silently
+ * disabling reclaim tracing there).
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
 int trace_shrink_folio_list(struct pt_regs *ctx) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -3852,7 +4109,6 @@ int trace_shrink_folio_list(struct pt_regs *ctx) {
   cache_events.perf_submit(ctx, &data, sizeof(data));
   return 0;
 }
-#endif
 
 /* ============================================================================
  * DIRECT I/O TRACING
@@ -4160,6 +4416,33 @@ int trace_io_uring_enter_x64(struct pt_regs *ctx) {
                              (u32)flags);
 }
 #endif /* __x86_64__ */
+
+#if defined(__aarch64__) || defined(bpf_target_arm64)
+/**
+ * @brief Kprobe entry for the __arm64_sys_io_uring_enter syscall wrapper.
+ *
+ * Unwraps the user pt_regs (see trace_mremap_entry_arm64): fd/to_submit/
+ * min_complete/flags live in regs[0..3] per the arm64 syscall ABI.
+ *
+ * @param ctx  BPF context (PARM1 = user pt_regs)
+ * @return     0
+ */
+int trace_io_uring_enter_arm64(struct pt_regs *ctx) {
+  struct pt_regs *uregs = (struct pt_regs *)PT_REGS_PARM1(ctx);
+  if (!uregs) {
+    return 0;
+  }
+
+  unsigned long fd = 0, to_submit = 0, min_complete = 0, flags = 0;
+  bpf_probe_read_kernel(&fd, sizeof(fd), &uregs->regs[0]);
+  bpf_probe_read_kernel(&to_submit, sizeof(to_submit), &uregs->regs[1]);
+  bpf_probe_read_kernel(&min_complete, sizeof(min_complete), &uregs->regs[2]);
+  bpf_probe_read_kernel(&flags, sizeof(flags), &uregs->regs[3]);
+
+  return emit_io_uring_enter(ctx, (u32)fd, (u32)to_submit, (u32)min_complete,
+                             (u32)flags);
+}
+#endif /* __aarch64__ */
 
 /**
  * @brief ABI-stable subset of the io_uring SQE (uapi/linux/io_uring.h).
@@ -4998,7 +5281,13 @@ TRACEPOINT_PROBE(tcp, tcp_retransmit_skb) {
   bpf_probe_read_kernel(&e.saddr_v6, sizeof(e.saddr_v6), args->saddr_v6);
   bpf_probe_read_kernel(&e.daddr_v6, sizeof(e.daddr_v6), args->daddr_v6);
 
+  /* The 'state' field was added to this tracepoint in kernel 4.20 (never
+   * backported to RHEL 8's 4.18). Gated on the loader's format-file sniff for
+   * the same reason as HAS_SKB_DROP_REASON above; without it, state stays 0
+   * (not a valid TCP state, reads as "unknown"). */
+#ifdef HAS_TCP_RETRANSMIT_STATE
   e.state = args->state;
+#endif
   e.ipver = (e.saddr_v4 != 0 || e.daddr_v4 != 0) ? 4 : 6;
 
   net_drop_events.perf_submit(args, &e, sizeof(e));
@@ -5025,8 +5314,15 @@ TRACEPOINT_PROBE(skb, kfree_skb) {
   eth_proto = bpf_ntohs(eth_proto);
   if (eth_proto != 0x0800 && eth_proto != 0x86dd) return 0;  /* not IPv4/IPv6 */
 
-  /* Read drop reason (kernel 5.17+ has this field) */
+  /* Read drop reason. The 'reason' field only exists where the running
+   * kernel's tracepoint format has it (mainline 5.17+, backported to 5.15.58+
+   * LTS). Referencing a missing args-> field is a compile error that aborts
+   * the whole load, so the loader sniffs the format file and defines
+   * HAS_SKB_DROP_REASON — the gate can never disagree with the args struct.
+   * Without it, drop_reason stays 0 (SKB_DROP_REASON_NOT_SPECIFIED). */
+#ifdef HAS_SKB_DROP_REASON
   bpf_probe_read_kernel(&e.drop_reason, sizeof(e.drop_reason), &args->reason);
+#endif
 
   /* Read packet length */
   bpf_probe_read_kernel(&e.skb_len, sizeof(e.skb_len), &skb->len);

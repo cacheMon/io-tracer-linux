@@ -164,22 +164,27 @@ _PSEUDO_FS_MAGICS = frozenset({
 
 
 class _Statfs(ctypes.Structure):
-    # Layout of glibc `struct statfs` on 64-bit Linux. Only f_type (the first
-    # word, carrying the superblock magic) is read; the rest is declared so the
-    # buffer is correctly sized for the syscall to write into.
+    # Layout of glibc `struct statfs`. The __fsword_t fields are `long` and
+    # the count fields `unsigned long` in glibc, so declaring them as
+    # c_long/c_ulong matches the ABI on BOTH 32- and 64-bit userlands
+    # (hard-coding c_int64 misread f_type on 32-bit, notably big-endian ones).
+    # Only f_type (the superblock magic) is read; the rest is declared so the
+    # buffer is correctly sized for the syscall to write into. The trailing
+    # pad keeps the buffer comfortably larger than any glibc variant.
     _fields_ = [
-        ("f_type", ctypes.c_int64),
-        ("f_bsize", ctypes.c_int64),
-        ("f_blocks", ctypes.c_uint64),
-        ("f_bfree", ctypes.c_uint64),
-        ("f_bavail", ctypes.c_uint64),
-        ("f_files", ctypes.c_uint64),
-        ("f_ffree", ctypes.c_uint64),
+        ("f_type", ctypes.c_long),
+        ("f_bsize", ctypes.c_long),
+        ("f_blocks", ctypes.c_ulong),
+        ("f_bfree", ctypes.c_ulong),
+        ("f_bavail", ctypes.c_ulong),
+        ("f_files", ctypes.c_ulong),
+        ("f_ffree", ctypes.c_ulong),
         ("f_fsid", ctypes.c_int32 * 2),
-        ("f_namelen", ctypes.c_int64),
-        ("f_frsize", ctypes.c_int64),
-        ("f_flags", ctypes.c_int64),
-        ("f_spare", ctypes.c_int64 * 4),
+        ("f_namelen", ctypes.c_long),
+        ("f_frsize", ctypes.c_long),
+        ("f_flags", ctypes.c_long),
+        ("f_spare", ctypes.c_long * 4),
+        ("_pad", ctypes.c_byte * 64),
     ]
 
 

@@ -16,9 +16,15 @@ Usage:
     tracer.trace()
 """
 
+# PEP 563: keep all annotations lazy so PEP 604 (`X | None`) and PEP 585
+# (`list[str]`) syntax import cleanly on Python 3.7-3.9 (RHEL 9, Debian 11,
+# Ubuntu 20.04, Amazon Linux stock interpreters).
+from __future__ import annotations
+
 import shutil
 import signal
 import os
+import tempfile
 import ctypes
 import threading
 import json
@@ -268,33 +274,125 @@ class IOTracer:
         self.bpf_file = bpf_file
         self._attempted_cflags: list[str] = []
         try:
+            def _tracepoint_format(category: str, name: str) -> str:
+                # Tracepoint format files live under debugfs on older setups and
+                # under tracefs (/sys/kernel/tracing) on modern ones that no
+                # longer mount debugfs; check both.
+                for base in ("/sys/kernel/debug/tracing", "/sys/kernel/tracing"):
+                    try:
+                        with open(f"{base}/events/{category}/{name}/format", "r") as f:
+                            return f.read()
+                    except OSError:
+                        continue
+                return ""
+
             def _init_bpf():
+                # KNOWN FOLLOW-UP: -bpf-stack-size=4096 only lifts LLVM's
+                # compile-time diagnostic; the kernel verifier still enforces
+                # 512 bytes per frame. struct data_t (~408 bytes) is
+                # stack-allocated in ~26 handlers, so frames sit close enough
+                # to 512 that a different LLVM's stack layout can cross it at
+                # load time on some distros. The durable fix is moving data_t
+                # into a per-CPU scratch map (like dual_data_buffer) handler by
+                # handler and THEN dropping this flag so oversize frames fail
+                # at compile again — do not drop the flag alone.
                 cflags = ["-Wno-duplicate-decl-specifier", "-Wno-macro-redefined", "-mllvm", "-bpf-stack-size=4096"]
-                tp_format = "/sys/kernel/debug/tracing/events/block/block_rq_complete/format"
-                if os.path.exists(tp_format):
-                    with open(tp_format, "r") as f:
-                        if "cmd_flags" in f.read():
-                            cflags.append("-DHAS_CMD_FLAGS")
+                # Feature-detect optional tracepoint fields by sniffing the same
+                # format files BCC generates the args structs from, so the -D
+                # gates can never disagree with what actually compiles. This
+                # (rather than LINUX_VERSION_CODE) also does the right thing on
+                # kernels with backports (e.g. 'reason' backported to 5.15.58).
+                if "cmd_flags" in _tracepoint_format("block", "block_rq_complete"):
+                    cflags.append("-DHAS_CMD_FLAGS")
                 # Compile the network probe subset only when requested. The
                 # connection/sockopt/drop probes auto-attach when compiled,
                 # so gating at compile time keeps overhead at zero when off.
                 if self.trace_network:
                     cflags.append("-DENABLE_NETWORK")
+                    # skb:kfree_skb 'reason' exists on mainline 5.17+ (and
+                    # 5.15.58+ LTS); tcp:tcp_retransmit_skb 'state' on 4.20+.
+                    # Referencing a missing args-> field is a compile error
+                    # that aborts the whole load, so gate each on its format.
+                    if " reason;" in _tracepoint_format("skb", "kfree_skb"):
+                        cflags.append("-DHAS_SKB_DROP_REASON")
+                    if " state;" in _tracepoint_format("tcp", "tcp_retransmit_skb"):
+                        cflags.append("-DHAS_TCP_RETRANSMIT_STATE")
                 # Record the cflags before compiling so the diagnostics dump can
                 # report them even when the BPF() call itself raises.
                 self._attempted_cflags = cflags
+                # A native compiler abort (LLVM report_fatal_error -> SIGABRT)
+                # kills the process inside libbcc WITHOUT raising, so the
+                # except-path below never runs for it. Leave a breadcrumb
+                # diagnostics file before compiling and delete it on success —
+                # an abort then still leaves a shareable report on disk.
+                self._write_compile_breadcrumb(cflags)
                 self.b = BPF(src_file=bpf_file.encode(), cflags=cflags)
                 self.probe_tracker = KernelProbeTracker(self.b, developer_mode, trace_cache=self.trace_cache)
+                self._remove_compile_breadcrumb()
 
             run_with_spinner("Loading BPF program", _init_bpf)
         except Exception as e:
+            # The full dump below supersedes the pre-compile breadcrumb.
+            self._remove_compile_breadcrumb()
             logger("error", f"failed to initialize BPF: {e}")
-            print("Your device is incompatible with this version of IO Tracer.")
+            print("IO Tracer could not compile or load its eBPF program on this host.")
             # Dump as much OS/kernel/toolchain information as possible so the
             # incompatibility can actually be diagnosed (rather than emailing us
             # a bare "it doesn't work"). Never let the dump mask the real error.
+            # The dump also prints remediation hints (missing kernel headers,
+            # Secure Boot lockdown, old bcc) when it can tell the causes apart.
             self._dump_failure_diagnostics(e, "BPF program failed to compile or load")
             sys.exit(1)
+
+    def _write_compile_breadcrumb(self, cflags: list[str]) -> None:
+        """Write a pre-compile diagnostics file (no console output).
+
+        Deleted again on successful load (and on a handled failure, where the
+        full dump supersedes it); if the compiler aborts the process natively
+        the file survives as the failure report. Created with
+        NamedTemporaryFile (O_CREAT|O_EXCL, mode 0600, random suffix) — the
+        tracer runs as root, so an open() of a fixed, predictable name in
+        world-writable /tmp would follow an attacker-planted symlink. Never
+        raises.
+        """
+        self._compile_breadcrumb_path = None
+        try:
+            diagnostics = self.system_snapper.collect_diagnostics(
+                error=None,
+                attempted_cflags=cflags,
+                bpf_file=getattr(self, "bpf_file", None),
+                # Happy-path cost control: skip the subprocess toolchain
+                # probes here; the full failure dump still collects them.
+                include_toolchain_probes=False,
+                context=(
+                    "BPF compile started. If this file still exists, the "
+                    "compiler terminated the process natively (e.g. 'LLVM "
+                    "ERROR: ...' followed by an abort) before the tracer "
+                    "could handle the failure — share this file with the "
+                    "maintainers."
+                ),
+            )
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="io-tracer-pending-compile-",
+                suffix=".json",
+                delete=False,
+            ) as f:
+                json.dump(diagnostics, f, indent=2, default=str)
+                self._compile_breadcrumb_path = f.name
+        except Exception:  # noqa: BLE001 - breadcrumb is best effort
+            self._compile_breadcrumb_path = None
+
+    def _remove_compile_breadcrumb(self) -> None:
+        """Delete the pre-compile breadcrumb, if one was written. Never raises."""
+        path = getattr(self, "_compile_breadcrumb_path", None)
+        self._compile_breadcrumb_path = None
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def _dump_failure_diagnostics(self, error: BaseException, context: str) -> None:
         """Best-effort OS-information dump for a compile/run failure.
@@ -1102,7 +1200,10 @@ class IOTracer:
         cmd_flags_str = self.flag_mapper.decode_block_req_flags(cmd_flags) if cmd_flags else ""
         
         # Decode raw operation code (REQ_OP_READ, REQ_OP_WRITE, etc.)
-        # Note: op_code is 0 on kernel 5.17+ where cmd_flags is unavailable - don't decode it
+        # Note: mainline block_rq_complete has never exposed cmd_flags, so
+        # op_code/cmd_flags are 0 on stock kernels (the rwbs-derived
+        # `operation` column covers classification); they only populate on
+        # kernels whose tracepoint format actually carries cmd_flags.
         op_code = event.op_code if hasattr(event, 'op_code') else 0
         op_code_str = self.flag_mapper.decode_block_op_code(op_code) if (op_code is not None and op_code != 0) else ""
 
