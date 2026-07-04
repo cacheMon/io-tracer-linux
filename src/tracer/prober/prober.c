@@ -91,6 +91,7 @@ struct bpf_task_work {};   /* task_work field, added in 6.14 */
 #include <linux/in.h>         /* IPv4 socket address structures */
 #include <linux/in6.h>        /* IPv6 socket address structures */
 #include <linux/mm.h>         /* Memory management (page, vm_area_struct) */
+#include <linux/pagemap.h>    /* Page cache (readahead_control, address_space) */
 #include <linux/sched.h>      /* Process/task structures */
 #include <linux/stat.h>       /* File mode/permission macros (S_ISREG, etc.) */
 #include <linux/tcp.h>        /* TCP protocol structures */
@@ -1971,6 +1972,45 @@ int trace_mremap_entry_x64(struct pt_regs *ctx) {
 }
 #endif /* __x86_64__ */
 
+#if defined(__aarch64__) || defined(bpf_target_arm64)
+/**
+ * @brief kprobe entry for the __arm64_sys_mremap syscall wrapper.
+ *
+ * arm64 has CONFIG_ARCH_HAS_SYSCALL_WRAPPER since 4.19: __arm64_sys_*
+ * functions receive a single struct pt_regs * holding the user registers;
+ * the syscall arguments live in regs[0..3] (x0-x3 per SC_ARM64_REGS_TO_ARGS),
+ * mirroring the x86-64 variant above. Without this variant (and its Python
+ * attach branch) arm64 silently lost all MREMAP events.
+ *
+ * @param ctx  BPF context (PARM1 = user pt_regs)
+ * @return     0
+ */
+int trace_mremap_entry_arm64(struct pt_regs *ctx) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  u32 pid = pid_tgid >> 32;
+
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid) {
+    return 0;
+  }
+
+  struct pt_regs *uregs = (struct pt_regs *)PT_REGS_PARM1(ctx);
+  if (!uregs) {
+    return 0;
+  }
+
+  struct mremap_args args = {};
+  bpf_probe_read_kernel(&args.old_addr, sizeof(args.old_addr), &uregs->regs[0]);
+  bpf_probe_read_kernel(&args.old_len, sizeof(args.old_len), &uregs->regs[1]);
+  bpf_probe_read_kernel(&args.new_len, sizeof(args.new_len), &uregs->regs[2]);
+  bpf_probe_read_kernel(&args.flags, sizeof(args.flags), &uregs->regs[3]);
+
+  mremap_staging.update(&pid_tgid, &args);
+  return 0;
+}
+#endif /* __aarch64__ */
+
 /**
  * @brief kretprobe return for sys_mremap - emit event with old + new addresses
  *
@@ -3044,7 +3084,7 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
  * folio_mark_accessed() is called when a cached page is accessed.
  * Indicates data was served from cache without disk I/O.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 int trace_folio_mark_accessed(struct pt_regs *ctx, struct folio *folio) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -3129,7 +3169,7 @@ int trace_hit(struct pt_regs *ctx, struct page *page) {
  * filemap_add_folio() adds a new page to cache after disk read.
  * This indicates a cache miss that required actual disk I/O.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 int trace_filemap_add_folio(struct pt_regs *ctx, struct address_space *mapping,
                             struct folio *folio, pgoff_t index, gfp_t gfp) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
@@ -3240,11 +3280,11 @@ int trace_account_page_dirtied(struct pt_regs *ctx, struct page *page,
 #endif
 
 /**
- * @brief Dirty page probe - folio version (kernel >= 5.17)
+ * @brief Dirty page probe - folio version (kernel >= 5.16)
  *
  * folio_mark_dirty() marks a folio as modified in newer kernels.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 int trace_folio_mark_dirty(struct pt_regs *ctx, struct folio *folio) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -3322,11 +3362,11 @@ int trace_clear_page_dirty_for_io(struct pt_regs *ctx, struct page *page) {
 #endif
 
 /**
- * @brief Writeback start probe - folio version (kernel >= 5.17)
+ * @brief Writeback start probe - folio version (kernel >= 5.16)
  *
  * folio_clear_dirty_for_io() starts writeback in newer kernels.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 int trace_folio_clear_dirty_for_io(struct pt_regs *ctx, struct folio *folio) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -3404,11 +3444,11 @@ int trace_test_clear_page_writeback(struct pt_regs *ctx, struct page *page) {
 #endif
 
 /**
- * @brief Writeback completion probe - folio version (kernel >= 5.17)
+ * @brief Writeback completion probe - folio version (kernel >= 5.16)
  *
  * folio_end_writeback() signals writeback completion.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
 int trace_folio_end_writeback(struct pt_regs *ctx, struct folio *folio) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -3695,13 +3735,17 @@ int trace_truncate_pages(struct pt_regs *ctx, struct address_space *mapping,
 }
 
 /**
- * @brief Cache drop probe - folio version (kernel >= 5.18)
+ * @brief Cache drop probe - folio version (kernel >= 5.17)
  *
- * Captures explicit cache drops (e.g., POSIX_FADV_DONTNEED).
+ * Captures explicit cache drops (e.g., POSIX_FADV_DONTNEED). Attached to
+ * __filemap_remove_folio(folio, shadow) — the folio is the FIRST argument
+ * and the mapping is read from folio->mapping. (The previous prototype,
+ * (mapping, folio), matched no kernel: it misread the folio pointer as the
+ * mapping and the shadow pointer as the folio, emitting garbage drop rows.)
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
-int trace_cache_drop_folio(struct pt_regs *ctx, struct address_space *mapping,
-                           struct folio *folio) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+int trace_cache_drop_folio(struct pt_regs *ctx, struct folio *folio,
+                           void *shadow) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
   u32 config_key = 0;
@@ -3717,21 +3761,23 @@ int trace_cache_drop_folio(struct pt_regs *ctx, struct address_space *mapping,
 
   if (folio) {
     bpf_probe_read_kernel(&data.index, sizeof(data.index), &folio->index);
-    
+
     // Get LRU type from folio/page flags
     unsigned long flags = 0;
     struct page *p = (struct page *)folio;
     bpf_probe_read_kernel(&flags, sizeof(flags), &p->flags);
     if (flags != 0) {
     }
-  }
 
-  if (mapping) {
-    struct inode *host = NULL;
-    bpf_probe_read_kernel(&host, sizeof(host), &mapping->host);
-    if (host) {
-      bpf_probe_read_kernel(&data.inode, sizeof(data.inode), &host->i_ino);
-      populate_cache_metadata(&data, host);
+    struct address_space *mapping = NULL;
+    bpf_probe_read_kernel(&mapping, sizeof(mapping), &folio->mapping);
+    if (mapping) {
+      struct inode *host = NULL;
+      bpf_probe_read_kernel(&host, sizeof(host), &mapping->host);
+      if (host) {
+        bpf_probe_read_kernel(&data.inode, sizeof(data.inode), &host->i_ino);
+        populate_cache_metadata(&data, host);
+      }
     }
   }
 
@@ -3791,12 +3837,18 @@ int trace_cache_drop_page(struct pt_regs *ctx, struct page *page) {
 #endif
 
 /**
- * @brief Cache readahead probe - prefetch tracking
+ * @brief Cache readahead probe - legacy version (kernel < 5.10)
  *
  * Captures kernel readahead (prefetch) operations that speculatively
  * load pages into cache. count field contains pages being prefetched.
+ * Matches __do_page_cache_readahead(mapping, file, offset, nr_to_read,
+ * lookahead_size); kernel 5.10 replaced it with do_page_cache_ra() taking
+ * a readahead_control (see trace_page_cache_ra below). The old >= 5.17
+ * guard on this prototype matched no kernel at all: on >= 5.10 the first
+ * argument is the readahead_control, so reading it as the mapping emitted
+ * garbage readahead rows, and on < 5.17 the handler didn't compile.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
 int trace_do_page_cache_readahead(struct pt_regs *ctx, struct address_space *mapping,
                                    struct file *file, pgoff_t index, unsigned long nr_pages) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
@@ -3830,13 +3882,112 @@ int trace_do_page_cache_readahead(struct pt_regs *ctx, struct address_space *map
 #endif
 
 /**
+ * @brief Cache readahead probe - readahead_control version (kernel >= 5.10)
+ *
+ * do_page_cache_ra(ractl, nr_to_read, lookahead_size) carries the mapping
+ * and the start index inside the readahead_control.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+int trace_page_cache_ra(struct pt_regs *ctx, struct readahead_control *ractl,
+                        unsigned long nr_to_read) {
+  u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid)
+    return 0;
+
+  struct cache_data data = {};
+  data.ts = bpf_ktime_get_ns();
+  data.pid = pid;
+  data.type = CACHE_READAHEAD;
+  data.count = (u32)nr_to_read;  // Number of pages in readahead window
+  bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+  if (ractl) {
+    struct address_space *mapping = NULL;
+    bpf_probe_read_kernel(&mapping, sizeof(mapping), &ractl->mapping);
+    // Set index before calling populate_cache_metadata
+    bpf_probe_read_kernel(&data.index, sizeof(data.index), &ractl->_index);
+    if (mapping) {
+      struct inode *host = NULL;
+      bpf_probe_read_kernel(&host, sizeof(host), &mapping->host);
+      if (host) {
+        bpf_probe_read_kernel(&data.inode, sizeof(data.inode), &host->i_ino);
+        populate_cache_metadata(&data, host);
+      }
+    }
+  }
+
+  data.cpu_id = bpf_get_smp_processor_id();
+  cache_events.perf_submit(ctx, &data, sizeof(data));
+  return 0;
+}
+#endif
+
+/**
+ * @brief Cache readahead probe - page_cache_ra_order fallback (kernel >= 5.18)
+ *
+ * page_cache_ra_order(ractl, ra, new_order) has no nr_to_read argument; the
+ * requested window size lives in ra->size. Only attached when
+ * do_page_cache_ra is unavailable (e.g. inlined) on a given kernel.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0)
+int trace_page_cache_ra_order(struct pt_regs *ctx, struct readahead_control *ractl,
+                              struct file_ra_state *ra) {
+  u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+  u32 config_key = 0;
+  u32 *tracer_pid = tracer_config.lookup(&config_key);
+  if (tracer_pid && pid == *tracer_pid)
+    return 0;
+
+  struct cache_data data = {};
+  data.ts = bpf_ktime_get_ns();
+  data.pid = pid;
+  data.type = CACHE_READAHEAD;
+  bpf_get_current_comm(&data.comm, sizeof(data.comm));
+
+  if (ra) {
+    unsigned int ra_size = 0;
+    bpf_probe_read_kernel(&ra_size, sizeof(ra_size), &ra->size);
+    data.count = ra_size;  // Requested readahead window, in pages
+  }
+
+  if (ractl) {
+    struct address_space *mapping = NULL;
+    bpf_probe_read_kernel(&mapping, sizeof(mapping), &ractl->mapping);
+    // Set index before calling populate_cache_metadata
+    bpf_probe_read_kernel(&data.index, sizeof(data.index), &ractl->_index);
+    if (mapping) {
+      struct inode *host = NULL;
+      bpf_probe_read_kernel(&host, sizeof(host), &mapping->host);
+      if (host) {
+        bpf_probe_read_kernel(&data.inode, sizeof(data.inode), &host->i_ino);
+        populate_cache_metadata(&data, host);
+      }
+    }
+  }
+
+  data.cpu_id = bpf_get_smp_processor_id();
+  cache_events.perf_submit(ctx, &data, sizeof(data));
+  return 0;
+}
+#endif
+
+/**
  * @brief Cache reclaim probe - memory pressure tracking
  *
- * shrink_folio_list() is called during memory reclaim.
+ * shrink_folio_list() (shrink_page_list() before the folio conversion) is
+ * called during memory reclaim.
  * kswapd = background reclaim, other processes = direct reclaim.
  * Direct reclaim indicates memory pressure affecting performance.
+ *
+ * The handler reads no function arguments, so it works attached to either
+ * symbol on any kernel — no version guard needed (the old >= 5.17 guard
+ * compiled it out on kernels where shrink_page_list exists, silently
+ * disabling reclaim tracing there).
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
 int trace_shrink_folio_list(struct pt_regs *ctx) {
   u32 pid = bpf_get_current_pid_tgid() >> 32;
 
@@ -3866,7 +4017,6 @@ int trace_shrink_folio_list(struct pt_regs *ctx) {
   cache_events.perf_submit(ctx, &data, sizeof(data));
   return 0;
 }
-#endif
 
 /* ============================================================================
  * DIRECT I/O TRACING
@@ -4174,6 +4324,33 @@ int trace_io_uring_enter_x64(struct pt_regs *ctx) {
                              (u32)flags);
 }
 #endif /* __x86_64__ */
+
+#if defined(__aarch64__) || defined(bpf_target_arm64)
+/**
+ * @brief Kprobe entry for the __arm64_sys_io_uring_enter syscall wrapper.
+ *
+ * Unwraps the user pt_regs (see trace_mremap_entry_arm64): fd/to_submit/
+ * min_complete/flags live in regs[0..3] per the arm64 syscall ABI.
+ *
+ * @param ctx  BPF context (PARM1 = user pt_regs)
+ * @return     0
+ */
+int trace_io_uring_enter_arm64(struct pt_regs *ctx) {
+  struct pt_regs *uregs = (struct pt_regs *)PT_REGS_PARM1(ctx);
+  if (!uregs) {
+    return 0;
+  }
+
+  unsigned long fd = 0, to_submit = 0, min_complete = 0, flags = 0;
+  bpf_probe_read_kernel(&fd, sizeof(fd), &uregs->regs[0]);
+  bpf_probe_read_kernel(&to_submit, sizeof(to_submit), &uregs->regs[1]);
+  bpf_probe_read_kernel(&min_complete, sizeof(min_complete), &uregs->regs[2]);
+  bpf_probe_read_kernel(&flags, sizeof(flags), &uregs->regs[3]);
+
+  return emit_io_uring_enter(ctx, (u32)fd, (u32)to_submit, (u32)min_complete,
+                             (u32)flags);
+}
+#endif /* __aarch64__ */
 
 /**
  * @brief ABI-stable subset of the io_uring SQE (uapi/linux/io_uring.h).
@@ -5012,7 +5189,13 @@ TRACEPOINT_PROBE(tcp, tcp_retransmit_skb) {
   bpf_probe_read_kernel(&e.saddr_v6, sizeof(e.saddr_v6), args->saddr_v6);
   bpf_probe_read_kernel(&e.daddr_v6, sizeof(e.daddr_v6), args->daddr_v6);
 
+  /* The 'state' field was added to this tracepoint in kernel 4.20 (never
+   * backported to RHEL 8's 4.18). Gated on the loader's format-file sniff for
+   * the same reason as HAS_SKB_DROP_REASON above; without it, state stays 0
+   * (not a valid TCP state, reads as "unknown"). */
+#ifdef HAS_TCP_RETRANSMIT_STATE
   e.state = args->state;
+#endif
   e.ipver = (e.saddr_v4 != 0 || e.daddr_v4 != 0) ? 4 : 6;
 
   net_drop_events.perf_submit(args, &e, sizeof(e));
@@ -5039,8 +5222,15 @@ TRACEPOINT_PROBE(skb, kfree_skb) {
   eth_proto = bpf_ntohs(eth_proto);
   if (eth_proto != 0x0800 && eth_proto != 0x86dd) return 0;  /* not IPv4/IPv6 */
 
-  /* Read drop reason (kernel 5.17+ has this field) */
+  /* Read drop reason. The 'reason' field only exists where the running
+   * kernel's tracepoint format has it (mainline 5.17+, backported to 5.15.58+
+   * LTS). Referencing a missing args-> field is a compile error that aborts
+   * the whole load, so the loader sniffs the format file and defines
+   * HAS_SKB_DROP_REASON — the gate can never disagree with the args struct.
+   * Without it, drop_reason stays 0 (SKB_DROP_REASON_NOT_SPECIFIED). */
+#ifdef HAS_SKB_DROP_REASON
   bpf_probe_read_kernel(&e.drop_reason, sizeof(e.drop_reason), &args->reason);
+#endif
 
   /* Read packet length */
   bpf_probe_read_kernel(&e.skb_len, sizeof(e.skb_len), &skb->len);

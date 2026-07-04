@@ -268,18 +268,40 @@ class IOTracer:
         self.bpf_file = bpf_file
         self._attempted_cflags: list[str] = []
         try:
+            def _tracepoint_format(category: str, name: str) -> str:
+                # Tracepoint format files live under debugfs on older setups and
+                # under tracefs (/sys/kernel/tracing) on modern ones that no
+                # longer mount debugfs; check both.
+                for base in ("/sys/kernel/debug/tracing", "/sys/kernel/tracing"):
+                    try:
+                        with open(f"{base}/events/{category}/{name}/format", "r") as f:
+                            return f.read()
+                    except OSError:
+                        continue
+                return ""
+
             def _init_bpf():
                 cflags = ["-Wno-duplicate-decl-specifier", "-Wno-macro-redefined", "-mllvm", "-bpf-stack-size=4096"]
-                tp_format = "/sys/kernel/debug/tracing/events/block/block_rq_complete/format"
-                if os.path.exists(tp_format):
-                    with open(tp_format, "r") as f:
-                        if "cmd_flags" in f.read():
-                            cflags.append("-DHAS_CMD_FLAGS")
+                # Feature-detect optional tracepoint fields by sniffing the same
+                # format files BCC generates the args structs from, so the -D
+                # gates can never disagree with what actually compiles. This
+                # (rather than LINUX_VERSION_CODE) also does the right thing on
+                # kernels with backports (e.g. 'reason' backported to 5.15.58).
+                if "cmd_flags" in _tracepoint_format("block", "block_rq_complete"):
+                    cflags.append("-DHAS_CMD_FLAGS")
                 # Compile the network probe subset only when requested. The
                 # connection/sockopt/drop probes auto-attach when compiled,
                 # so gating at compile time keeps overhead at zero when off.
                 if self.trace_network:
                     cflags.append("-DENABLE_NETWORK")
+                    # skb:kfree_skb 'reason' exists on mainline 5.17+ (and
+                    # 5.15.58+ LTS); tcp:tcp_retransmit_skb 'state' on 4.20+.
+                    # Referencing a missing args-> field is a compile error
+                    # that aborts the whole load, so gate each on its format.
+                    if " reason;" in _tracepoint_format("skb", "kfree_skb"):
+                        cflags.append("-DHAS_SKB_DROP_REASON")
+                    if " state;" in _tracepoint_format("tcp", "tcp_retransmit_skb"):
+                        cflags.append("-DHAS_TCP_RETRANSMIT_STATE")
                 # Record the cflags before compiling so the diagnostics dump can
                 # report them even when the BPF() call itself raises.
                 self._attempted_cflags = cflags

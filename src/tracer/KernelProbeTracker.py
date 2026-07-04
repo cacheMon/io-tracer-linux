@@ -225,10 +225,16 @@ class KernelProbeTracker:
             self.add_kprobe("__vm_munmap", "trace_munmap")
 
             # mremap probes — kernel may export the arch wrapper or the generic
-            # symbol. The wrapper needs the pt_regs-unwrapping variant.
+            # symbol. The wrappers need the per-arch pt_regs-unwrapping variant
+            # (get_kprobe_functions fullmatches, so the arch branches are
+            # mutually exclusive; the kretprobe reads only PT_REGS_RC, which is
+            # correct on every arch).
             if BPF.get_kprobe_functions(b'__x64_sys_mremap'):
                 self.add_kprobe("__x64_sys_mremap", "trace_mremap_entry_x64")
                 self.add_kretprobe("__x64_sys_mremap", "trace_mremap_ret")
+            elif BPF.get_kprobe_functions(b'__arm64_sys_mremap'):
+                self.add_kprobe("__arm64_sys_mremap", "trace_mremap_entry_arm64")
+                self.add_kretprobe("__arm64_sys_mremap", "trace_mremap_ret")
             elif BPF.get_kprobe_functions(b'sys_mremap'):
                 self.add_kprobe("sys_mremap", "trace_mremap_entry")
                 self.add_kretprobe("sys_mremap", "trace_mremap_ret")
@@ -374,14 +380,18 @@ class KernelProbeTracker:
                 elif self.developer_mode:
                     logger("warning", "No cache drop function found, drop events will not be traced")
 
-                # Cache readahead probes - track prefetch operations
+                # Cache readahead probes - track prefetch operations. Each
+                # symbol has a different signature, so each attaches to its
+                # own correctly-typed handler.
                 if BPF.get_kprobe_functions(b'__do_page_cache_readahead'):
+                    # (mapping, file, offset, nr_to_read, ...) — kernel < 5.10
                     self.add_kprobe("__do_page_cache_readahead", "trace_do_page_cache_readahead")
                 elif BPF.get_kprobe_functions(b'do_page_cache_ra'):
-                    self.add_kprobe("do_page_cache_ra", "trace_do_page_cache_readahead")
+                    # (readahead_control, nr_to_read, ...) — kernel >= 5.10
+                    self.add_kprobe("do_page_cache_ra", "trace_page_cache_ra")
                 elif BPF.get_kprobe_functions(b'page_cache_ra_order'):
-                    # Newer kernels (5.16+)
-                    self.add_kprobe("page_cache_ra_order", "trace_do_page_cache_readahead")
+                    # (readahead_control, file_ra_state, order) — kernel >= 5.18
+                    self.add_kprobe("page_cache_ra_order", "trace_page_cache_ra_order")
                 elif self.developer_mode:
                     logger("warning", "No readahead probe available, readahead events will not be traced")
 
@@ -402,20 +412,22 @@ class KernelProbeTracker:
             # The tracepoints are automatically attached via TRACEPOINT_PROBE macros in BPF code
             # We also attach kprobes as fallback for kernels without stable tracepoints
             
-            # io_uring_enter syscall probe
-            if BPF.get_kprobe_functions(b'__io_uring_enter'):
-                self.add_kprobe("__io_uring_enter", "trace_io_uring_enter")
-                if self.developer_mode:
-                    logger("info", "io_uring tracing enabled via __io_uring_enter")
-            elif BPF.get_kprobe_functions(b'__x64_sys_io_uring_enter'):
+            # io_uring_enter syscall probe. The syscall is only reachable via
+            # the per-arch SYSCALL_DEFINE wrappers, so each arch needs its
+            # pt_regs-unwrapping variant. (Earlier fallbacks __io_uring_enter /
+            # __sys_io_uring_enter never existed in any mainline kernel —
+            # only SYSCALL_DEFINE6 in fs/io_uring.c / io_uring/io_uring.c —
+            # so those branches were dead on every arch and arm64 silently
+            # got no ENTER events at all.)
+            if BPF.get_kprobe_functions(b'__x64_sys_io_uring_enter'):
                 # Syscall wrapper: needs the pt_regs-unwrapping variant.
                 self.add_kprobe("__x64_sys_io_uring_enter", "trace_io_uring_enter_x64")
                 if self.developer_mode:
                     logger("info", "io_uring tracing enabled via __x64_sys_io_uring_enter")
-            elif BPF.get_kprobe_functions(b'__sys_io_uring_enter'):
-                self.add_kprobe("__sys_io_uring_enter", "trace_io_uring_enter")
+            elif BPF.get_kprobe_functions(b'__arm64_sys_io_uring_enter'):
+                self.add_kprobe("__arm64_sys_io_uring_enter", "trace_io_uring_enter_arm64")
                 if self.developer_mode:
-                    logger("info", "io_uring tracing enabled via __sys_io_uring_enter")
+                    logger("info", "io_uring tracing enabled via __arm64_sys_io_uring_enter")
             else:
                 if self.developer_mode:
                     logger("warning", "io_uring_enter probe not available - ENTER events disabled")
