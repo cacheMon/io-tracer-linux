@@ -41,23 +41,33 @@
  * incomplete type". The program never instantiates these structs, so an empty
  * placeholder is enough to complete the type for the compiler.
  *
- * We can only declare the ones the headers leave incomplete: defining a
- * placeholder for a struct the headers already define fully is a redefinition
- * error, and there is no preprocessor test for "is this type complete?".
- * Hence the per-version guards below.
+ * Whether each struct is already complete depends on BOTH the kernel version
+ * AND the installed BCC release: BCC force-includes its own vendored uapi
+ * snapshot (virtual_bpf.h) BEFORE this file, and that snapshot fully defines
+ * e.g. struct bpf_timer since bcc 0.23. A LINUX_VERSION_CODE guard therefore
+ * cannot be right for every combination — `struct bpf_timer {};` under
+ * `< 5.17` was a hard "redefinition" compile error on stock Ubuntu 22.04
+ * (kernel 5.15 + bcc 0.24), and there is no preprocessor test for "is this
+ * type complete?".
+ *
+ * Instead, RENAME the struct tags from this point on: the vendored uapi
+ * definitions processed before this file keep their real names, while every
+ * later reference (the kernel headers' btf_field_type_size() and friends) is
+ * rewritten to a private placeholder tag that we define completely. This is
+ * correct on every bcc/kernel pair regardless of which side defines the real
+ * struct, because the renamed tag is ours alone.
  *
  * MAINTENANCE: if a future kernel fails to compile with
  *   "invalid application of 'sizeof' to an incomplete type 'struct bpf_<X>'"
- * add `struct bpf_<X> {};` here under the matching version guard. The
- * authoritative list lives in btf_field_type_size() in <linux/bpf.h>.
+ * add a rename + placeholder pair for bpf_<X> here. The authoritative list
+ * lives in btf_field_type_size() in <linux/bpf.h>.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
-struct bpf_timer {};       /* bpf_timer field, forward-declared from 5.17 on */
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-struct bpf_wq {};          /* workqueue field, added in 6.14 */
-struct bpf_task_work {};   /* task_work field, added in 6.14 */
-#endif
+#define bpf_timer     __iotracer_ph_bpf_timer
+#define bpf_wq        __iotracer_ph_bpf_wq
+#define bpf_task_work __iotracer_ph_bpf_task_work
+struct __iotracer_ph_bpf_timer {};
+struct __iotracer_ph_bpf_wq {};
+struct __iotracer_ph_bpf_task_work {};
 
 /* BPF atomic load/store instructions - fallback definitions */
 #ifndef BPF_LOAD_ACQ
@@ -112,6 +122,45 @@ struct bpf_task_work {};   /* task_work field, added in 6.14 */
 #endif
 #endif
 
+/* ----------------------------------------------------------------------------
+ * bpf_probe_read_kernel/user compatibility (kernel < 5.5)
+ * ----------------------------------------------------------------------------
+ * The split probe_read helpers only exist from kernel 5.5; on older kernels
+ * the generic bpf_probe_read/bpf_probe_read_str ARE the correct helpers and
+ * every BCC release declares them. BCC >= 0.15 self-heals on such kernels by
+ * injecting its own object-like `#define bpf_probe_read_kernel bpf_probe_read`
+ * into the prologue (which makes the #ifndef below skip ours); bcc 0.12-0.14
+ * (stock Ubuntu 20.04) declare the new names but emit helper ids a < 5.5
+ * verifier rejects at load ("invalid func unknown#113"), so these
+ * function-like macros rewrite the calls to the legacy helpers instead.
+ * The kernel-version guard matters: on >= 5.5 kernels the legacy
+ * bpf_probe_read may not even exist (s390x/riscv64 omit it), and the
+ * kernel/user distinction must be preserved there.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0)
+#ifndef bpf_probe_read_kernel
+#define bpf_probe_read_kernel(dst, sz, src)      bpf_probe_read(dst, sz, src)
+#endif
+#ifndef bpf_probe_read_kernel_str
+#define bpf_probe_read_kernel_str(dst, sz, src)  bpf_probe_read_str(dst, sz, src)
+#endif
+#ifndef bpf_probe_read_user
+#define bpf_probe_read_user(dst, sz, src)        bpf_probe_read(dst, sz, src)
+#endif
+#ifndef bpf_probe_read_user_str
+#define bpf_probe_read_user_str(dst, sz, src)    bpf_probe_read_str(dst, sz, src)
+#endif
+#endif /* LINUX_VERSION_CODE < 5.5 */
+
+/* bpf_get_current_cgroup_id() exists from kernel 4.18 (commit bf6fa2c893c5);
+ * referencing it on older kernels rejects every program that calls it at
+ * load time. 0 is the "unknown cgroup" sentinel userspace already accepts. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 18, 0)
+#define iotracer_get_cgroup_id() bpf_get_current_cgroup_id()
+#else
+#define iotracer_get_cgroup_id() 0
+#endif
+
 /* ============================================================================
  * CONSTANTS AND CONFIGURATION
  * ============================================================================
@@ -119,6 +168,14 @@ struct bpf_task_work {};   /* task_work field, added in 6.14 */
 
 /** Maximum length for captured filenames (including null terminator) */
 #define FILENAME_MAX_LEN 256
+
+/* The BPF backend inlines constant memset/memcpy only up to 1024 bytes; above
+ * that, clang fails with "A call to built-in function 'memset' is not
+ * supported" on every LLVM version. Several buffers of this size are
+ * memset/memcpy'd as a unit, so keep the constant under the cliff. */
+_Static_assert(FILENAME_MAX_LEN <= 1024,
+               "FILENAME_MAX_LEN must stay <= 1024: larger constant "
+               "memset/memcpy cannot be inlined by the BPF backend");
 
 /** openat() dirfd sentinel meaning "resolve relative to the cwd". Defined here
  *  in case the BPF include set doesn't pull in <linux/fcntl.h>. */
@@ -273,21 +330,14 @@ struct data_dual_t {
   u64 latency_ns;                     /**< Operation latency */
 };
 
-/**
- * @brief Kernel renamedata structure (kernel 5.12+)
- *
- * Used by vfs_rename() in modern kernels. We define a minimal version
- * to extract the dentry pointers we need.
- */
-struct renamedata_bpf {
-  void *old_mnt_idmap;
-  struct inode *old_dir;
-  struct dentry *old_dentry;
-  void *new_mnt_idmap;
-  struct inode *new_dir;
-  struct dentry *new_dentry;
-  /* remaining fields not needed */
-};
+/* NOTE: vfs_rename's renamedata argument is read via the REAL struct
+ * renamedata from <linux/fs.h> (see trace_vfs_rename). A hand-rolled mirror
+ * of its layout used to live here and silently broke whenever the kernel
+ * reshuffled the struct — most recently in 6.18, which merged the two
+ * mnt_idmap fields and moved new_dentry from offset 40 to 32, so the stale
+ * offset read landed on delegated_inode and emitted garbage rename events.
+ * BCC recompiles against the running kernel's headers, so using the real
+ * type keeps the offsets correct on every kernel automatically. */
 
 /**
  * @brief Staging struct for sys_mremap arguments
@@ -1133,6 +1183,16 @@ BPF_PERCPU_ARRAY(dpath_scratch_map, struct dpath_scratch, 1);
 
 static __always_inline void build_dentry_path(struct dentry *dentry,
                                               char *buf, int buf_size) {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 3, 0)
+  /* Pre-5.3 verifiers have no bounded-loop support: if the compiler leaves
+   * either loop below rolled (LLVM-version dependent — a real deployment has
+   * logged "loop not unrolled" here), the back-edge rejects the WHOLE
+   * program; and when the loops do unroll, the ~thousands of resulting
+   * instructions can breach the pre-5.2 4096-insn cap. Only the readdir
+   * probe reaches this path, so degrade it to basename-only on old kernels
+   * rather than risk the entire tracer. */
+  get_file_path_from_dentry(dentry, buf, buf_size);
+#else
   buf[0] = '\0';
   if (!dentry) return;
   /* The assembly buffer is masked into a FILENAME_MAX_LEN window and copied out
@@ -1188,6 +1248,7 @@ static __always_inline void build_dentry_path(struct dentry *dentry,
    * buffer; out[off] is already NUL-terminated within that window. */
   __builtin_memcpy(buf, out, FILENAME_MAX_LEN);
   buf[FILENAME_MAX_LEN - 1] = '\0';
+#endif /* LINUX_VERSION_CODE >= 5.3 */
 }
 
 /**
@@ -1283,7 +1344,7 @@ int trace_vfs_read(struct pt_regs *ctx, struct file *file, char __user *buf,
   // Provenance metadata: parent PID, container (cgroup) id, backing
   // device, and filesystem magic for source classification.
   data.ppid = get_ppid();
-  data.cgroup_id = bpf_get_current_cgroup_id();
+  data.cgroup_id = iotracer_get_cgroup_id();
   get_file_source(file, &data.dev, &data.fs_magic);
 
   // Defer submission to the kretprobe, which records the return value
@@ -1364,7 +1425,7 @@ int trace_vfs_write(struct pt_regs *ctx, struct file *file,
   // Provenance metadata: parent PID, container (cgroup) id, backing
   // device, and filesystem magic for source classification.
   data.ppid = get_ppid();
-  data.cgroup_id = bpf_get_current_cgroup_id();
+  data.cgroup_id = iotracer_get_cgroup_id();
   get_file_source(file, &data.dev, &data.fs_magic);
 
   // Defer submission to the kretprobe, which records the return value
@@ -1528,7 +1589,7 @@ int trace_vfs_open(struct pt_regs *ctx, const struct path *path,
   // Provenance metadata: parent PID, container (cgroup) id, backing
   // device, and filesystem magic for source classification.
   data.ppid = get_ppid();
-  data.cgroup_id = bpf_get_current_cgroup_id();
+  data.cgroup_id = iotracer_get_cgroup_id();
   get_file_source(file, &data.dev, &data.fs_magic);
 
   // Prefer the full path captured from the syscall entry (trace_do_sys_openat2_entry).
@@ -2445,17 +2506,14 @@ int trace_ksys_sync(struct pt_regs *ctx) {
  */
 
 /**
- * @brief Trace vfs_rename() - File/directory rename
+ * @brief Shared body for trace_vfs_rename (both signature variants below).
  *
  * Captures rename()/renameat() operations with source and destination paths.
  * Uses per-CPU buffer for the 572-byte data_dual_t structure.
- * Kernel 6.x signature: vfs_rename(struct renamedata *rd)
- *
- * @param ctx  BPF context
- * @param rd   Rename data structure containing old/new dentry info
- * @return     0
  */
-int trace_vfs_rename(struct pt_regs *ctx, struct renamedata_bpf *rd) {
+static __always_inline int emit_vfs_rename(struct pt_regs *ctx,
+                                           struct dentry *old_dentry,
+                                           struct dentry *new_dentry) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
   u32 pid = pid_tgid >> 32;
 
@@ -2464,16 +2522,6 @@ int trace_vfs_rename(struct pt_regs *ctx, struct renamedata_bpf *rd) {
   if (tracer_pid && pid == *tracer_pid) {
     return 0;
   }
-
-  if (!rd) {
-    return 0;
-  }
-
-  // Read dentry pointers from renamedata struct
-  struct dentry *old_dentry = NULL;
-  struct dentry *new_dentry = NULL;
-  bpf_probe_read_kernel(&old_dentry, sizeof(old_dentry), &rd->old_dentry);
-  bpf_probe_read_kernel(&new_dentry, sizeof(new_dentry), &rd->new_dentry);
 
   if (!old_dentry || !new_dentry) {
     return 0;
@@ -2485,11 +2533,11 @@ int trace_vfs_rename(struct pt_regs *ctx, struct renamedata_bpf *rd) {
   if (!data) {
     return 0;
   }
-  
+
   // Zero-initialize filename buffers to avoid stale data
   __builtin_memset(data->filename_old, 0, FILENAME_MAX_LEN);
   __builtin_memset(data->filename_new, 0, FILENAME_MAX_LEN);
-  
+
   data->pid = pid;
   data->ts = bpf_ktime_get_ns();
   bpf_get_current_comm(&data->comm, sizeof(data->comm));
@@ -2509,6 +2557,50 @@ int trace_vfs_rename(struct pt_regs *ctx, struct renamedata_bpf *rd) {
   events_dual.perf_submit(ctx, data, sizeof(*data));
   return 0;
 }
+
+/**
+ * @brief Trace vfs_rename() - File/directory rename
+ *
+ * Kernel >= 5.12 signature: vfs_rename(struct renamedata *rd). The dentries
+ * are read through the REAL struct renamedata from <linux/fs.h>, so BCC
+ * computes the field offsets from the running kernel's headers — correct
+ * across the 6.3 user_namespace->mnt_idmap swap AND the 6.18 relayout that
+ * broke the previous fixed-offset mirror (see the note above mremap_args).
+ * The old_dentry/new_dentry field names are stable across 5.12..6.18+.
+ *
+ * @param ctx  BPF context
+ * @param rd   Rename data structure containing old/new dentry info
+ * @return     0
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+int trace_vfs_rename(struct pt_regs *ctx, struct renamedata *rd) {
+  if (!rd) {
+    return 0;
+  }
+
+  // Read dentry pointers from the kernel's own renamedata definition
+  struct dentry *old_dentry = NULL;
+  struct dentry *new_dentry = NULL;
+  bpf_probe_read_kernel(&old_dentry, sizeof(old_dentry), &rd->old_dentry);
+  bpf_probe_read_kernel(&new_dentry, sizeof(new_dentry), &rd->new_dentry);
+
+  return emit_vfs_rename(ctx, old_dentry, new_dentry);
+}
+#else
+/**
+ * Kernel < 5.12 signature:
+ *   vfs_rename(struct inode *old_dir, struct dentry *old_dentry,
+ *              struct inode *new_dir, struct dentry *new_dentry,
+ *              struct inode **delegated_inode, unsigned int flags)
+ * The previous unguarded renamedata-typed handler read inode internals as
+ * dentry pointers on these kernels and emitted garbage rename events.
+ */
+int trace_vfs_rename(struct pt_regs *ctx, struct inode *old_dir,
+                     struct dentry *old_dentry, struct inode *new_dir,
+                     struct dentry *new_dentry) {
+  return emit_vfs_rename(ctx, old_dentry, new_dentry);
+}
+#endif
 
 /**
  * @brief Trace vfs_mkdir() - Directory creation
