@@ -676,10 +676,17 @@ struct block_rq_key_t {
 BPF_TABLE("lru_hash", struct block_rq_key_t, struct block_issue_ctx, block_start_times, 65536); /**< Issue time + submitter, keyed by dev+sector */
 BPF_TABLE("lru_hash", struct block_rq_key_t, u64, block_insert_times, 65536);  /**< Tracks block request insert time (queue latency) */
 
-/* Monotonic generator for per-request IDs (see block_event.req_id). A single
- * u64 bumped atomically at issue time; lets consumers disambiguate repeated
- * I/O to the same (dev, sector) and correlate a request across its lifecycle. */
-BPF_ARRAY(block_req_id_gen, u64, 1);
+/* Per-CPU generator for per-request IDs (see block_event.req_id): each CPU
+ * bumps its own counter (no cross-CPU race, so no atomic op is needed) and
+ * the CPU id is folded into the high bits so ids stay unique across CPUs.
+ * A shared counter bumped via __sync_fetch_and_add's return value was tried
+ * first, but that lowers to a BPF XADD-with-fetch, which older/distro clang
+ * BPF backends can't legally emit and crash on (LLVM ERROR: Invalid usage of
+ * the XADD return value) -- see docs/COMPATIBILITY_FIXES.md #5. Consumers
+ * only need per-CPU-monotonic ids to disambiguate repeated I/O to the same
+ * (dev, sector) and correlate a request across its lifecycle; nothing relies
+ * on strict global ordering across CPUs. */
+BPF_PERCPU_ARRAY(block_req_id_gen, u64, 1);
 
 /* Block-tracing diagnostics counters (per-CPU, summed in userspace at exit):
  *   [0] requests issued, [1] requests completed (emitted),
@@ -2884,8 +2891,10 @@ TRACEPOINT_PROBE(block, block_rq_issue) {
   // Assign a monotonic per-request id, carried to the completion event.
   u32 gen_key = 0;
   u64 *gen = block_req_id_gen.lookup(&gen_key);
-  if (gen)
-    ictx.req_id = __sync_fetch_and_add(gen, 1);
+  if (gen) {
+    u64 local_id = (*gen)++;
+    ictx.req_id = ((u64)bpf_get_smp_processor_id() << 48) | (local_id & 0xFFFFFFFFFFFFULL);
+  }
 
   block_start_times.update(&key, &ictx);
 
