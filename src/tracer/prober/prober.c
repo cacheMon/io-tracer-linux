@@ -322,9 +322,10 @@ struct block_event {
   u32 dev;                  /**< Device number (major:minor encoded) for partition ID */
   u64 queue_time_ns;        /**< Time from insert to issue (scheduler latency) */
   u32 op_code;              /**< Raw block operation code (REQ_OP_*) */
-  u64 req_id;               /**< Monotonic per-request id, unique within a trace
-                              *   session. Disambiguates distinct I/Os that reuse
-                              *   the same (dev, sector). */
+  u64 req_id;               /**< Per-request id, unique within a trace session
+                              *   (CPU id in the high 16 bits, per-CPU sequence
+                              *   in the low 48). Disambiguates distinct I/Os
+                              *   that reuse the same (dev, sector). */
 };
 
 /* ============================================================================
@@ -636,7 +637,7 @@ struct vfs_info {
  */
 struct block_issue_ctx {
   u64 ts;                   /**< Issue timestamp (device latency baseline) */
-  u64 req_id;               /**< Monotonic per-request id (see block_event.req_id) */
+  u64 req_id;               /**< Unique per-request id (see block_event.req_id) */
   u32 pid;                  /**< Submitting process ID */
   u32 tid;                  /**< Submitting thread ID */
   u32 ppid;                 /**< Submitter's parent PID */
@@ -676,10 +677,15 @@ struct block_rq_key_t {
 BPF_TABLE("lru_hash", struct block_rq_key_t, struct block_issue_ctx, block_start_times, 65536); /**< Issue time + submitter, keyed by dev+sector */
 BPF_TABLE("lru_hash", struct block_rq_key_t, u64, block_insert_times, 65536);  /**< Tracks block request insert time (queue latency) */
 
-/* Monotonic generator for per-request IDs (see block_event.req_id). A single
- * u64 bumped atomically at issue time; lets consumers disambiguate repeated
- * I/O to the same (dev, sector) and correlate a request across its lifecycle. */
-BPF_ARRAY(block_req_id_gen, u64, 1);
+/* Per-request ID generator (see block_event.req_id). A per-CPU u64 counter
+ * bumped at issue time; the emitted req_id folds the CPU id into the high bits
+ * so ids stay unique across CPUs without an atomic fetch-and-add. A global
+ * atomic counter is not portable here: the BPF XADD instruction can't return
+ * its old value on all kernels/LLVM ("Invalid usage of the XADD return value"),
+ * and a read-then-lock_xadd would race and hand out duplicate ids. Lets
+ * consumers disambiguate repeated I/O to the same (dev, sector) and correlate a
+ * request across its lifecycle. */
+BPF_PERCPU_ARRAY(block_req_id_gen, u64, 1);
 
 /* Block-tracing diagnostics counters (per-CPU, summed in userspace at exit):
  *   [0] requests issued, [1] requests completed (emitted),
@@ -2881,11 +2887,19 @@ TRACEPOINT_PROBE(block, block_rq_issue) {
   ictx.ppid = get_ppid();
   bpf_get_current_comm(&ictx.comm, sizeof(ictx.comm));
 
-  // Assign a monotonic per-request id, carried to the completion event.
+  // Assign a unique per-request id, carried to the completion event. The
+  // generator is a per-CPU counter — BPF programs run with preemption disabled,
+  // so the read-increment-store needs no atomic — and the CPU id is folded into
+  // the high 16 bits to keep ids unique across CPUs. Using __sync_fetch_and_add
+  // on a global counter is not portable: its return value compiles to a BPF
+  // XADD that can't return its old value on all kernels/LLVM.
   u32 gen_key = 0;
   u64 *gen = block_req_id_gen.lookup(&gen_key);
-  if (gen)
-    ictx.req_id = __sync_fetch_and_add(gen, 1);
+  if (gen) {
+    u64 seq = *gen;
+    *gen = seq + 1;
+    ictx.req_id = ((u64)bpf_get_smp_processor_id() << 48) | (seq & 0xFFFFFFFFFFFFULL);
+  }
 
   block_start_times.update(&key, &ictx);
 
