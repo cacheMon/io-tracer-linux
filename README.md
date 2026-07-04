@@ -41,14 +41,18 @@ pacman -S bcc bcc-tools python-bcc
 
 For more distros, visit the official [BCC's installation guide](https://github.com/iovisor/bcc/blob/master/INSTALL.md)
 
-3. Finally, install the Python dependencies. The simplest way is to install
-them all at once from `requirements.txt`:
+3. Finally, install the Python dependencies. Prefer your distro's packages
+(the tracer runs under the system Python, which is what the distro `bcc`
+bindings are built for — see the next code block). If you use pip instead,
+note that Debian 12 / Ubuntu 23.04+ mark the system interpreter as
+externally managed (PEP 668), so a bare `pip install` fails; append
+`--break-system-packages` or use the distro packages:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-Or, if you prefer your distro's package manager:
+Distro package manager equivalents:
 
 ```bash
 # Ubuntu / Debian
@@ -68,7 +72,7 @@ To run the test suite you'll also need `pytest` (`pip install pytest`).
 
 ## Usage
 ```
-usage: sudo iotrc [-h] [-v] [-a] [--cache] [--network] [--computer-id] [--reward] [--no-upload] {dev} ...
+usage: sudo iotrc [-h] [-v] [-a] [--cache] [--network] [--computer-id] [--reward] [--no-upload] [--output DIR] {dev} ...
 
 Trace IO syscalls
 
@@ -79,6 +83,7 @@ options:
   --computer-id    Print this machine ID and exit
   --reward         Show your reward code (unlocked after uploading traces)
   --no-upload      Disable automatic upload of traces (for testing)
+  --output DIR     Base directory for trace output (default: system temp dir)
 
 subcommands:
   {dev}            Run in developer mode with extra logs and checks

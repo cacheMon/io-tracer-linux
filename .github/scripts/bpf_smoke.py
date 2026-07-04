@@ -98,30 +98,47 @@ def main():
         (b"iomap_dio_rw", [("kprobe", "iomap_dio_rw", "trace_dio_entry_iomap"),
                            ("kretprobe", "iomap_dio_rw", "trace_dio_return")]),
         (b"__blockdev_direct_IO", [("kprobe", "__blockdev_direct_IO", "trace_dio_entry_blockdev")]),
-        # Cache-probe guard/symbol alignment: each folio/page handler must be
-        # compiled in exactly when its attach symbol exists on the running
-        # kernel. A mismatch attaches fine on the dev kernel and silently
-        # drops the probe family elsewhere, so validate every pair here.
-        (b"folio_mark_accessed", [("kprobe", "folio_mark_accessed", "trace_folio_mark_accessed")]),
-        (b"mark_page_accessed", [("kprobe", "mark_page_accessed", "trace_hit")]),
-        (b"filemap_add_folio", [("kprobe", "filemap_add_folio", "trace_filemap_add_folio")]),
-        (b"add_to_page_cache_lru", [("kprobe", "add_to_page_cache_lru", "trace_miss")]),
-        (b"__folio_mark_dirty", [("kprobe", "__folio_mark_dirty", "trace_folio_mark_dirty")]),
-        (b"folio_clear_dirty_for_io", [("kprobe", "folio_clear_dirty_for_io", "trace_folio_clear_dirty_for_io")]),
-        (b"folio_end_writeback", [("kprobe", "folio_end_writeback", "trace_folio_end_writeback")]),
-        (b"filemap_remove_folio", [("kprobe", "filemap_remove_folio", "trace_filemap_remove_folio")]),
-        (b"__filemap_remove_folio", [("kprobe", "__filemap_remove_folio", "trace_cache_drop_folio")]),
-        (b"do_page_cache_ra", [("kprobe", "do_page_cache_ra", "trace_page_cache_ra")]),
-        (b"__do_page_cache_readahead", [("kprobe", "__do_page_cache_readahead", "trace_do_page_cache_readahead")]),
-        (b"page_cache_ra_order", [("kprobe", "page_cache_ra_order", "trace_page_cache_ra_order")]),
-        (b"shrink_folio_list", [("kprobe", "shrink_folio_list", "trace_shrink_folio_list")]),
-        (b"shrink_page_list", [("kprobe", "shrink_page_list", "trace_shrink_folio_list")]),
     ]
     for symbol, symbol_probes in conditional_probes:
         if BPF.get_kprobe_functions(symbol):
             probes.extend(symbol_probes)
         else:
             print(f"SKIP: {symbol.decode()} not present on this kernel")
+
+    # Cache-probe guard/symbol alignment, expressed as ORDERED fallback chains
+    # exactly like KernelProbeTracker: the first present symbol wins and the
+    # rest are skipped. This matters because old page-API symbols
+    # (mark_page_accessed, add_to_page_cache_lru, ...) still exist on modern
+    # kernels as exported folio-compat wrappers while their page-variant
+    # handlers are compiled OUT (>= 5.16/5.17 guards) — attaching every
+    # existing symbol unconditionally would fail CI on every modern kernel.
+    conditional_probe_chains = [
+        [(b"folio_mark_accessed", "trace_folio_mark_accessed"),
+         (b"mark_page_accessed", "trace_hit")],
+        [(b"filemap_add_folio", "trace_filemap_add_folio"),
+         (b"add_to_page_cache_lru", "trace_miss")],
+        [(b"__folio_mark_dirty", "trace_folio_mark_dirty"),
+         (b"account_page_dirtied", "trace_account_page_dirtied")],
+        [(b"folio_clear_dirty_for_io", "trace_folio_clear_dirty_for_io"),
+         (b"clear_page_dirty_for_io", "trace_clear_page_dirty_for_io")],
+        [(b"folio_end_writeback", "trace_folio_end_writeback"),
+         (b"test_clear_page_writeback", "trace_test_clear_page_writeback")],
+        [(b"filemap_remove_folio", "trace_filemap_remove_folio"),
+         (b"__filemap_remove_folio", "trace_filemap_remove_folio"),
+         (b"__delete_from_page_cache", "trace_delete_from_page_cache")],
+        [(b"__do_page_cache_readahead", "trace_do_page_cache_readahead"),
+         (b"do_page_cache_ra", "trace_page_cache_ra"),
+         (b"page_cache_ra_order", "trace_page_cache_ra_order")],
+        [(b"shrink_folio_list", "trace_shrink_folio_list"),
+         (b"shrink_page_list", "trace_shrink_folio_list")],
+    ]
+    for chain in conditional_probe_chains:
+        for symbol, fn in chain:
+            if BPF.get_kprobe_functions(symbol):
+                probes.append(("kprobe", symbol.decode(), fn))
+                break
+        else:
+            print(f"SKIP: no symbol of chain {[s.decode() for s, _ in chain]} present")
 
     for kind, event, fn in probes:
         if kind == "kprobe":

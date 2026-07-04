@@ -16,6 +16,11 @@ Example:
     path = resolver.resolve_path(inode=12345, pid=1234, filename="unknown")
 """
 
+# PEP 563: keep all annotations lazy so PEP 604 (`X | None`) and PEP 585
+# (`list[str]`) syntax import cleanly on Python 3.7-3.9 (RHEL 9, Debian 11,
+# Ubuntu 20.04, Amazon Linux stock interpreters).
+from __future__ import annotations
+
 import os
 import time
 from pathlib import Path

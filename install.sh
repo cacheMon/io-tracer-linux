@@ -55,18 +55,38 @@ check_root() {
 
 check_python() {
     if ! command -v python3 &> /dev/null; then
-        log_error "python3 is not installed. Please install Python 3.6+ and re-run."
+        log_error "python3 is not installed. Please install Python 3.7+ and re-run."
         exit 1
     fi
 
+    # The tracer uses time.time_ns / subprocess(text=...) (3.7+). Annotations
+    # are PEP 563-lazy, so 3.7-3.9 work; RHEL 8's stock 3.6 does NOT — use the
+    # python38+ AppStream there (with the matching python3X-bcc bindings).
     PY_VERSION=$(python3 -c 'import sys; print("%d%02d" % sys.version_info[:2])')
-    if [ "$PY_VERSION" -lt 306 ]; then
+    if [ "$PY_VERSION" -lt 307 ]; then
         PY_LABEL=$(python3 --version 2>&1)
-        log_error "Python 3.6+ is required (found $PY_LABEL)"
+        log_error "Python 3.7+ is required (found $PY_LABEL)"
         exit 1
     fi
 
     log_success "Python $(python3 --version 2>&1 | awk '{print $2}') detected"
+}
+
+# Kernel headers are needed by BCC to compile the eBPF program at runtime,
+# but the exact linux-headers-$(uname -r) package is often unavailable (WSL2
+# kernels, cloud images whose running kernel left the mirrors). Never let a
+# missing headers package abort the whole install: BCC can also compile from
+# the kernel's embedded headers (CONFIG_IKHEADERS, /sys/kernel/kheaders.tar.xz).
+install_kernel_headers_apt() {
+    apt-get install -y "linux-headers-$(uname -r)" || {
+        log_warning "linux-headers-$(uname -r) is not available from apt (normal on WSL2 and stale cloud images)."
+        if [ -d "/lib/modules/$(uname -r)/build" ] || [ -e /sys/kernel/kheaders.tar.xz ]; then
+            log_info "Kernel headers are available another way (build dir or CONFIG_IKHEADERS); continuing."
+        else
+            log_warning "No kernel headers found: the tracer will fail to compile until headers are provided."
+            log_warning "On WSL2, build headers from https://github.com/microsoft/WSL2-Linux-Kernel or enable CONFIG_IKHEADERS."
+        fi
+    }
 }
 
 detect_distro() {
@@ -95,25 +115,46 @@ detect_distro() {
 install_bcc_ubuntu() {
     log_info "Installing BCC for Ubuntu/Debian-based system..."
     apt-get update -qq
-    apt-get install -y bpfcc-tools linux-headers-$(uname -r)
+    # bcc itself is a hard requirement (fatal); headers are best-effort.
+    apt-get install -y bpfcc-tools
+    install_kernel_headers_apt
 }
 
 install_bcc_debian() {
     log_info "Installing BCC for Debian..."
-    
-    # Check if sid repo is already added
-    if ! grep -q "debian sid main" /etc/apt/sources.list 2>/dev/null; then
-        log_info "Adding Debian sid repository for BCC..."
-        echo "deb http://cloudfront.debian.net/debian sid main" >> /etc/apt/sources.list
-    fi
-    
+    # bpfcc-tools/libbpfcc have shipped in Debian stable main since buster —
+    # no sid repository needed. (An earlier version of this script appended
+    # the sid repo to /etc/apt/sources.list, which risks partial upgrades to
+    # unstable on any later `apt upgrade`. If a previous run added it, remove
+    # the "deb http://cloudfront.debian.net/debian sid main" line.)
     apt-get update -qq
-    apt-get install -y bpfcc-tools libbpfcc libbpfcc-dev linux-headers-$(uname -r)
+    apt-get install -y bpfcc-tools libbpfcc libbpfcc-dev
+    install_kernel_headers_apt
 }
 
 install_bcc_fedora() {
-    log_info "Installing BCC for Fedora..."
+    log_info "Installing BCC for Fedora/RHEL-family..."
     dnf install -y bcc bcc-tools python3-bcc
+    # Match the running kernel where possible; plain kernel-devel as fallback
+    # (also covers install_weak_deps=False setups where the bcc RPM's
+    # "Recommends: kernel-devel" is not honored).
+    dnf install -y "kernel-devel-$(uname -r)" || dnf install -y kernel-devel || \
+        log_warning "kernel-devel unavailable; BCC will rely on embedded headers (CONFIG_IKHEADERS) if present"
+}
+
+install_bcc_amazon() {
+    # Amazon Linux 2023 ships dnf + bcc in the base repos; Amazon Linux 2
+    # (EOL 2026-06-30) needs amazon-linux-extras and is not supported —
+    # rejected outright, even if dnf happens to be installed on it (its
+    # repos still lack bcc, so the install would fail mid-flight anyway).
+    if [ "${VERSION_ID%%.*}" = "2" ]; then
+        log_error "Amazon Linux 2 is past end-of-life and not supported; use Amazon Linux 2023."
+        exit 1
+    fi
+    log_info "Installing BCC for Amazon Linux 2023..."
+    dnf install -y bcc bcc-tools python3-bcc
+    dnf install -y "kernel-devel-$(uname -r)" || dnf install -y kernel-devel || \
+        log_warning "kernel-devel unavailable; BCC will rely on embedded headers (CONFIG_IKHEADERS) if present"
 }
 
 install_bcc_arch() {
@@ -150,7 +191,7 @@ install_git_if_needed() {
             ubuntu|debian|linuxmint|pop)
                 apt-get install -y git
                 ;;
-            fedora|rhel|centos)
+            fedora|rhel|centos|rocky|almalinux|amzn)
                 dnf install -y git
                 ;;
             arch|manjaro)
@@ -175,10 +216,11 @@ clone_repo() {
 install_bin() {
     log_info "Installing $BIN_NAME wrapper to $BIN_DIR..."
 
-    # Write a wrapper script so that iotrc.py is always executed from inside
-    # the repo directory. This is required because iotrc.py uses package-relative
-    # imports (from src.tracer.IOTracer import ...) which only resolve when
-    # Python's working directory is the repo root.
+    # The wrapper execs iotrc.py by absolute path from whatever directory the
+    # user is in: imports resolve via sys.path[0] (the script's directory) and
+    # iotrc.py resolves the BPF source relative to __file__, so no cd is
+    # needed. (An earlier comment here claimed the CWD had to be the repo
+    # root — that was never enforced and is not required.)
     cat > "$BIN_DIR/$BIN_NAME" << EOF
 #!/bin/bash
 exec python3 "$INSTALL_DIR/iotrc.py" "\$@"
@@ -204,7 +246,11 @@ install_dependencies() {
             ;;
         rhel|centos|rocky|almalinux)
             log_warning "RHEL-based distro detected. Using dnf..."
-            dnf install -y bcc bcc-tools python3-bcc
+            install_bcc_fedora
+            install_python_deps_dnf
+            ;;
+        amzn)
+            install_bcc_amazon
             install_python_deps_dnf
             ;;
         arch|manjaro)
