@@ -2898,7 +2898,7 @@ TRACEPOINT_PROBE(block, block_rq_issue) {
   if (gen) {
     u64 seq = *gen;
     *gen = seq + 1;
-    ictx.req_id = ((u64)bpf_get_smp_processor_id() << 48) | (seq & 0xFFFFFFFFFFFFULL);
+    ictx.req_id = ((u64)(bpf_get_smp_processor_id() & 0xFFFF) << 48) | (seq & 0xFFFFFFFFFFFFULL);
   }
 
   block_start_times.update(&key, &ictx);
