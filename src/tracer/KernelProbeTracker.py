@@ -406,6 +406,33 @@ class KernelProbeTracker:
                     logger("warning", "No reclaim probe available, reclaim events will not be traced")
 
             # =====================================
+            # Block-layer swap-origin capture
+            # =====================================
+            # The block_rq_* tracepoints auto-attach, but they cannot see
+            # REQ_SWAP: rwbs never encodes it, and on mainline kernels the
+            # tracepoint args carry no cmd_flags at all (only some patched
+            # vendor kernels expose it — see the HAS_CMD_FLAGS sniffing in
+            # IOTracer). A best-effort kprobe on blk_mq_start_request (the
+            # function that fires trace_block_rq_issue) reads the bit from
+            # struct request so the block stream can tag swap-out I/O with a
+            # `swap` flag. The BPF handler only exists when the kernel's
+            # headers define REQ_SWAP (4.19+); load_func failing means it was
+            # compiled out, and attaching an empty program would charge every
+            # block request a kprobe trap for nothing, so skip it. If
+            # anything here is unavailable, block events simply carry no swap
+            # tag — nothing else is affected.
+            if BPF.get_kprobe_functions(b'blk_mq_start_request'):
+                try:
+                    self.b.load_func("trace_blk_mq_start_request", BPF.KPROBE)
+                except Exception:
+                    if self.developer_mode:
+                        logger("warning", "swap-origin BPF handler unavailable (REQ_SWAP undefined on this kernel, or load failed) - swap tagging disabled")
+                else:
+                    self.add_kprobe("blk_mq_start_request", "trace_blk_mq_start_request")
+            elif self.developer_mode:
+                logger("warning", "blk_mq_start_request not available - swap-origin tagging disabled")
+
+            # =====================================
             # io_uring probes for async I/O tracing
             # =====================================
             # Note: io_uring tracepoints are preferred when available (kernel 5.6+)

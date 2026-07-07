@@ -105,7 +105,7 @@ STREAMS = {
             _col("size", "u64", "bytes", "I/O size."),
             _col("latency_ms", "float", "milliseconds", "Device latency (issue->completion)."),
             _col("device", "string", "", "Device major:minor (Windows: disk index)."),
-            _col("flags", "string", "", "rwbs sub-flags (sync|meta|ahead|...); empty when none."),
+            _col("flags", "string", "", "rwbs sub-flags (sync|meta|ahead|...) plus swap for REQ_SWAP (swap-out) requests; empty when none."),
             # --- Linux-only extras (columns 11+) --- #
             _col("cpu_id", "u32", "", "CPU that processed completion."),
             _col("ppid", "u32"),
