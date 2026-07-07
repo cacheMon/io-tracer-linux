@@ -60,7 +60,8 @@ _NON_IO_SIZE_OPS = frozenset({
 })
 
 
-_ACTIVITY_THRESHOLD = 100  # block I/O events/sec to qualify as "active"
+_ACTIVITY_WINDOW_S = 60     # sampling window length, in seconds
+_ACTIVITY_THRESHOLD = 100   # block I/O events per _ACTIVITY_WINDOW_S to qualify as "active"
 
 
 class IOTracer:
@@ -232,10 +233,10 @@ class IOTracer:
         self._cmdline_cache_max     = 100000  # hard cap on cmdline cache entries
         self._disk_event_counter: int = 0
         self._counter_lock          = threading.Lock()
-        self.active_duration_s: int = 0
+        self.active_windows: int = 0
         self._activity_stop         = threading.Event()
         self._activity_t: threading.Thread | None = None
-        self._last_posted_active_s: int = 0
+        self._last_posted_active_windows: int = 0
         self._last_posted_rows: dict[str, int] = {}
         self._telemetry_lock        = threading.Lock()
 
@@ -415,19 +416,20 @@ class IOTracer:
             self._disk_event_counter += 1
 
     def _activity_detector(self) -> None:
-        while not self._activity_stop.wait(timeout=1.0):
+        while not self._activity_stop.wait(timeout=_ACTIVITY_WINDOW_S):
             with self._counter_lock:
                 count = self._disk_event_counter
                 self._disk_event_counter = 0
                 if count > _ACTIVITY_THRESHOLD:
-                    self.active_duration_s += 1
+                    self.active_windows += 1
 
     def _post_telemetry_delta(self) -> None:
         with self._counter_lock:
-            current_active_s = self.active_duration_s
+            current_active_windows = self.active_windows
 
         with self._telemetry_lock:
-            duration_delta = current_active_s - self._last_posted_active_s
+            windows_delta = current_active_windows - self._last_posted_active_windows
+            duration_delta = windows_delta * _ACTIVITY_WINDOW_S
 
             current_rows = self.writer.get_rows_written_snapshot()
 
@@ -440,7 +442,7 @@ class IOTracer:
             if duration_delta == 0 and not events_delta:
                 return
 
-            self._last_posted_active_s = current_active_s
+            self._last_posted_active_windows = current_active_windows
             self._last_posted_rows = current_rows
 
         self.upload_manager.post_telemetry(
