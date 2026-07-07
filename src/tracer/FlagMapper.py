@@ -514,6 +514,28 @@ class FlagMapper:
         
         return "|".join(result) if result else "UNKNOWN"
 
+    def append_swap_flag(self, flags_str, is_swap):
+        """
+        Append the swap-origin tag to a block flags string.
+
+        Swap-out block I/O carries REQ_SWAP in the kernel, which the rwbs
+        string never encodes; the tracer captures it as a separate boolean at
+        request-issue time and merges it into the pipe-joined ``flags`` column
+        here (lowercase, consistent with the rwbs-derived sub-flags such as
+        ``sync``/``meta``/``ahead``).
+
+        Args:
+            flags_str: Existing pipe-joined block flags ("" when none).
+            is_swap: Truthy when the request carried REQ_SWAP.
+
+        Returns:
+            str: The flags string with ``swap`` appended when is_swap is
+                 truthy, otherwise unchanged.
+        """
+        if not is_swap:
+            return flags_str
+        return f"{flags_str}|swap" if flags_str else "swap"
+
     def decode_block_req_flags(self, flags):
         """
         Decode block request command flags.

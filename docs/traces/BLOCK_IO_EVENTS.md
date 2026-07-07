@@ -35,7 +35,7 @@
 | 7 | size | `u64` | I/O size in bytes |
 | 8 | latency_ms | `float` | Device latency in milliseconds (issue → completion) |
 | 9 | device | `string` | Device number as `major:minor` identifying the partition/device |
-| 10 | flags | `string` | Pipe-separated rwbs sub-flags (`sync`, `meta`, `ahead`, …) split out of the `operation` column |
+| 10 | flags | `string` | Pipe-separated rwbs sub-flags (`sync`, `meta`, `ahead`, …) split out of the `operation` column, plus `swap` for swap-out (`REQ_SWAP`) requests — see [Swap-origin tagging](#swap-origin-tagging-swap-flag) |
 | 11 | cpu_id | `u32` | CPU where completion was processed |
 | 12 | ppid | `u32` | Parent process ID |
 | 13 | queue_latency_ms | `float` | Queue/scheduler latency in milliseconds (insert → issue); empty if unavailable |
@@ -61,11 +61,11 @@ I/O latency is tracked across the block layer request lifecycle using kernel tra
    - **Meaning**: Represents the time the request spent queued up in the OS scheduler waiting to be dispatched to the device.
 
 **Key Matching Mechanism**: 
-To accurately match corresponding `insert`, `issue`, and `complete` events for a single request, the tracer uses a composite key consisting of the block device number and starting sector (`(dev << 32) ^ sector`). CPU IDs are intentionally excluded from the correlation key, as an I/O request may be issued on one CPU but completed via an interrupt handled by a different CPU.
+To accurately match corresponding `insert`, `issue`, and `complete` events for a single request, the tracer uses a composite key struct holding the block device number and the full 64-bit starting sector as separate fields (so distinct `(dev, sector)` pairs can never collide). CPU IDs are intentionally excluded from the correlation key, as an I/O request may be issued on one CPU but completed via an interrupt handled by a different CPU.
 
 ## Operation Types
 
-Derived from the block layer `rwbs` string and normalized. When the rwbs string contains multiple flags (e.g., "WS", "RM"), the operation field contains pipe-separated values (e.g., "write|sync", "read|meta"):
+Derived from the block layer `rwbs` string and normalized. When the rwbs string contains multiple flags (e.g., "WS", "RM"), the base operation goes in the operation column (field 2) and the remaining sub-flags go in the flags column (field 10) — e.g. "WS" → operation=`write`, flags=`sync`:
 
 | Value | Description |
 |-------|-------------|
@@ -128,15 +128,51 @@ Command flags captured in the `command_flags` field (field 14). Multiple flags a
 | `0x2000` | `REQ_NOWAIT` | Don't wait if request cannot be issued |
 | `0x4000` | `REQ_CGROUP_PUNT` | Cgroup accounting |
 
+## Swap-origin tagging (`swap` flag)
+
+Swap I/O goes through the block layer with no filesystem counterpart, so on
+memory-constrained hosts it masquerades as filesystem block I/O (inflating
+apparent write amplification and polluting cacheability analysis). To let
+analysis subtract it, the tracer appends `swap` to the `flags` column (field
+10) for requests that carried the kernel's `REQ_SWAP` command flag.
+
+**How it is captured.** The rwbs string never encodes `REQ_SWAP`, and on
+mainline kernels the `block_rq_*` tracepoint arguments carry no `cmd_flags` at
+all (the `command_flags` column only populates on patched vendor kernels — see
+the note under the field table), so the bit cannot come from the tracepoint
+arguments. Instead a best-effort kprobe on `blk_mq_start_request()` — the
+function that fires `block_rq_issue` — reads `cmd_flags` from `struct request`
+at issue time and carries the bit to the completion event via a
+`(device, sector)`-keyed map, mirroring the existing issue→completion
+correlation. Because that key is reused over time, the marker is timestamped
+and cross-checked against the matched issue context (and restricted to write
+ops) before it is honored, so a marker orphaned by a missed completion cannot
+mis-tag a later request.
+
+**Caveats:**
+
+- **Swap-out only.** The kernel sets `REQ_SWAP` exclusively on swap *writes*
+  (`mm/page_io.c` builds swap-in reads as plain `REQ_OP_READ`), so swap-in
+  reads are never tagged, on any kernel version.
+- **Best-effort.** If the `blk_mq_start_request` symbol cannot be probed, or
+  the kernel's headers do not define `REQ_SWAP` (kernels < 4.19, where the
+  probe is skipped entirely), block events simply carry no `swap` tag; nothing
+  else is affected.
+- **Request-based devices only.** Swap on bio-based devices (e.g. zram)
+  produces no `block_rq_*` events at all, so it never appears in this stream —
+  with or without tagging.
+
+**Example** `flags` values: `swap`, `sync|swap`, `meta` (no swap).
+
 ## RWBS Flags
 
-Character flags from the block layer tracepoint `rwbs` string. Each character in the rwbs string is decoded to its corresponding flag name, and when multiple characters are present, they are concatenated with pipes in the Operation field (field 2).
+Character flags from the block layer tracepoint `rwbs` string. Each character in the rwbs string is decoded to its corresponding flag name; the first (the base operation) lands in the Operation column (field 2) and any remaining sub-flags are pipe-concatenated into the flags column (field 10).
 
 **Examples:**
-- `"R"` → `"read"`
-- `"WS"` → `"write|sync"`
-- `"RM"` → `"read|meta"`
-- `"WMA"` → `"write|meta|ahead"`
+- `"R"` → operation=`read`, flags empty
+- `"WS"` → operation=`write`, flags=`sync`
+- `"RM"` → operation=`read`, flags=`meta`
+- `"WMA"` → operation=`write`, flags=`meta|ahead`
 
 | Char | Name | Description |
 |------|------|-------------|

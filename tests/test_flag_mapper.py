@@ -109,6 +109,33 @@ class MmapProtTests(unittest.TestCase):
         self.assertEqual(self.m.format_mmap_map_flags(0), "NO_MAP")
 
 
+class SwapFlagTests(unittest.TestCase):
+    """append_swap_flag merges the REQ_SWAP marker into the block flags column."""
+
+    def setUp(self):
+        self.m = FlagMapper()
+
+    def test_no_swap_leaves_flags_unchanged(self):
+        self.assertEqual(self.m.append_swap_flag("", 0), "")
+        self.assertEqual(self.m.append_swap_flag("sync|meta", 0), "sync|meta")
+
+    def test_swap_on_empty_flags(self):
+        self.assertEqual(self.m.append_swap_flag("", 1), "swap")
+
+    def test_swap_appends_to_existing_flags(self):
+        # Lowercase and pipe-joined, consistent with the rwbs sub-flags.
+        self.assertEqual(self.m.append_swap_flag("sync", 1), "sync|swap")
+        self.assertEqual(self.m.append_swap_flag("sync|meta", 1), "sync|meta|swap")
+
+    def test_matches_block_stream_pipeline(self):
+        # End-to-end shape of _print_event_block: format_block_ops decodes the
+        # rwbs string, the base op is split off, and the swap marker joins the
+        # remaining sub-flags.
+        parts = self.m.format_block_ops("WS").split("|")
+        op_flags = "|".join(parts[1:])
+        self.assertEqual(self.m.append_swap_flag(op_flags, 1), "sync|swap")
+
+
 class ErrnoTests(unittest.TestCase):
     def test_zero_is_empty(self):
         self.assertEqual(FlagMapper.format_errno(0), "")

@@ -377,6 +377,9 @@ struct block_event {
                               *   (CPU id in the high 16 bits, per-CPU sequence
                               *   in the low 48). Disambiguates distinct I/Os
                               *   that reuse the same (dev, sector). */
+  u8 is_swap;               /**< 1 when the request carried REQ_SWAP (swap-out
+                              *   I/O). The kernel only sets REQ_SWAP on swap
+                              *   writes, so swap-in reads are never tagged. */
 };
 
 /* ============================================================================
@@ -727,6 +730,30 @@ struct block_rq_key_t {
  * envelope that gates block tracing. */
 BPF_TABLE("lru_hash", struct block_rq_key_t, struct block_issue_ctx, block_start_times, 65536); /**< Issue time + submitter, keyed by dev+sector */
 BPF_TABLE("lru_hash", struct block_rq_key_t, u64, block_insert_times, 65536);  /**< Tracks block request insert time (queue latency) */
+
+/* Swap-origin (REQ_SWAP) markers, keyed like block_start_times and consumed
+ * at completion. Populated by the best-effort blk_mq_start_request kprobe:
+ * rwbs never encodes REQ_SWAP, and on mainline kernels the block tracepoint
+ * args carry no cmd_flags at all (see HAS_CMD_FLAGS), so the bit has to be
+ * read from struct request itself. The value is the marker's capture
+ * timestamp, cross-checked against the matched issue ctx at completion to
+ * reject markers left behind by requests that never completed; non-swap
+ * requests scrub the key at start (mirroring how the sibling maps are
+ * refreshed by every new claimant of (dev, sector)). Sized like the sibling
+ * maps: the resident population is only in-flight swap writes, but the
+ * common-LRU allocator hands out free nodes in per-CPU batches (~128/CPU),
+ * so a small ceiling starts evicting live markers on many-CPU hosts during
+ * swap storms — exactly the workload this tagging exists to measure. */
+BPF_TABLE("lru_hash", struct block_rq_key_t, u64, block_swap_flags, 65536);
+
+/* A genuine swap marker is written at blk_mq_start_request entry, moments
+ * before the same invocation fires block_rq_issue (which stores ictx->ts) —
+ * so marker_ts <= ictx->ts, with a gap of microseconds unless the task is
+ * preempted between the two. Anything newer than ictx belongs to a later
+ * request at a reused (dev, sector) key; anything older than this bound is
+ * residue of a request whose completion was never seen. 1s absorbs
+ * preemption and requeue latency with orders of magnitude to spare. */
+#define SWAP_MARKER_MAX_AGE_NS (1ULL * 1000000000ULL)   /* 1 second */
 
 /* Per-request ID generator (see block_event.req_id). A per-CPU u64 counter
  * bumped at issue time; the emitted req_id folds the CPU id into the high bits
@@ -3045,6 +3072,69 @@ TRACEPOINT_PROBE(block, block_rq_issue) {
 }
 
 /**
+ * @brief Swap-origin capture at request start (kprobe on blk_mq_start_request)
+ *
+ * Swap-out I/O reaches the block layer with REQ_SWAP set, but that bit is
+ * invisible to the tracepoint handlers above: the rwbs string never encodes
+ * it, and on mainline kernels the tracepoint args carry no cmd_flags at all
+ * (only some patched vendor kernels expose it — see HAS_CMD_FLAGS). It has
+ * to be read from struct request itself, which the tracepoint args do not
+ * carry — hence this kprobe on blk_mq_start_request(), the exported function
+ * that fires trace_block_rq_issue for every request-based driver since the
+ * legacy request path was removed in 5.0. Attachment is best-effort in
+ * KernelProbeTracker: if the symbol is missing, block events simply carry no
+ * swap tag.
+ *
+ * Swap-flagged requests store a timestamped marker; every other request
+ * scrubs the key, so a marker left behind by a swap write that never
+ * completed cannot mis-tag a later request reusing the same (dev, sector).
+ *
+ * NOTE: the kernel sets REQ_SWAP only on swap WRITES (mm/page_io.c builds
+ * swap-in reads as plain REQ_OP_READ), so swap-in traffic is never tagged.
+ *
+ * The whole handler is compiled out on kernels whose headers do not define
+ * REQ_SWAP (< 4.19): KernelProbeTracker probes for the function before
+ * attaching, so those kernels do not pay a per-request kprobe trap for a
+ * guaranteed no-op.
+ */
+#ifdef REQ_SWAP
+int trace_blk_mq_start_request(struct pt_regs *ctx, struct request *rq) {
+  /* Mirror the block_rq_issue/complete tracepoints' key fields so the
+   * completion handler's block_rq_key() lookup matches:
+   *   dev    = disk_devt(disk) = MKDEV(major, first_minor), MINORBITS = 20.
+   *            The tracepoints read the disk from rq->q->disk since the
+   *            5.17 removal of rq->rq_disk (f3fa33acca9f), and from
+   *            rq->rq_disk before that.
+   *   sector = blk_rq_trace_sector(rq), which is blk_rq_pos(rq) ==
+   *            rq->__sector except for passthrough requests — and swap I/O
+   *            is never passthrough. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+  struct gendisk *disk = rq->q->disk;
+#else
+  struct gendisk *disk = rq->rq_disk;
+#endif
+  if (!disk)
+    return 0;
+  u32 dev = ((u32)disk->major << 20) | (u32)disk->first_minor;
+  struct block_rq_key_t key = block_rq_key(dev, rq->__sector);
+
+  if (rq->cmd_flags & REQ_SWAP) {
+    u64 ts = bpf_ktime_get_ns();
+    block_swap_flags.update(&key, &ts);
+  } else {
+    /* Scrub any stale marker at this key: (dev, sector) is not unique over
+     * time, and unlike the sibling maps (overwritten by every insert/issue)
+     * this map is only ever written by swap requests, so without the scrub a
+     * marker orphaned by a missed completion would tag the next request that
+     * reuses the key — however much later that is. Deleting a missing key is
+     * a cheap hash miss, so the common case stays inexpensive. */
+    block_swap_flags.delete(&key);
+  }
+  return 0;
+}
+#endif /* REQ_SWAP */
+
+/**
  * @brief Block request completion tracepoint
  *
  * Records when I/O completes, calculates latencies, and emits event.
@@ -3065,8 +3155,10 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
     // Drop any insert timestamp for this key too — without the issue ctx we
     // can't emit an event, and leaving it behind lets a later request that
     // reuses the same (dev,sector) key read a stale insert_ts and report a
-    // wildly inflated queue latency.
+    // wildly inflated queue latency. Same for a stale swap marker, which
+    // would mis-tag a later non-swap request reusing the key.
     block_insert_times.delete(&key);
+    block_swap_flags.delete(&key);
     return 0;
   }
 
@@ -3077,6 +3169,7 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
   if (tracer_pid && ictx->pid == *tracer_pid) {
     block_start_times.delete(&key);
     block_insert_times.delete(&key);
+    block_swap_flags.delete(&key);
     return 0;
   }
 
@@ -3095,6 +3188,7 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
       *stale += 1;
     block_start_times.delete(&key);
     block_insert_times.delete(&key);
+    block_swap_flags.delete(&key);
     return 0;
   }
 
@@ -3133,7 +3227,7 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
   event.latency_ns = latency;
   event.queue_time_ns = queue_time;  // New: queue time
   event.req_id = ictx->req_id;       // Stable per-request id
-  
+
 #ifdef HAS_CMD_FLAGS
   event.cmd_flags = args->cmd_flags; // Capture REQ_* command flags
   // Extract raw operation code from cmd_flags (lower 8 bits contain REQ_OP_*)
@@ -3149,6 +3243,26 @@ TRACEPOINT_PROBE(block, block_rq_complete) {
   event.dev = args->dev;
 
   bpf_probe_read_kernel(&event.op, sizeof(event.op), &args->rwbs);
+
+  // Swap-origin marker captured by the blk_mq_start_request kprobe (the
+  // tracepoint args carry neither the rwbs-invisible REQ_SWAP nor, on
+  // mainline kernels, cmd_flags at all). (dev, sector) keys are reused over
+  // time, so — mirroring the ictx staleness guards above — the marker is
+  // honored only when it is consistent with the matched issue ctx: a genuine
+  // marker is written at blk_mq_start_request entry, moments before the same
+  // invocation fires block_rq_issue, so it must be no newer than ictx->ts
+  // (newer = a later request's marker) and not much older (older = residue
+  // of a request whose completion was missed). The kernel sets REQ_SWAP only
+  // on writes, so a non-write rwbs can never legitimately match. Deleted on
+  // every path so a later request cannot inherit it.
+  u64 *swap_ts = block_swap_flags.lookup(&key);
+  if (swap_ts) {
+    if (*swap_ts <= ictx->ts &&
+        ictx->ts - *swap_ts < SWAP_MARKER_MAX_AGE_NS &&
+        event.op[0] == 'W')
+      event.is_swap = 1;
+    block_swap_flags.delete(&key);
+  }
 
   bl_events.perf_submit(args, &event, sizeof(event));
 

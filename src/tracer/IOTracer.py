@@ -1178,6 +1178,12 @@ class IOTracer:
         _op_parts = ops_str.split("|")
         op_base = _op_parts[0]
         op_flags = "|".join(_op_parts[1:])
+        # Swap-origin marker (REQ_SWAP, captured at issue time by the
+        # blk_mq_start_request kprobe — rwbs never encodes it) joins the
+        # rwbs-derived sub-flags so swap-out traffic can be separated from
+        # filesystem-origin block I/O.
+        op_flags = self.flag_mapper.append_swap_flag(
+            op_flags, getattr(event, 'is_swap', 0))
         latency_ns = event.latency_ns
         latency_ms = latency_ns / 1_000_000.0
         cpu_id = event.cpu_id
