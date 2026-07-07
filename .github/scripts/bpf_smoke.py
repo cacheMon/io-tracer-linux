@@ -98,6 +98,11 @@ def main():
         (b"iomap_dio_rw", [("kprobe", "iomap_dio_rw", "trace_dio_entry_iomap"),
                            ("kretprobe", "iomap_dio_rw", "trace_dio_return")]),
         (b"__blockdev_direct_IO", [("kprobe", "__blockdev_direct_IO", "trace_dio_entry_blockdev")]),
+        # Swap-origin capture: the handler only exists when the kernel's
+        # headers define REQ_SWAP (4.19+; always true on CI runners), so a
+        # failed attach here catches a broken #ifdef guard that BPF() load
+        # alone would silently pass.
+        (b"blk_mq_start_request", [("kprobe", "blk_mq_start_request", "trace_blk_mq_start_request")]),
     ]
     for symbol, symbol_probes in conditional_probes:
         if BPF.get_kprobe_functions(symbol):
