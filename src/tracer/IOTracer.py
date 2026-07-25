@@ -551,6 +551,9 @@ class IOTracer:
         #   inode get the path for free. If bpf_d_path fell back to basename
         #   (no leading '/'), try fd-based userspace resolution as a backup.
         # - All other events: check the inode cache populated by OPEN events.
+        # - SENDFILE: do_sendfile() only exposes a raw fd (never a struct file*
+        #   in the kernel), so there's no inode to key off of — resolve the
+        #   source fd directly instead, same fd-based resolver OPEN falls back to.
         if not self.anonymous and event.inode != 0:
             if op_name == 'OPEN':
                 if filename and filename.startswith('/'):
@@ -579,6 +582,12 @@ class IOTracer:
                 cached = self.path_resolver.inode_to_path.get(event.inode)
                 if cached:
                     filename = cached
+        elif not self.anonymous and op_name == "SENDFILE" and getattr(event, 'fd', 0):
+            # No inode available (do_sendfile() never exposes a struct file*),
+            # but the source fd was captured at entry — resolve it directly.
+            filename = self.path_resolver.resolve_by_fd(
+                pid=event.pid, fd=event.fd, filename=filename
+            )
 
         # Invariant: an OPEN filename is absolute or a clean basename, never an
         # unanchored relative path. If it is still relative here (inode==0 skipped
@@ -592,6 +601,12 @@ class IOTracer:
                 self._track_mmap_region(event.pid, raw_address, event.size, filename)
             elif op_name == "MUNMAP":
                 resolved_filename = self._resolve_munmap_filename(event.pid, raw_address, event.size)
+                if resolved_filename:
+                    filename = resolved_filename
+            elif op_name in ("MSYNC", "MADVISE"):
+                # Unlike MUNMAP, the mapping survives these calls — look up the
+                # tracked region without mutating it.
+                resolved_filename = self._lookup_region_filename(event.pid, raw_address)
                 if resolved_filename:
                     filename = resolved_filename
 
@@ -685,8 +700,29 @@ class IOTracer:
             "filename": filename,
         }
 
+    def _lookup_region_filename(self, pid: int, address: int) -> str:
+        """Read-only lookup of the tracked mmap region covering `address`.
+
+        Unlike `_resolve_munmap_filename`, this never mutates `mmap_regions` —
+        for callers like MSYNC/MADVISE where the mapping stays alive after the
+        call, so the tracked region must not be shrunk/split/removed.
+        """
+        regions = self.mmap_regions.get(pid)
+        if not regions:
+            return ""
+
+        match_start = self._find_region_start(regions, address)
+        if match_start is None:
+            return ""
+
+        return regions.get(match_start, {}).get("filename", "")
+
     def _resolve_munmap_filename(self, pid: int, start: int, length: int) -> str:
-        """Resolve munmap filename from the best matching tracked mmap region."""
+        """Resolve munmap filename from the best matching tracked mmap region.
+
+        munmap() actually destroys the mapping, so — unlike `_lookup_region_filename`
+        — this also shrinks/splits/removes the tracked region to match.
+        """
         regions = self.mmap_regions.get(pid)
         if not regions:
             return ""

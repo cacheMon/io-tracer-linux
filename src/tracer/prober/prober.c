@@ -286,11 +286,11 @@ struct data_t {
   char filename[FILENAME_MAX_LEN]; /**< Filename from dentry (basename only) */
   u64 inode;                      /**< Inode number for file identification */
   u64 size;                       /**< Operation size in bytes (read/write length) */
-  u64 address;                    /**< Mapping address for MMAP/MUNMAP events */
+  u64 address;                    /**< Mapping address for MMAP/MUNMAP/MSYNC/MADVISE events */
   u32 flags;                      /**< File flags (O_RDONLY, O_SYNC, etc.) */
   enum op_type op;                /**< Operation type from op_type enum */
   /* Enhanced fields for I/O correlation and analysis */
-  u32 fd;                         /**< File descriptor. Populated for OPEN events via the openat kretprobe; 0 for all other event types. */
+  u32 fd;                         /**< File descriptor. Populated for OPEN events via the openat kretprobe, and for SENDFILE (source fd) at entry; 0 for all other event types. */
   u64 offset;                     /**< File offset for read/write operations */
   u32 tid;                        /**< Thread ID for multi-threaded correlation */
   u32 mmap_prot;                  /**< mmap protection flags (PROT_*) for MMAP events */
@@ -2916,7 +2916,10 @@ int trace_vfs_fallocate(struct pt_regs *ctx, struct file *file, int mode,
  * @brief Trace sendfile() - Zero-copy file-to-socket transfer
  *
  * Captures sendfile() operations for efficient file serving.
- * Does not have direct access to file structures, only FDs.
+ * Does not have direct access to file structures, only FDs — the source
+ * fd is passed through in `data.fd` so userspace can resolve its path via
+ * /proc/<pid>/fd/<fd> (PathResolver.resolve_by_fd), the same mechanism used
+ * as the fd-based fallback for OPEN events.
  *
  * @param ctx    BPF context
  * @param out_fd Destination (socket) file descriptor
@@ -2943,6 +2946,7 @@ int trace_sendfile(struct pt_regs *ctx, int out_fd, int in_fd, loff_t *offset,
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
   data.op = OP_SENDFILE;
   data.inode = 0;
+  data.fd = (u32)in_fd;
   data.size = 0;   /* set to actual transferred bytes at return; never the
                       requested `count` ceiling (often SSIZE_MAX) */
   data.flags = 0;
@@ -4412,7 +4416,8 @@ TRACEPOINT_PROBE(syscalls, sys_enter_msync) {
   data.ts = bpf_ktime_get_ns();
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
   data.op = OP_MSYNC;
-  data.offset = args->start;  // Store address as offset
+  data.address = args->start;  // Address of the mapped region being synced;
+                                // resolved against mmap_regions in userspace.
   data.size = args->len;
   data.flags = args->flags;
 
@@ -4439,7 +4444,8 @@ TRACEPOINT_PROBE(syscalls, sys_enter_madvise) {
   data.ts = bpf_ktime_get_ns();
   bpf_get_current_comm(&data.comm, sizeof(data.comm));
   data.op = OP_MADVISE;
-  data.offset = args->start;  // Store address as offset
+  data.address = args->start;  // Address of the advised region; resolved
+                                // against mmap_regions in userspace.
   data.size = args->len_in;
   data.flags = args->behavior;
 

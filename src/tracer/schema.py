@@ -83,7 +83,7 @@ STREAMS = {
             _col("errno", "string", "", "Error name when READ/WRITE failed; empty otherwise."),
             _col("mmap_prot", "string", "", "MMAP PROT_* flags; empty for non-MMAP."),
             _col("mmap_flags", "string", "", "MMAP MAP_* flags; empty for non-MMAP."),
-            _col("address", "string", "", "Mapping address (hex) for MMAP/MUNMAP/MREMAP."),
+            _col("address", "string", "", "Mapping/region address (hex) for MMAP/MUNMAP/MSYNC/MADVISE/MREMAP."),
             _col("cmdline", "string", "", "Full argv of the triggering process."),
             _col("ppid", "u32"),
             _col("container_id", "u64", "", "cgroup v2 id (container identifier)."),

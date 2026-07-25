@@ -59,25 +59,43 @@ Non-OPEN events  (READ, WRITE, CLOSE, MMAP, etc.)
    ├─ cache hit  →  full absolute path
    └─ cache miss →  basename from d_name (the dentry short name)
 
-MMAP/MUNMAP post-processing
-───────────────────────────
+MMAP/MUNMAP/MSYNC/MADVISE post-processing
+──────────────────────────────────────────
 ⑤  userspace mmap region cache  (populated by MMAP events)
    ├─ key: PID + mapping start address
    ├─ value: mapping end address + filename
-   └─ used by MUNMAP to recover the filename for the unmapped region
+   ├─ used by MUNMAP to recover the filename for the unmapped region
+   │  (lookup is mutating: the matched region is shrunk/split/removed,
+   │  since munmap() actually destroys the mapping)
+   └─ used by MSYNC/MADVISE to recover the filename for the synced/advised
+      region (lookup is read-only: the mapping is still alive afterward)
 
 `MMAP` stores the actual mapping start returned by `do_mmap` (via kretprobe), not
 the caller's requested hint address. This is required for joining later
-`MUNMAP` events for non-`MAP_FIXED` mappings.
+`MUNMAP`/`MSYNC`/`MADVISE` events for non-`MAP_FIXED` mappings.
+
+SENDFILE events
+────────────────
+⑥  do_sendfile kprobe (entry)
+   └─ do_sendfile() only exposes raw file descriptors, never a struct file*,
+      so there is no inode to resolve in-kernel. The source fd (`in_fd`) is
+      passed through in the event's `fd` field instead.
+
+⑦  userspace fd resolution (using the fd from ⑥)
+   └─ PathResolver.resolve_by_fd(): a single `readlink` on
+      `/proc/<pid>/fd/<fd>`, the same mechanism used as OPEN's fd-based
+      fallback. Requires the fd to still be open at event time, which holds
+      here since resolution happens on the entry probe, before the transfer
+      (and any close) completes.
 ```
 
-### File Descriptor Field
+### File Descriptor Field (internal, not a CSV column)
 
-For `OPEN` events the `fd` column (last column) contains the allocated file descriptor number returned by the `openat` syscall. This is guaranteed to match the fd seen by userspace. For all other event types this field is `0`.
+The raw perf event carries a `fd` field that is used internally for path resolution but is **not** one of the emitted CSV columns (see the field table below — there is no `fd` column). For `OPEN` events it holds the allocated file descriptor number returned by the `openat` syscall, guaranteed to match the fd seen by userspace, and is consumed by `PathResolver.resolve_by_fd()` as the fd-based fallback when the kernel-resolved path isn't already absolute. For `SENDFILE` events it holds the source (`in_fd`) file descriptor, captured at the `do_sendfile()` entry probe and consumed the same way to resolve the `filename` column. For all other event types this field is `0`.
 
-### MUNMAP Filename Resolution Implementation
+### MUNMAP / MSYNC / MADVISE Filename Resolution Implementation
 
-`MUNMAP` does not expose a `struct file *` or inode in the probed kernel path, so the tracer cannot resolve its filename directly in eBPF. The implementation therefore uses a two-stage join across `MMAP` and `MUNMAP` events:
+None of `MUNMAP`, `MSYNC`, or `MADVISE` expose a `struct file *` or inode in their probed kernel path (`vm_munmap` and the `msync`/`madvise` syscall tracepoints only ever see an address and a length), so the tracer cannot resolve their filenames directly in eBPF. The implementation instead joins all three against the region cache populated by `MMAP`:
 
 1. `do_mmap` kprobe (`trace_mmap_entry`) captures file-backed mapping metadata:
    - `PID`
@@ -96,17 +114,16 @@ For `OPEN` events the `fd` column (last column) contains the allocated file desc
 5. The cached value stores:
    - mapping end address
    - resolved filename
-6. When `__vm_munmap` fires, the kernel event only carries:
+6. When `__vm_munmap`, `sys_enter_msync`, or `sys_enter_madvise` fires, the kernel event only carries:
    - `PID`
-   - unmapped start address
-   - unmapped length
-7. Userspace looks up the tracked region whose address range contains the unmapped start address and copies that region's filename into the `MUNMAP` CSV row.
-8. After a match, the cached region is updated:
-   - full unmap: remove the region
-   - prefix/suffix unmap: shrink the region
-   - middle unmap: split the region into two tracked regions
+   - the address passed to the call (`data.address` — the region start for `MUNMAP`/`MSYNC`, the advised range start for `MADVISE`)
+   - length (`MUNMAP`/`MSYNC`) or none needed (`MADVISE` lookup only needs the start address)
+7. Userspace looks up the tracked region whose address range contains that address and copies its filename into the CSV row.
+8. What happens to the cached region after the lookup differs by operation, because only `munmap()` actually destroys the mapping:
+   - `MUNMAP` (`_resolve_munmap_filename`, mutating): the cached region is updated to match — full unmap removes it, a prefix/suffix unmap shrinks it, a middle unmap splits it into two tracked regions.
+   - `MSYNC`/`MADVISE` (`_lookup_region_filename`, read-only): the cached region is left untouched, since the mapping is still live after the call. Reusing the mutating munmap path here would incorrectly shrink/evict a region that the process hasn't actually unmapped.
 
-This is why the `address` column matters for both `MMAP` and `MUNMAP`: it is the join key that lets userspace recover filenames for unmap events.
+This is why the `address` column matters for `MMAP`, `MUNMAP`, `MSYNC`, and `MADVISE` alike: it is the join key that lets userspace recover filenames for all four.
 
 ### Caveats
 
@@ -147,8 +164,11 @@ Opens triggered by the kernel itself (e.g. during `execve` loading the ELF inter
 #### Inode cache is process-lifetime scoped
 The `inode → path` cache populated by OPEN events is held in memory for the tracer session. It covers any file that was opened while the tracer was running. Files opened before the tracer started will only have basenames for non-OPEN events unless an OPEN event for that inode is also captured.
 
-#### MUNMAP filename recovery is best-effort
-`MUNMAP` does not provide file context in the kernel probe. The tracer recovers the filename in userspace by matching the `PID` and unmapped address against previously seen `MMAP` regions. This works for exact unmaps and partial unmaps of tracked regions, but it cannot recover filenames for mappings that existed before tracing started or for missed `MMAP` events.
+#### MUNMAP / MSYNC / MADVISE filename recovery is best-effort
+None of these provide file context in the kernel probe. The tracer recovers the filename in userspace by matching the `PID` and the call's address against previously seen `MMAP` regions. This works for exact and partial matches against tracked regions, but it cannot recover filenames for mappings that existed before tracing started or for missed `MMAP` events — most commonly `MADVISE`/`MSYNC` calls on `MAP_ANONYMOUS` regions, which have no backing file to begin with and are expected to resolve empty.
+
+#### SENDFILE filename recovery requires the source fd to still be open
+`SENDFILE` resolves its filename by reading `/proc/<pid>/fd/<in_fd>` at the `do_sendfile()` entry probe. If the perf buffer is backed up and userspace processes the event after the process has already closed that fd (or exited), resolution falls back to empty — the same race that affects OPEN's fd-based fallback.
 
 #### Hard links
 A single inode can have multiple paths. The cache stores whichever absolute path was seen first. For files with multiple hard links, the filename may not match the specific link name used by the accessing process.
@@ -171,7 +191,7 @@ The path captured is relative to the mount namespace of the probed process. In c
 | 3 | pid | `u32` | Process ID |
 | 4 | tid | `u32` | Thread ID for multi-threaded correlation; empty if `0` |
 | 5 | command | `string` | Process name (max 16 characters) |
-| 6 | filename | `string` | File path; for dual-path operations (`RENAME`, `LINK`, `SYMLINK`) formatted as `old_path -> new_path`. For `OPEN`, the path is resolved to absolute via `/proc/<pid>/fd`; if that races (fd already closed) and the captured path was relative, it is resolved against the openat `dirfd` / process cwd as a fallback |
+| 6 | filename | `string` | File path; for dual-path operations (`RENAME`, `LINK`, `SYMLINK`) formatted as `old_path -> new_path`. For `OPEN`, the path is resolved to absolute via `/proc/<pid>/fd`; if that races (fd already closed) and the captured path was relative, it is resolved against the openat `dirfd` / process cwd as a fallback. For `SENDFILE`, resolved via the same `/proc/<pid>/fd` mechanism using the source fd (an internal-only event field, not a CSV column — see below). For `MSYNC`/`MADVISE`, resolved by joining the call's address (column 18) against the `MMAP`/`MUNMAP` region cache (see Filename Resolution above); empty for anonymous (non-file-backed) mappings, which have no path to resolve |
 | 7 | size | `u64` | **Requested** I/O size in bytes — the `count` argument to `read`/`write` (or operation size for others); `0` for non-I/O operations. The **actual** bytes transferred are in column 9 (`bytes_completed`), which can be smaller (short read/write). |
 | 8 | offset | `u64` | File offset for positioned I/O; empty if `0` |
 | 9 | bytes_completed | `u64` | **Actual** bytes read/written for `READ`/`WRITE` (`return_value` when `>= 0`); compare against column 7 (`size`) to detect short I/O. Empty on failure or for other operations |
@@ -183,7 +203,7 @@ The path captured is relative to the mount namespace of the probed process. In c
 | 15 | errno | `string` | Error name (e.g. `EAGAIN`) when a `READ`/`WRITE` failed (`return_value < 0`); empty on success or for other operations |
 | 16 | mmap_prot | `string` | MMAP protection flags (`PROT_*`, pipe-separated); empty for non-MMAP operations |
 | 17 | mmap_flags | `string` | MMAP mapping flags (`MAP_*`, pipe-separated); empty for non-MMAP operations |
-| 18 | address | `string` | Mapping start address as hex (`0x...`) for `MMAP` and `MUNMAP`; for `MREMAP` formatted as `old_address -> new_address`; empty for other operations |
+| 18 | address | `string` | Mapping/region address as hex (`0x...`) for `MMAP`, `MUNMAP`, `MSYNC`, and `MADVISE`; for `MREMAP` formatted as `old_address -> new_address`; empty for other operations |
 | 19 | cmdline | `string` | Full command line (`argv` joined by spaces) of the process that triggered the event; empty if unresolvable (see below) |
 | 20 | ppid | `u32` | Parent process ID (`real_parent->tgid`); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
 | 21 | container_id | `u64` | cgroup v2 id of the process (container identifier); populated for `READ`/`WRITE`/`OPEN`; empty otherwise |
